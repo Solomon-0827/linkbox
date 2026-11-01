@@ -1,0 +1,40 @@
+# 使用与本机配置
+
+## Clash Verge
+
+链路盒子通过本机控制接口连接 Clash Verge。Mac 使用当前用户的 Clash Verge 服务 socket；请启用 Clash Verge 服务模式。Windows 自动发现当前用户的命名管道，也支持已配置的本机 TCP 控制端口。不要为此开放局域网控制端口。
+
+固定组名为 `中转入口` 和 `美国静态家宽`。后者应包含 `dialer-proxy: 中转入口`。GLOBAL 必须选择美国静态家宽，而不是直接选择机场节点。
+
+默认预期出口由固定节点的 `server` IP 推断。服务器地址与实际公网出口不同，或服务器使用域名时，需要在本机设置预期 IP：Mac 的 `settings.json` 使用 `expected_ip`，Windows 使用 `expectedIP`。
+
+## 本机数据目录
+
+- Mac：`~/Library/Application Support/ProxyToolbox`
+- Windows：应用“检查报告”按钮打开 Electron 的本机用户数据目录。
+
+程序不会把本机设置、订阅、测试记录上传到仓库。Net.Coffee 和 ipwho.is 请求会按其正常用途查询所见出口信息。
+
+## 节点筛选
+
+将 `examples/node-policy.example.json` 复制为本机数据目录的 `node-policy.json` 并编辑：
+
+- `blocked_providers`：不再显示、不测速的订阅名称。
+- `excluded_nodes`：按订阅名称列出剔除的节点；`*` 表示不区分订阅。
+- `node_providers`：显式节点的所属订阅映射，避免按名称猜测归属。
+
+Windows 可在连接设置中点击“导入节点筛选规则”。文件只影响列表、测速和订阅更新范围，不会自动切换当前节点。当前正在使用但被剔除的节点仍显示在顶部连接路径中，直到手动切换。
+
+## 更新订阅
+
+Mac 可在本机数据目录放置 `subscriptions.json`，格式参照示例；名称仅支持英文字母、数字、下划线和短横线。更新会保存当前入口定义、保留节点选择、保留筛选规则，并校验配置后热加载；不重启内核或关闭连接。没有此文件时，从现有 HTTP proxy-providers 读取订阅。备份留在本机 `backups` 目录。
+
+Windows 更新 Clash 配置中的 HTTP proxy-providers。被屏蔽的订阅不更新。如果当前入口来自动态订阅、缺少独立固定定义，为避免订阅更新删除或改变当前入口，会暂缓更新它；可以手动换到其他入口后再更新。
+
+新订阅如果包含专用 DNS，必须同时将对应域名策略配置到 Clash 的 `dns.proxy-server-nameserver-policy`；只复制节点而遗漏专用 DNS 会导致错误的失败结果。示例不含任何真实 DNS 订阅凭据。
+
+## 安全边界
+
+测速使用独立临时 Mihomo 内核、物理网卡和本机端口，TUN 关闭；结束时只清理自己创建的进程。检测到物理网络或当前选择变化会停止，不自动恢复用户选择。
+
+五路并发针对延迟测试，不保证下载带宽测试结果可直接比较。不要把 WebRTC 无候选、探测超时、无活跃进程当作“无泄漏”的证明。
