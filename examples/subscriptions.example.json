@@ -1,0 +1,5 @@
+{
+  "sources": [
+    {"name": "example-provider", "url": "https://subscription.example.invalid/clash"}
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "blocked_providers": ["retired-provider"],
+  "excluded_nodes": {"example-provider": ["unreliable-node"]},
+  "node_providers": {"unreliable-node": "example-provider"}
+}

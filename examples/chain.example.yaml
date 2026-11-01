@@ -1,0 +1,36 @@
+# Example only: replace addresses and credentials locally before importing.
+mixed-port: 7897
+allow-lan: false
+mode: global
+ipv6: false
+log-level: warning
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack: [any:53]
+proxies:
+  - name: 示例中转
+    type: http
+    server: relay.example.invalid
+    port: 443
+    tls: true
+    username: YOUR_USERNAME
+    password: CHANGE_ME
+  - name: 美国静态家宽
+    type: ss
+    server: 203.0.113.10
+    port: 8388
+    cipher: aes-256-gcm
+    password: CHANGE_ME
+    dialer-proxy: 中转入口
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies: [美国静态家宽]
+  - name: 中转入口
+    type: select
+    proxies: [示例中转]
+rules:
+  - MATCH,美国静态家宽

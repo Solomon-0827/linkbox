@@ -1,0 +1,23 @@
+{
+  "name": "linkbox-windows",
+  "productName": "链路盒子",
+  "version": "1.1.0",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "start": "electron .",
+    "package": "node build.cjs"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1",
+    "https-proxy-agent": "^7.0.6"
+  },
+  "devDependencies": {
+    "@electron/get": "^3.1.0",
+    "@electron/asar": "^4.0.1",
+    "resedit": "^2.0.3",
+    "electron": "42.11.18"
+  },
+  "description": "链路盒子：Clash Verge 中转节点管理与隔离测速"
+}
