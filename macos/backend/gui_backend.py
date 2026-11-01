@@ -14,14 +14,7 @@ import toolbox as t
 import runtime
 
 def node_inventory(p):
-    all_nodes={name:(value,None) for name,value in p.items()}
-    providers=t.api('GET','/providers/proxies').get('providers',{})
-    for provider,data in providers.items():
-        for value in data.get('proxies',[]):
-            # Explicit proxy definitions take precedence; provider-only nodes use scoped API.
-            existing=all_nodes.get(value['name'],(value,None))[0]
-            all_nodes[value['name']]=(existing,provider)
-    return all_nodes
+    return t.node_inventory(p)
 
 def node_rows(p):
     inventory=node_inventory(p)
@@ -51,7 +44,7 @@ def node_rows(p):
 
 def snapshot(include_nodes=True):
     c,p=t.state()
-    data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':[n for n in p.get(t.ENTRY,{}).get('all',[]) if runtime.allowed(n)],'expected_ip':runtime.expected_ip()}
+    data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':t.candidate_names(p),'expected_ip':runtime.expected_ip()}
     if include_nodes:
         try:data['node_rows']=node_rows(p)
         except Exception as e:data['node_rows_error']=str(e)

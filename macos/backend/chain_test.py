@@ -46,7 +46,7 @@ def active_state():
     c,p=t.state()
     return {'mode':c.get('mode'),'tun':c.get('tun',{}).get('enable'),
             'entry':p.get(t.ENTRY,{}).get('now'),'exit':p.get('GLOBAL',{}).get('now'),
-            'dialer':p.get(t.EXIT,{}).get('dialer-proxy')},[n for n in p.get(t.ENTRY,{}).get('all',[]) if runtime.allowed(n)]
+            'dialer':p.get(t.EXIT,{}).get('dialer-proxy')},t.candidate_names(p)
 
 
 def load_nodes():

@@ -14,7 +14,7 @@ class PolicyTests(unittest.TestCase):
     def test_current_selection_retained_but_excluded_from_test_list(self):
         policy={'node_providers':{'current':'kept'},'excluded_nodes':{'kept':['current']}}
         proxies={'GLOBAL':{'now':'美国静态家宽'},'中转入口':{'now':'current','all':['current','good']},'美国静态家宽':{'dialer-proxy':'中转入口'}}
-        with patch.object(runtime,'read_json',return_value=policy),patch.object(chain_test.t,'state',return_value=({'mode':'global'},proxies)):
+        with patch.object(runtime,'read_json',return_value=policy),patch.object(chain_test.t,'state',return_value=({'mode':'global'},proxies)),patch.object(chain_test.t,'api',return_value={}):
             state,names=chain_test.active_state()
             self.assertEqual(state['entry'],'current');self.assertEqual(names,['good'])
     def test_provider_labels_are_not_assumed_from_node_name(self):
@@ -30,3 +30,12 @@ class PolicyTests(unittest.TestCase):
             c=chain_test.isolated_config({'name':'a'},{'name':'b'},12345,'en0')
             self.assertEqual(c['dns']['proxy-server-nameserver-policy'],policy)
             self.assertFalse(c['tun']['enable'])
+
+    def test_both_benchmark_lists_use_live_provider_without_mapping(self):
+        policy={'blocked_providers':['retired'],'excluded_nodes':{'kept':['slow']}}
+        proxies={'GLOBAL':{'now':'美国静态家宽'},'中转入口':{'now':'old','all':['old','slow','fast']},'美国静态家宽':{'dialer-proxy':'中转入口'}}
+        providers={'providers':{'retired':{'proxies':[{'name':'old'}]},'kept':{'proxies':[{'name':'slow'},{'name':'fast'}]}}}
+        with patch.object(runtime,'read_json',return_value=policy),patch.object(chain_test.t,'state',return_value=({'mode':'global'},proxies)),patch.object(chain_test.t,'api',return_value=providers):
+            state,names=chain_test.active_state()
+            self.assertEqual(state['entry'],'old');self.assertEqual(names,['fast'])
+            self.assertEqual(gui_backend.snapshot(False)['nodes'],['fast'])

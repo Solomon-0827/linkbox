@@ -39,6 +39,20 @@ def state():
     p = api('GET', '/proxies')['proxies']
     return conf, p
 
+def node_inventory(proxies):
+    result={name:(value,value.get('provider-name') or None) for name,value in proxies.items()}
+    providers=api('GET','/providers/proxies').get('providers',{})
+    for provider,data in providers.items():
+        for value in data.get('proxies',[]):
+            result[value['name']]=(result.get(value['name'],(value,None))[0],provider)
+    return result
+
+def candidate_names(proxies):
+    import runtime
+    inventory=node_inventory(proxies)
+    return [name for name in proxies.get(ENTRY,{}).get('all',[])
+            if runtime.allowed(name,inventory.get(name,({},None))[1])]
+
 def show():
     c, p = state()
     print(f'\n模式：{c.get("mode")}；TUN：{"开启" if c.get("tun", {}).get("enable") else "关闭"}')
