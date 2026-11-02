@@ -9,6 +9,12 @@ final class SoftButton: NSButton {
     var primary = false
     var plain = false
     var symbolName:String?
+    private var spinTimer:Timer?
+    private var angle:CGFloat=0
+    var spinning=false { didSet {
+        spinTimer?.invalidate();spinTimer=nil;angle=0;needsDisplay=true
+        if spinning { spinTimer=Timer.scheduledTimer(withTimeInterval:1/30,repeats:true) { [weak self] _ in guard let self=self else{return};self.angle+=12;self.needsDisplay=true } }
+    } }
     private var tracking:NSTrackingArea?
     private var hoverTimer:Timer?
     private var hover:CGFloat=0
@@ -43,9 +49,9 @@ final class SoftButton: NSButton {
         let attrs: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize:12,weight:.medium),.foregroundColor:color]
         let text = NSAttributedString(string:title,attributes:attrs)
         let symbol=symbolName.flatMap { NSImage(systemSymbolName:$0,accessibilityDescription:nil)?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors:[color])) }
-        let iconWidth:CGFloat=symbol == nil ? 0 : 20
+        let iconWidth:CGFloat=symbol == nil ? 0 : title.isEmpty ? 14 : 20
         let start=(bounds.width-text.size().width-iconWidth)/2
-        if let symbol=symbol { symbol.draw(in:NSRect(x:start,y:(bounds.height-14)/2,width:14,height:14),from:.zero,operation:.sourceOver,fraction:1,respectFlipped:true,hints:nil) }
+        if let symbol=symbol { NSGraphicsContext.saveGraphicsState();let rotation=NSAffineTransform();rotation.translateX(by:start+7,yBy:bounds.height/2);rotation.rotate(byDegrees:angle);rotation.translateX(by:-(start+7),yBy:-bounds.height/2);rotation.concat();symbol.draw(in:NSRect(x:start,y:(bounds.height-14)/2,width:14,height:14),from:.zero,operation:.sourceOver,fraction:1,respectFlipped:true,hints:nil);NSGraphicsContext.restoreGraphicsState() }
         text.draw(at:NSPoint(x:start+iconWidth,y:(bounds.height-text.size().height)/2))
     }
 }
@@ -281,13 +287,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     let entry = NSTextField(labelWithString: "正在读取…")
     let exitLabel = NSTextField(labelWithString: "—")
     let modeLabel = NSTextField(labelWithString: "—")
-    let feedback = NSTextField(wrappingLabelWithString: "双击节点切换中转入口；测速不会自动切换。")
+    let feedback = NSTextField(wrappingLabelWithString: "")
     let picker = NSPopUpButton(frame: .zero, pullsDown: false)
     let lastTestLabel = NSTextField(labelWithString:"上次测速：暂无记录")
     let spinner = NSProgressIndicator()
     let nodeTable = HoverTable()
     var nodeRows:[[String:Any]]=[]
-    var latencyButton:NSButton!
+
     var chainButton:NSButton!
     var hourlyTestTimer:Timer?
     var chainTimer:Timer?
@@ -304,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var checkButton: NSButton!
     var settingsButton:NSButton!
     var deleteButton:NSButton!
+    var refreshingOnline=Set<String>()
     var editingNodes=false
     var selectedNodes=Set<String>()
 
@@ -348,17 +355,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         symbol("shippingbox.fill",110,22,19,accent)
         label("Linkbox",137,22,130,13,ink,.semibold)
-        latencyButton=button("轻量测速",#selector(testLatency));latencyButton.frame=NSRect(x:222,y:729,width:104,height:32);canvas.addSubview(latencyButton);(latencyButton as? SoftButton)?.plain=true;(latencyButton as? SoftButton)?.symbolName="bolt"
-        chainButton=button("全链路测速",#selector(testChain));chainButton.frame=NSRect(x:336,y:729,width:116,height:32);canvas.addSubview(chainButton);(chainButton as? SoftButton)?.plain=true;(chainButton as? SoftButton)?.symbolName="point.3.connected.trianglepath.dotted"
 
         rule(0,61,900)
         let overview=NSView(frame:NSRect(x:0,y:62,width:900,height:148));overview.wantsLayer=true;overview.layer?.backgroundColor=NSColor(calibratedRed:0.984,green:0.988,blue:0.992,alpha:1).cgColor;canvas.addSubview(overview)
         symbol("desktopcomputer",24,87,17,muted)
-        label("本机",48,86,40,13,ink,.medium);symbol("chevron.right",94,90,10,muted)
-        let pill=NSView(frame:NSRect(x:118,y:80,width:332,height:29));pill.wantsLayer=true;pill.layer?.backgroundColor=NSColor.white.cgColor;pill.layer?.cornerRadius=4;pill.layer?.borderWidth=1;pill.layer?.borderColor=NSColor(calibratedWhite:0.88,alpha:1).cgColor;canvas.addSubview(pill)
-        label("●",127,87,12,10,.systemGreen)
-        field(entry,145,87,295,12)
-        symbol("chevron.right",464,90,10,muted);symbol("globe.americas.fill",489,86,18,accent);field(exitLabel,516,87,300,13)
+        label("本机",48,86,40,13,ink,.medium);symbol("chevron.right",124,90,10,muted)
+        let pill=NSView(frame:NSRect(x:143,y:80,width:307,height:29));pill.wantsLayer=true;pill.layer?.backgroundColor=NSColor.white.cgColor;pill.layer?.cornerRadius=4;pill.layer?.borderWidth=1;pill.layer?.borderColor=NSColor(calibratedWhite:0.88,alpha:1).cgColor;canvas.addSubview(pill)
+        label("●",152,87,12,10,.systemGreen)
+        field(entry,170,87,270,12)
+        symbol("chevron.right",464,90,10,muted);symbol("globe.americas.fill",489,86,18,accent);field(exitLabel,516,87,250,13)
         for x:CGFloat in [192,370,548,726] { rule(x,129,1,55) }
         label("出口 IP",24,128,150,11,muted,.medium)
         field(identityLine,24,147,143,14)
@@ -378,14 +383,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let columns:[(String,String,CGFloat)] = [("rank","排名",50),("name","中转节点名称",392),("provider","来源订阅",100),("delay","入口延迟",100),("chain_delay","全链路延迟",110),("test_state","检测状态",100)]
         var columnX:CGFloat=24
         for (key,title,width) in columns {
-            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-14,height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
+            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(["provider","chain_delay","test_state"].contains(key) ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
             if ["delay","chain_delay","test_state"].contains(key) { l.alignment = .right };canvas.addSubview(l)
             columnX += width
         }
         rule(0,250,900)
-        let scroll=NSScrollView(frame:NSRect(x:24,y:251,width:852,height:421))
+        let scroll=NSScrollView(frame:NSRect(x:24,y:251,width:852,height:467))
         scroll.hasVerticalScroller=true;scroll.scrollerStyle = .overlay;scroll.drawsBackground=true;scroll.backgroundColor = .white;scroll.borderType = .noBorder
-        nodeTable.frame=NSRect(x:0,y:0,width:852,height:421);nodeTable.style = .plain;nodeTable.headerView=nil
+        nodeTable.frame=NSRect(x:0,y:0,width:852,height:467);nodeTable.style = .plain;nodeTable.headerView=nil
         for (key,title,width) in columns {
             let column=NSTableColumn(identifier:NSUserInterfaceItemIdentifier(key));column.title=title;column.minWidth=width;column.maxWidth=width;column.width=width;nodeTable.addTableColumn(column)
         }
@@ -396,29 +401,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.delegate=self;nodeTable.dataSource=self;nodeTable.allowsMultipleSelection=false
         nodeTable.target=self;nodeTable.doubleAction=#selector(doubleClickNode)
         scroll.documentView=nodeTable;canvas.addSubview(scroll)
-        rule(0,672,900)
-        spinner.frame=NSRect(x:326,y:790,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
+        rule(0,718,900)
+        spinner.frame=NSRect(x:24,y:790,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
         func toolbarText(_ text:NSTextField,_ x:CGFloat,_ width:CGFloat,_ size:CGFloat,_ centerY:CGFloat=740) {
             let value=text.stringValue;text.cell=CenteredTextCell(textCell:value);text.isBordered=false;text.isEditable=false;text.drawsBackground=false
             text.frame=NSRect(x:x,y:centerY-14,width:width,height:28);text.font = .systemFont(ofSize:size,weight:.medium);text.textColor=muted;canvas.addSubview(text)
         }
-        toolbarText(NSTextField(labelWithString:"每小时测速"),72,94,12,695)
-        rule(179,684,1,22)
-        toolbarText(lastTestLabel,198,410,11,695);refreshLastTestTime()
-        autoSwitch.setAccessibilityLabel("每小时自动测速");autoSwitch.frame=NSRect(x:24,y:682,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
-        let reportButton=button("检查报告",#selector(reports));reportButton.frame=NSRect(x:24,y:729,width:88,height:32);(reportButton as? SoftButton)?.plain=true;canvas.addSubview(reportButton)
-        checkButton=button("检查网络",#selector(check));checkButton.frame=NSRect(x:122,y:729,width:90,height:32);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
-        let ipButton=button("Net.Coffee ↗",#selector(showIP));ipButton.frame=NSRect(x:766,y:729,width:110,height:32);canvas.addSubview(ipButton)
-        settingsButton=button("设置",#selector(toggleNodeEditing));settingsButton.frame=NSRect(x:682,y:729,width:74,height:32);canvas.addSubview(settingsButton)
-        deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:679,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
+        toolbarText(NSTextField(labelWithString:"每小时测速"),72,94,12,740)
+        rule(179,729,1,22)
+        toolbarText(lastTestLabel,198,410,11,740);refreshLastTestTime()
+        autoSwitch.setAccessibilityLabel("每小时自动测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
+        func iconButton(_ label:String,_ symbol:String,_ action:Selector,_ x:CGFloat,_ y:CGFloat)->NSButton {
+            let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
+        }
+        refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),84,80)
+        checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
+        manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),170,218)
+        updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),536,218)
+        chainButton=iconButton("全链路测速","speedometer",#selector(testChain),744,218)
+        settingsButton=iconButton("编辑节点","wrench",#selector(toggleNodeEditing),848,218)
+        deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:724,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
         rule(24,771,852)
-        refreshButton=button("↻ 刷新状态",#selector(refresh));refreshButton.frame=NSRect(x:19,y:782,width:94,height:28);(refreshButton as? SoftButton)?.plain=true;canvas.addSubview(refreshButton)
-        updateButton=button("↓ 更新订阅",#selector(updateSubscriptions));updateButton.frame=NSRect(x:119,y:782,width:94,height:28);(updateButton as? SoftButton)?.plain=true;canvas.addSubview(updateButton)
-        manageButton=button("管理节点",#selector(manageNodes));manageButton.frame=NSRect(x:219,y:782,width:94,height:28);canvas.addSubview(manageButton);(manageButton as? SoftButton)?.plain=true;(manageButton as? SoftButton)?.symbolName="slider.horizontal.3"
-        toolbarText(feedback,348,280,11,796)
+        toolbarText(feedback,44,560,11,796)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
         toolbarText(modeLabel,638,238,11,796);modeLabel.alignment = .right
-        controls = [settingsButton,picker,manageButton,updateButton,refreshButton,checkButton,latencyButton,chainButton]
+        controls = [settingsButton,picker,manageButton,updateButton,refreshButton,checkButton,chainButton]
         let tray=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         tray.button?.image=NSImage(systemSymbolName:"link",accessibilityDescription:"链路盒子")
         let trayMenu=NSMenu()
@@ -456,18 +463,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func button(_ text: String,_ action: Selector) -> NSButton { let b = SoftButton(title:text,target:self,action:action); b.isBordered = false; b.setButtonType(.momentaryPushIn); return b }
     func setBusy(_ value: Bool,_ message: String) {
-        if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;chainButton.title="全链路测速" }
+        if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;(chainButton as? SoftButton)?.symbolName="speedometer";chainButton.setAccessibilityLabel("全链路测速") }
         busy = value
         nodeTable.allowsEmptySelection = true
         nodeTable.allowsTypeSelect = !value
         for c in controls { c.isEnabled = !value }
         updateEditingControls()
         if value { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
-        feedback.stringValue = message == "状态已更新。没有修改代理配置。" ? "\(nodeRows.count) 个节点 · 双击切换中转" : message
+        feedback.stringValue = message == "状态已更新。没有修改代理配置。" ? "" : message
     }
     func render(_ s: [String:Any]) {
         expectedIP = s["expected_ip"] as? String ?? ""
-        refreshLastTestTime()
         current = s["entry"] as? String ?? ""
         entry.stringValue = current
         exitLabel.stringValue = s["exit"] as? String ?? "未知"
@@ -479,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let da=a[sortKey] as? Double ?? Double.greatestFiniteMagnitude,db=b[sortKey] as? Double ?? Double.greatestFiniteMagnitude
             return da == db ? (a["name"] as? String ?? "") < (b["name"] as? String ?? "") : da < db
         }
+        refreshLastTestTime()
         selectedNodes.removeAll();updateEditingControls()
         nodeTable.reloadData()
         nodeTable.deselectAll(nil)
@@ -487,8 +494,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         deleteButton?.title="删除已选（\(selectedNodes.count)）"
         deleteButton?.isEnabled = !busy && !selectedNodes.isEmpty
         deleteButton?.isHidden = !editingNodes
-        settingsButton?.title=editingNodes ? "完成" : "设置"
-        if editingNodes { for c in [manageButton,updateButton,refreshButton,checkButton,latencyButton,chainButton] { c?.isEnabled=false } }
+        (settingsButton as? SoftButton)?.symbolName=editingNodes ? "checkmark" : "wrench";settingsButton?.setAccessibilityLabel(editingNodes ? "完成编辑" : "编辑节点")
+        if editingNodes { for c in [manageButton,updateButton,refreshButton,checkButton,chainButton] { c?.isEnabled=false } }
     }
     @objc func toggleNodeEditing() {
         guard !busy else { return }
@@ -529,9 +536,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
                 let parsed = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
                 DispatchQueue.main.async {
-                    guard let result = parsed else { self.current = ""; self.setBusy(false,"操作未完成：未收到有效结果，请确认工具文件完整。"); return }
+                    guard let result = parsed else { self.finishRefresh("status");self.current = ""; self.setBusy(false,"操作未完成：未收到有效结果，请确认工具文件完整。"); return }
                     if result["ok"] as? Bool != true {
-                        self.current = ""; self.setBusy(false,result["error"] as? String ?? "操作失败"); if args.first == "switch" { self.refreshOnline() }; return
+                        self.finishRefresh("status");self.current = ""; self.setBusy(false,result["error"] as? String ?? "操作失败"); if args.first == "switch" { self.refreshOnline() }; return
                     }
                     if let state = result["state"] as? [String:Any] { self.render(state) }
                     self.setBusy(false,result["message"] as? String ?? "状态已更新。没有修改代理配置。")
@@ -539,7 +546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     complete(result)
                 }
             } catch {
-                DispatchQueue.main.async { self.current = ""; self.setBusy(false,"无法启动工具：\(error.localizedDescription)") }
+                DispatchQueue.main.async { self.finishRefresh("status");self.current = ""; self.setBusy(false,"无法启动工具：\(error.localizedDescription)") }
             }
         }
     }
@@ -601,9 +608,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             guard let date=date else { continue }
             if latest == nil || date > latest!.0 { latest=(date,title,!(record["reason"] as? String ?? "").isEmpty) }
         }
-        guard let (date,title,stopped)=latest else { lastTestLabel.stringValue="上次测速：暂无记录";return }
+        guard let (date,title,stopped)=latest else { lastTestLabel.stringValue="上次测速：暂无记录 · \(nodeRows.count) 个节点 · 全链路";return }
         let formatter=DateFormatter();formatter.dateFormat="MM-dd HH:mm:ss"
-        lastTestLabel.stringValue="上次测速：\(formatter.string(from:date))  ·  \(title)\(stopped ? " · 已中止" : "")"
+        lastTestLabel.stringValue="上次测速：\(formatter.string(from:date))  ·  \(nodeRows.count) 个节点 · \(title)\(stopped ? " · 已中止" : "")"
     }
     func readTestProgress(_ kind:String,finished:Bool=false) {
         guard let data=try? Data(contentsOf:base.appendingPathComponent("\(kind)-progress.json")),
@@ -622,7 +629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.reloadData()
         let count=p["index"] as? Int ?? 0,total=p["total"] as? Int ?? nodeRows.count
         if finished { refreshLastTestTime() }
-        feedback.stringValue=finished ? (count == total ? "检测完成 · \(total) 个节点" : "检测已停止 · \(count) / \(total)") : "检测中 · \(count) / \(total)"
+        if !finished { refreshLastTestTime();lastTestLabel.stringValue=lastTestLabel.stringValue.replacingOccurrences(of:"\(nodeRows.count) 个节点",with:"\(count)/\(total)") }
+        feedback.stringValue=finished && count != total ? "测速已停止" : ""
     }
     func beginTest(_ kind:String) {
         guard !busy else { return }
@@ -634,10 +642,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.reloadData()
         chainRunning=kind == "chain"
         invoke([kind],message:"准备检测 · \(nodeRows.count) 个节点") { _ in self.readTestProgress(kind,finished:true);self.showFastestNodes() }
-        if chainRunning { chainButton.title="停止测速";chainButton.isEnabled=true }
+        if chainRunning { (chainButton as? SoftButton)?.symbolName="stop.fill";chainButton.setAccessibilityLabel("停止测速");chainButton.isEnabled=true }
         chainTimer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:true) { _ in self.readTestProgress(kind) }
     }
-    @objc func testLatency() { beginTest("latency") }
     @objc func testChain() {
         if chainRunning {
             try? Data().write(to:base.appendingPathComponent("chain-cancel"))
@@ -661,7 +668,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     @objc func updateSubscriptions() { invoke(["update-subscriptions"],message:"正在更新保留的订阅…") { _ in self.refreshOnline();self.showFastestNodes() } }
-    @objc func refresh() { invoke(["status"],message:"正在读取 Clash 状态…") { _ in self.refreshOnline() } }
+    @objc func refresh() {
+        guard !busy else{return}
+        (refreshButton as? SoftButton)?.spinning=true
+        invoke(["status"],message:"正在刷新状态…") { _ in self.refreshOnline() }
+    }
+    func finishRefresh(_ part:String) {
+        refreshingOnline.remove(part)
+        if refreshingOnline.isEmpty { (refreshButton as? SoftButton)?.spinning=false }
+    }
+    @objc func showNetworkMenu() {
+        let menu=NSMenu()
+        for (title,action) in [("检查网络",#selector(check)),("Net.Coffee ↗",#selector(showIP))] {
+            let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=self;menu.addItem(item)
+        }
+        menu.popUp(positioning:nil,at:NSPoint(x:0,y:checkButton.bounds.maxY+4),in:checkButton)
+    }
     @objc func check() { invoke(["check"],message:"正在检查；浏览器会打开结果页。不会改变代理或 Claude 任务。") { _ in } }
     @objc func switchNode() {
         guard !busy, let target = picker.titleOfSelectedItem, !current.isEmpty else { return }
@@ -682,10 +704,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func refreshOnline() {
         resetOnline()
+        refreshingOnline=["coffee","ip"]
         let id=generation
         coffee=CoffeeReader(base:base) { [weak self] result,finished in
             guard let self=self,self.generation==id else { return }
             self.renderCoffee(result,finished:finished)
+            if finished { self.finishRefresh("coffee") }
         }
         coffee?.start()
         DispatchQueue.global(qos:.userInitiated).async {
@@ -696,6 +720,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let result=data
             DispatchQueue.main.async {
                 guard self.generation==id else { return }
+                defer { self.finishRefresh("ip") }
                 guard result["ok"] as? Bool == true,let info=result["ip_info"] as? [String:Any] else {
                     self.ipSummary.stringValue="出口未验证";self.locationLine.stringValue=result["error"] as? String ?? "查询失败，请刷新重试";self.renderOverview();return
                 }
@@ -749,7 +774,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         udpValue.stringValue=udpValue.stringValue.replacingOccurrences(of:"未检测到泄露",with:"未见泄漏").replacingOccurrences(of:"未检测到泄漏",with:"未见泄漏")
         if mismatch { sourceLine.stringValue="检测出口不一致" }
     }
-    @objc func reports() { let path = base.appendingPathComponent("proxy-self-check/reports"); try? FileManager.default.createDirectory(at:path,withIntermediateDirectories:true); NSWorkspace.shared.open(path) }
     @objc func help() { NSWorkspace.shared.open(base.appendingPathComponent("使用说明.md")) }
     func applicationWillTerminate(_ notification:Notification) { hourlyTestTimer?.invalidate();chainTimer?.invalidate() }
     @objc func showWindow() { window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true) }

@@ -24,9 +24,9 @@ class ParallelTests(unittest.TestCase):
                     if int(node['name'])<5:gate.wait(timeout=3)
                     if mode=='cancel':(base/'chain-cancel').touch()
                     for _ in range(8):
-                        if cancelled():return [],[]
+                        if cancelled():return [],[],{}
                         time.sleep(.01)
-                    return [{'ms':100,'ip':c.EXPECTED}]*3,[]
+                    return [{'ms':100,'ip':c.EXPECTED}]*3,[],{'delay':42}
                 finally:
                     with mutex:active-=1
             def read_state():
@@ -35,7 +35,9 @@ class ParallelTests(unittest.TestCase):
                 c.run()
             record=json.loads((base/'chain-results.json').read_text())
             self.assertEqual(peak,5);self.assertEqual(active,0)
-            if mode=='normal':self.assertEqual(len(record['results']),8)
+            if mode=='normal':
+                self.assertEqual(len(record['results']),8)
+                self.assertTrue(all(row['delay']==42 for row in record['results'].values()))
             else:
                 self.assertEqual(len(calls),5);self.assertEqual(record['results'],{})
                 self.assertTrue(record['reason'])

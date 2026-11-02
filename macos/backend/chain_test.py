@@ -81,7 +81,7 @@ def isolated_config(entry, exit_node, port, interface):
                    'nameserver':['https://dns.alidns.com/dns-query'],
                    'proxy-server-nameserver':['https://dns.alidns.com/dns-query'],
                    'nameserver-policy':DNS_POLICY,'proxy-server-nameserver-policy':DNS_POLICY},
-            'proxies':[a,b],'proxy-groups':[],'rules':['MATCH,TEST_US_EXIT']}
+            'proxies':[a,b],'proxy-groups':[],'rules':['DOMAIN,www.gstatic.com,TEST_ENTRY','MATCH,TEST_US_EXIT']}
 
 
 def stop_owned(process):
@@ -113,6 +113,26 @@ def trace(port, cancelled):
     finally:stop_owned(p)
 
 
+def entrance_delay(port,cancelled):
+    """The isolated core routes this exact host through TEST_ENTRY only."""
+    command=['/usr/bin/curl','--silent','--show-error','--proxy',f'http://127.0.0.1:{port}',
+             '--noproxy','','--connect-timeout','3','--max-time','3','--max-filesize','1024',
+             '--output','/dev/null','--write-out','%{http_code} %{time_total}',
+             'https://www.gstatic.com/generate_204']
+    process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    try:
+        deadline=time.monotonic()+4
+        while process.poll() is None:
+            if cancelled() or time.monotonic()>deadline:raise RuntimeError('入口测试取消或超时')
+            time.sleep(.05)
+        stdout,_=process.communicate()
+        if process.returncode:raise RuntimeError('入口请求失败')
+        code,total=stdout.decode().split()
+        if code!='204':raise RuntimeError('入口响应非 204')
+        return max(1,round(float(total)*1000))
+    finally:stop_owned(process)
+
+
 def test_node(node, exit_node, network, cancelled):
     # Unique private directory and one non-TUN child; secrets removed in finally.
     with tempfile.TemporaryDirectory(prefix='proxy-chain-') as tmp:
@@ -133,6 +153,9 @@ def test_node(node, exit_node, network, cancelled):
             if not ready:raise RuntimeError('隔离端口未就绪')
             owner=subprocess.run(['/usr/sbin/lsof','-nP','-a','-p',str(p.pid),f'-iTCP:{port}','-sTCP:LISTEN'],capture_output=True,text=True,timeout=3)
             if owner.returncode!=0:raise RuntimeError('无法确认临时端口归属，已停止测试')
+            entrance={'delay':None,'time':dt.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'隔离入口 HTTPS 204 / 3 秒超时','error':''}
+            try:entrance['delay']=entrance_delay(port,cancelled)
+            except Exception as error:entrance['error']=str(error)
             samples=[];errors=[]
             for index in range(3):
                 if cancelled():break
@@ -140,7 +163,7 @@ def test_node(node, exit_node, network, cancelled):
                 except RuntimeError as error:errors.append(str(error))
                 if errors and not samples:break  # avoid repeatedly probing a failing path
                 time.sleep(.25)
-            return samples,errors
+            return samples,errors,entrance
         finally:stop_owned(p)
 
 
@@ -166,10 +189,11 @@ def run():
         def measure(name):
             row={'chain_time':dt.datetime.now().astimezone().isoformat(timespec='seconds'),
                  'chain_delay':None,'chain_status':'未验证','chain_samples':[], 'chain_error':'',
-                 'chain_interface':network['interface'],'chain_target':TARGET,'chain_ip':None}
+                 'chain_interface':network['interface'],'chain_target':TARGET,'chain_ip':None,'delay':None}
             try:
                 if name not in nodes:raise RuntimeError('本地缓存缺少节点凭据，请在 Clash 更新订阅后再试')
-                samples,errors=test_node(nodes[name],exit_node,network,cancelled)
+                samples,errors,entrance=test_node(nodes[name],exit_node,network,cancelled)
+                row.update(entrance)
                 row['chain_samples']=samples;row['chain_error']='；'.join(errors)
                 if samples:row['chain_ip']=samples[0]['ip']
                 if len(samples)>=2:

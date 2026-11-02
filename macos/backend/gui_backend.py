@@ -185,7 +185,7 @@ def main():
         import network_check,io,contextlib
         output=io.StringIO()
         with contextlib.redirect_stdout(output):network_check.main()
-        result={'message':'检查完成；报告保存在本机。','details':output.getvalue()}
+        result={'message':'检查完成；可在检测页面下载报告。','details':output.getvalue()}
     else:raise RuntimeError('未知操作')
     print(json.dumps({'ok':True,**result},ensure_ascii=False))
 
