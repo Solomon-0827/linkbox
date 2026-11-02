@@ -33,7 +33,7 @@ def node_rows(p):
         last=history[-1] if history else {}
         saved=cache.get(name)
         # Prefer this tool's explicitly measured baseline; label its timestamp in the UI.
-        row={'name':name,'provider':provider,
+        row={'name':name,'provider':runtime.provider_label(provider),
              'delay':last.get('delay') or None,'time':last.get('time',''),
              'status':'历史可达' if last.get('delay',0)>0 else '未验证',
              'source':'Clash 历史健康检查','error':''}
@@ -128,6 +128,13 @@ def main():
     action=sys.argv[1]
     if action=='self-test': result={'concurrency':runtime.CONCURRENCY,'bundled_backend':True}
     elif action=='status': result={'state':snapshot()}
+    elif action=='subscription-catalog':
+        import subscription_picker
+        result={'catalog':subscription_picker.catalog()}
+    elif action=='save-node-selection':
+        import subscription_picker
+        result=subscription_picker.apply(json.load(sys.stdin))
+        result['state']=snapshot()
     elif action=='update-subscriptions':
         import subscription_update
         result=subscription_update.run()

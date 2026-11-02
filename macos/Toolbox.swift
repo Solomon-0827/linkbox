@@ -45,6 +45,89 @@ final class SoftButton: NSButton {
     }
 }
 
+final class SubscriptionPicker: NSObject {
+    let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:760,height:640),styleMask:[.titled],backing:.buffered,defer:false)
+    let summary = NSTextField(labelWithString:"")
+    var checks:[NSButton]=[]
+    var groups:[String:[NSButton]]=[:]
+    var groupLabels:[String:NSTextField]=[:]
+    var groupNames:[String:String]=[:]
+    var nodeNames:[Int:String]=[:]
+    var sourceIDs:[Int:String]=[:]
+    var fingerprint:String
+    var onSave:([String:Any])->Void
+    var onCancel:()->Void
+    init(catalog:[String:Any],save:@escaping ([String:Any])->Void,cancel:@escaping ()->Void) {
+        fingerprint=catalog["fingerprint"] as? String ?? "";onSave=save;onCancel=cancel
+        super.init()
+        panel.title="管理节点";panel.appearance=NSAppearance(named:.aqua)
+        let view=Canvas(frame:NSRect(x:0,y:0,width:760,height:640));panel.contentView=view
+        view.wantsLayer=true;view.layer?.backgroundColor=NSColor.white.cgColor
+        func text(_ value:String,_ frame:NSRect,_ size:CGFloat=12,_ color:NSColor=muted)->NSTextField {
+            let label=NSTextField(wrappingLabelWithString:value);label.frame=frame;label.font = .systemFont(ofSize:size);label.textColor=color;view.addSubview(label);return label
+        }
+        _=text("选择加入列表的节点",NSRect(x:24,y:18,width:500,height:28),19,ink)
+        _=text("按 Clash Verge 订阅分组 · 保存后生效 · 当前入口自动保留",NSRect(x:24,y:52,width:710,height:22))
+        func button(_ title:String,_ action:Selector,_ frame:NSRect)->NSButton {
+            let b=SoftButton(title:title,target:self,action:action);b.isBordered=false;b.frame=frame;view.addSubview(b);return b
+        }
+        _=button("全部选中",#selector(selectAll),NSRect(x:24,y:86,width:88,height:30))
+        _=button("全部取消",#selector(clearAll),NSRect(x:122,y:86,width:88,height:30))
+        summary.frame=NSRect(x:230,y:92,width:500,height:22);summary.font = .systemFont(ofSize:12);summary.textColor=muted;view.addSubview(summary)
+        let scroll=NSScrollView(frame:NSRect(x:24,y:130,width:712,height:438));scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.borderType = .lineBorder
+        let document=Canvas(frame:NSRect(x:0,y:0,width:690,height:438));scroll.documentView=document;view.addSubview(scroll)
+        var y:CGFloat=0
+        for source in catalog["sources"] as? [[String:Any]] ?? [] {
+            guard let id=source["id"] as? String else { continue }
+            groups[id]=[];groupNames[id]=source["name"] as? String ?? id
+            let header=NSView(frame:NSRect(x:0,y:y,width:690,height:48));header.wantsLayer=true;header.layer?.backgroundColor=NSColor(calibratedRed:0.95,green:0.97,blue:1,alpha:1).cgColor;document.addSubview(header)
+            let label=NSTextField(labelWithString:"");label.frame=NSRect(x:14,y:14,width:440,height:22);label.font = .systemFont(ofSize:13,weight:.semibold);label.textColor=ink;header.addSubview(label);groupLabels[id]=label
+            for (title,action,x) in [("全选",#selector(selectGroup(_:)),CGFloat(520)),("取消",#selector(clearGroup(_:)),CGFloat(596))] {
+                let b=SoftButton(title:title,target:self,action:action);b.isBordered=false;b.identifier=NSUserInterfaceItemIdentifier(id);b.frame=NSRect(x:x,y:9,width:66,height:30);header.addSubview(b)
+            }
+            y+=48
+            let nodes=source["nodes"] as? [[String:Any]] ?? []
+            if nodes.isEmpty {
+                let warning=NSTextField(wrappingLabelWithString:source["warning"] as? String ?? "暂无节点")
+                warning.frame=NSRect(x:14,y:y+10,width:660,height:36);warning.font = .systemFont(ofSize:12);warning.textColor=muted;document.addSubview(warning);y+=54
+            }
+            for node in nodes {
+                guard let name=node["name"] as? String else { continue }
+                let current=node["current"] as? Bool ?? false
+                let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)))
+                b.frame=NSRect(x:14,y:y+9,width:22,height:24);b.tag=checks.count;b.state=(node["selected"] as? Bool ?? false) || current ? .on : .off
+                b.isEnabled = !current;b.setAccessibilityLabel(name+(current ? "，当前入口，自动保留" : ""));document.addSubview(b)
+                checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name;sourceIDs[b.tag]=id
+                let label=NSTextField(wrappingLabelWithString:name+(current ? "  · 当前入口" : ""))
+                label.frame=NSRect(x:46,y:y+7,width:628,height:36);label.font = .systemFont(ofSize:12);label.textColor=current ? accent : ink;document.addSubview(label)
+                y+=48
+            }
+            y+=10
+        }
+        if groups.isEmpty { let l=NSTextField(labelWithString:"未发现订阅，请先在 Clash Verge 添加订阅。");l.frame=NSRect(x:20,y:30,width:650,height:24);document.addSubview(l) }
+        document.setFrameSize(NSSize(width:690,height:max(y,438)))
+        _=button("取消",#selector(SubscriptionPicker.cancel),NSRect(x:536,y:590,width:90,height:32))
+        let apply=button("保存选择",#selector(SubscriptionPicker.save),NSRect(x:638,y:590,width:98,height:32));(apply as? SoftButton)?.primary=true
+        updateCounts()
+    }
+    func updateCounts() {
+        summary.stringValue="已选 \(checks.filter{$0.state == .on}.count) / \(checks.count) 个节点 · \(groups.count) 个订阅"
+        for (id,items) in groups { groupLabels[id]?.stringValue="\(groupNames[id] ?? id)  ·  \(items.filter{$0.state == .on}.count) / \(items.count)" }
+    }
+    func set(_ items:[NSButton],_ state:NSControl.StateValue) { for b in items where b.isEnabled { b.state=state };updateCounts() }
+    @objc func toggled(_ sender:NSButton) { updateCounts() }
+    @objc func selectAll() { set(checks,.on) }
+    @objc func clearAll() { set(checks,.off) }
+    @objc func selectGroup(_ sender:NSButton) { set(groups[sender.identifier?.rawValue ?? ""] ?? [],.on) }
+    @objc func clearGroup(_ sender:NSButton) { set(groups[sender.identifier?.rawValue ?? ""] ?? [],.off) }
+    @objc func cancel() { onCancel() }
+    @objc func save() {
+        var selected=Dictionary(uniqueKeysWithValues:groups.keys.map{($0,[String]())})
+        for b in checks where b.state == .on { if let id=sourceIDs[b.tag],let name=nodeNames[b.tag] { selected[id,default:[]].append(name) } }
+        onSave(["fingerprint":fingerprint,"selected":selected])
+    }
+}
+
 final class CenteredTextCell:NSTextFieldCell {
     override func drawingRect(forBounds rect:NSRect)->NSRect {
         var result=super.drawingRect(forBounds:rect)
@@ -163,6 +246,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var current = ""
     var busy = false
     var controls: [NSControl] = []
+    var nodePicker:SubscriptionPicker?
+    var manageButton:NSButton!
     var updateButton: NSButton!
     var refreshButton: NSButton!
     var checkButton: NSButton!
@@ -257,7 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.target=self;nodeTable.doubleAction=#selector(doubleClickNode)
         scroll.documentView=nodeTable;canvas.addSubview(scroll)
         rule(0,710,900)
-        spinner.frame=NSRect(x:220,y:790,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
+        spinner.frame=NSRect(x:326,y:790,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
         func toolbarText(_ text:NSTextField,_ x:CGFloat,_ width:CGFloat,_ size:CGFloat,_ centerY:CGFloat=740) {
             let value=text.stringValue;text.cell=CenteredTextCell(textCell:value);text.isBordered=false;text.isEditable=false;text.drawsBackground=false
             text.frame=NSRect(x:x,y:centerY-14,width:width,height:28);text.font = .systemFont(ofSize:size,weight:.medium);text.textColor=muted;canvas.addSubview(text)
@@ -272,10 +357,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         rule(24,771,852)
         refreshButton=button("↻ 刷新状态",#selector(refresh));refreshButton.frame=NSRect(x:19,y:782,width:94,height:28);(refreshButton as? SoftButton)?.plain=true;canvas.addSubview(refreshButton)
         updateButton=button("↓ 更新订阅",#selector(updateSubscriptions));updateButton.frame=NSRect(x:119,y:782,width:94,height:28);(updateButton as? SoftButton)?.plain=true;canvas.addSubview(updateButton)
-        toolbarText(feedback,242,370,11,796)
+        manageButton=button("管理节点",#selector(manageNodes));manageButton.frame=NSRect(x:219,y:782,width:94,height:28);canvas.addSubview(manageButton)
+        toolbarText(feedback,348,280,11,796)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
         toolbarText(modeLabel,638,238,11,796);modeLabel.alignment = .right
-        controls = [picker,updateButton,refreshButton,checkButton,latencyButton,chainButton]
+        controls = [picker,manageButton,updateButton,refreshButton,checkButton,latencyButton,chainButton]
         let tray=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         tray.button?.image=NSImage(systemSymbolName:"link",accessibilityDescription:"链路盒子")
         let trayMenu=NSMenu()
@@ -294,7 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         hourlyTestTimer?.invalidate();hourlyTestTimer=nil
         guard autoTestsEnabled else { return }
         let timer=Timer(timeInterval:3600,repeats:true) { [weak self] _ in
-            guard let self=self,self.autoTestsEnabled,!self.busy else { return }
+            guard let self=self,self.autoTestsEnabled,!self.busy,self.nodePicker == nil else { return }
             self.invoke(["status"],message:"正在读取 Clash 状态…") { _ in
                 if self.autoTestsEnabled { self.beginTest("chain") }
             }
@@ -349,7 +435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         picker.selectItem(withTitle:name)
         switchNode()
     }
-    func invoke(_ args: [String], message: String, complete: @escaping ([String:Any]) -> Void) {
+    func invoke(_ args: [String], message: String, input:Data? = nil, complete: @escaping ([String:Any]) -> Void) {
         guard !busy else { return }
         setBusy(true,message)
         let script = Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend").path
@@ -357,7 +443,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let p = Process(); p.executableURL = URL(fileURLWithPath: script); p.arguments = args
             let out = Pipe(); let err = Pipe(); p.standardOutput = out; p.standardError = err
             do {
+                let stdin=Pipe();if input != nil { p.standardInput=stdin }
                 try p.run()
+                if let input=input { stdin.fileHandleForWriting.write(input);try? stdin.fileHandleForWriting.close() }
                 let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
                 let parsed = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
                 DispatchQueue.main.async {
@@ -470,6 +558,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             chainButton.isEnabled=false;return
         }
         beginTest("chain")
+    }
+    @objc func manageNodes() {
+        invoke(["subscription-catalog"],message:"正在读取 Clash Verge 订阅…") { [weak self] result in
+            guard let self=self else { return }
+            guard let catalog=result["catalog"] as? [String:Any] else { return }
+            let picker=SubscriptionPicker(catalog:catalog,save:{ [weak self] selection in
+                guard let self=self,let picker=self.nodePicker,let data=try? JSONSerialization.data(withJSONObject:selection) else { return }
+                self.window.endSheet(picker.panel);self.nodePicker=nil
+                self.invoke(["save-node-selection"],message:"正在保存节点选择…",input:data) { _ in self.showFastestNodes() }
+            },cancel:{ [weak self] in
+                guard let self=self,let picker=self.nodePicker else { return }
+                self.window.endSheet(picker.panel);self.nodePicker=nil
+            })
+            self.nodePicker=picker;self.window.beginSheet(picker.panel)
+        }
     }
     @objc func updateSubscriptions() { invoke(["update-subscriptions"],message:"正在更新保留的订阅…") { _ in self.refreshOnline();self.showFastestNodes() } }
     @objc func refresh() { invoke(["status"],message:"正在读取 Clash 状态…") { _ in self.refreshOnline() } }

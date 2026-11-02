@@ -5,7 +5,7 @@ ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT/'dist';BUILD=ROOT/'build/macos';APP=OUT/'链路盒子.app'
 if sys.platform!='darwin':raise SystemExit('Build the Mac package on macOS.')
 OUT.mkdir(exist_ok=True);BUILD.mkdir(parents=True,exist_ok=True)
-subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--onedir','--name','linkbox-backend','--distpath',str(BUILD/'backend'),'--workpath',str(BUILD/'work'),'--specpath',str(BUILD),'--add-data',str(ROOT/'macos/backend/check.html')+':.','--collect-data','certifi','--hidden-import','subscription_update',str(ROOT/'macos/backend/gui_backend.py')],check=True)
+subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--onedir','--name','linkbox-backend','--distpath',str(BUILD/'backend'),'--workpath',str(BUILD/'work'),'--specpath',str(BUILD),'--add-data',str(ROOT/'macos/backend/check.html')+':.','--collect-data','certifi','--hidden-import','subscription_update','--hidden-import','subscription_picker',str(ROOT/'macos/backend/gui_backend.py')],check=True)
 if APP.exists():shutil.rmtree(APP)
 contents=APP/'Contents';(contents/'MacOS').mkdir(parents=True);(contents/'Resources').mkdir()
 shutil.copytree(BUILD/'backend/linkbox-backend',contents/'Resources/backend')
