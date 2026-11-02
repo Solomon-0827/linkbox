@@ -1,8 +1,9 @@
 'use strict';
-const {app,BrowserWindow,ipcMain,Tray,Menu,nativeImage,shell,dialog,session,nativeTheme}=require('electron');
+const {app,BrowserWindow,ipcMain,Tray,Menu,nativeImage,shell,dialog,session,nativeTheme,clipboard}=require('electron');
 const path=require('node:path'),fs=require('node:fs/promises');
 const {Backend,writeJSON,safeError}=require('./backend.cjs');
-const DEMO=process.argv.includes('--demo');let win,tray,backend,quitting=false,timer,autoStarted=false,coffeeWindow,coffeePending;
+const subscriptions=require('./subscriptions.cjs');
+const DEMO=process.argv.includes('--demo');let win,tray,backend,quitting=false,timer,autoStarted=false,coffeeWindow,coffeePending,uiActive=false;
 app.setName('链路盒子');nativeTheme.themeSource='light';if(process.platform==='win32')app.setAppUserModelId('local.linkbox.windows');
 if(!app.requestSingleInstanceLock()){app.quit();}else{
 app.on('second-instance',()=>{win?.show();win?.focus()});
@@ -10,12 +11,12 @@ app.on('window-all-closed',()=>{});
 app.on('before-quit',event=>{if(!quitting){event.preventDefault();quitting=true;clearInterval(timer);backend?.shutdown().finally(()=>app.quit());}});
 app.whenReady().then(async()=>{
  backend=await new Backend(app.getPath('userData'),(name,data)=>win?.webContents.send(name,data)).init();
- win=new BrowserWindow({width:1150,height:850,minWidth:900,minHeight:650,show:false,title:'链路盒子',backgroundColor:'#f5f7fa',icon:path.join(__dirname,'icon.png'),webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,sandbox:true,nodeIntegration:false}});
+ win=new BrowserWindow({width:1000,height:790,minWidth:900,minHeight:650,show:false,title:'链路盒子',backgroundColor:'#ffffff',icon:path.join(__dirname,'icon.png'),webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,sandbox:true,nodeIntegration:false}});
  win.removeMenu();win.webContents.setWindowOpenHandler(()=>({action:'deny'}));win.webContents.on('will-navigate',(e)=>e.preventDefault());
  session.defaultSession.setPermissionRequestHandler((_wc,_p,cb)=>cb(false));
  win.on('close',e=>{if(!quitting){e.preventDefault();win.hide();}});await win.loadFile('index.html');win.show();
  tray=new Tray(nativeImage.createFromPath(path.join(__dirname,'icon.png')).resize({width:32,height:32}));tray.setToolTip('链路盒子 · 后台运行');tray.setContextMenu(Menu.buildFromTemplate([{label:'打开链路盒子',click:()=>win.show()},{label:'停止测速',click:()=>backend.cancel()},{type:'separator'},{label:'退出链路盒子',click:()=>app.quit()}]));tray.on('double-click',()=>win.show());
- async function auto(){if(DEMO||backend.settings.hourly===false||backend.busy)return;try{await backend.benchmark('chain');win.webContents.send('automatic',{ok:true});}catch(e){win.webContents.send('automatic',{error:safeError(e)});}}
+ async function auto(){if(DEMO||backend.settings.hourly===false||backend.busy||uiActive)return;try{await backend.benchmark('chain');win.webContents.send('automatic',{ok:true});}catch(e){win.webContents.send('automatic',{error:safeError(e)});}}
  timer=setInterval(auto,3600000);
  if(!DEMO)setTimeout(async()=>{try{const s=await backend.state();backend.assertChain(s);autoStarted=true;await auto();}catch{}},12000);
 });
@@ -38,10 +39,14 @@ ipcMain.handle('linkbox',async(event,action,data)=>{
  case 'cancel':backend.cancel();value={};break;
  case 'update':value=await backend.updateSubscriptions();break;
  case 'check':value=await backend.networkCheck();break;
- case 'saveBrowserCheck':if(JSON.stringify(data).length>60000)throw Error('检查报告过大');await writeJSON(path.join(backend.dataDir,'browser-check.json'),data);value={};break;
+ case 'copyIP':if(!require('node:net').isIP(data?.ip||''))throw Error('尚无有效出口 IP');clipboard.writeText(data.ip);value={};break;
+ case 'activity':uiActive=!!data?.active;value={};break;
+ case 'catalog':value=await subscriptions.catalog(backend);break;
+ case 'saveSelection':value=await subscriptions.run(backend,data);break;
+ case 'removeNodes':value=await subscriptions.remove(backend,data);break;
+ case 'downloadReport':{if(!data||JSON.stringify(data).length>60000)throw Error('无效检查报告');const r=await dialog.showSaveDialog(win,{title:'下载网络检查报告',defaultPath:'LinkBox-network-check-'+new Date().toISOString().slice(0,10)+'.json',filters:[{name:'JSON',extensions:['json']}]});if(!r.canceled&&r.filePath)await writeJSON(r.filePath,data);value={};break;}
  case 'settings':await backend.saveSettings({hourly:!!data?.hourly});value={};break;
  case 'chooseConfig':case 'chooseCore':{const dir=action==='chooseConfig';const r=await dialog.showOpenDialog(win,{title:dir?'选择 Clash Verge 配置目录':'选择 verge-mihomo.exe',properties:[dir?'openDirectory':'openFile'],...(dir?{}:{filters:[{name:'Mihomo 内核',extensions:['exe']}]})});if(!r.canceled)await backend.saveSettings({[dir?'configDir':'corePath']:r.filePaths[0]});value={};break;}
- case 'reports':await fs.mkdir(path.join(backend.dataDir),{recursive:true});await shell.openPath(backend.dataDir);value={};break;
  case 'source':await shell.openExternal('https://ip.net.coffee/claude/');value={};break;
  case 'importFolder':await shell.openPath(path.join(app.isPackaged?process.resourcesPath:__dirname,'examples'));value={};break;
  case 'choosePolicy':{if(backend.busy)throw Error('请等待测速完成');const r=await dialog.showOpenDialog(win,{title:'导入节点筛选规则',properties:['openFile'],filters:[{name:'JSON',extensions:['json']}]});if(!r.canceled){const file=r.filePaths[0];if((await fs.stat(file)).size>1024*1024)throw Error('文件过大');const p=JSON.parse(await fs.readFile(file,'utf8'));if(!p||typeof p!=='object'||!Array.isArray(p.blocked_providers)||!p.excluded_nodes||typeof p.excluded_nodes!=='object')throw Error('无效筛选规则');await writeJSON(path.join(backend.dataDir,'node-policy.json'),p);}value={};break;}

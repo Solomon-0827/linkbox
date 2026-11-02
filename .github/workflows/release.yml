@@ -58,7 +58,7 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "链路盒子 $RELEASE_TAG" --notes-file docs/release-v1.1.0.md
+      - run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "链路盒子 $RELEASE_TAG" --notes-file "docs/release-$RELEASE_TAG.md"
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
