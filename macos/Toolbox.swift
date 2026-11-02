@@ -359,7 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         rule(0,61,900)
         let overview=NSView(frame:NSRect(x:0,y:62,width:900,height:148));overview.wantsLayer=true;overview.layer?.backgroundColor=NSColor(calibratedRed:0.984,green:0.988,blue:0.992,alpha:1).cgColor;canvas.addSubview(overview)
         symbol("desktopcomputer",24,87,17,muted)
-        label("本机",48,86,40,13,ink,.medium);symbol("chevron.right",124,90,10,muted)
+        label("本机",48,86,40,13,ink,.medium);symbol("chevron.right",112,90,10,muted)
         let pill=NSView(frame:NSRect(x:143,y:80,width:307,height:29));pill.wantsLayer=true;pill.layer?.backgroundColor=NSColor.white.cgColor;pill.layer?.cornerRadius=4;pill.layer?.borderWidth=1;pill.layer?.borderColor=NSColor(calibratedWhite:0.88,alpha:1).cgColor;canvas.addSubview(pill)
         label("●",152,87,12,10,.systemGreen)
         field(entry,170,87,270,12)
@@ -414,17 +414,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         func iconButton(_ label:String,_ symbol:String,_ action:Selector,_ x:CGFloat,_ y:CGFloat)->NSButton {
             let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
         }
-        refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),84,80)
+        refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),70,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
-        manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),170,218)
-        updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),536,218)
-        chainButton=iconButton("全链路测速","speedometer",#selector(testChain),744,218)
-        settingsButton=iconButton("编辑节点","wrench",#selector(toggleNodeEditing),848,218)
+        manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),152,218)
+        updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),520,218)
+        chainButton=iconButton("全链路测速","speedometer",#selector(testChain),738,218)
+        settingsButton=iconButton("编辑节点","wrench",#selector(toggleNodeEditing),840,218)
         deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:724,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
         rule(24,771,852)
         toolbarText(feedback,44,560,11,796)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
-        toolbarText(modeLabel,638,238,11,796);modeLabel.alignment = .right
+        toolbarText(modeLabel,638,238,11,740);modeLabel.alignment = .right
         controls = [settingsButton,picker,manageButton,updateButton,refreshButton,checkButton,chainButton]
         let tray=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         tray.button?.image=NSImage(systemSymbolName:"link",accessibilityDescription:"链路盒子")
@@ -494,6 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         deleteButton?.title="删除已选（\(selectedNodes.count)）"
         deleteButton?.isEnabled = !busy && !selectedNodes.isEmpty
         deleteButton?.isHidden = !editingNodes
+        modeLabel.isHidden=editingNodes
         (settingsButton as? SoftButton)?.symbolName=editingNodes ? "checkmark" : "wrench";settingsButton?.setAccessibilityLabel(editingNodes ? "完成编辑" : "编辑节点")
         if editingNodes { for c in [manageButton,updateButton,refreshButton,checkButton,chainButton] { c?.isEnabled=false } }
     }
