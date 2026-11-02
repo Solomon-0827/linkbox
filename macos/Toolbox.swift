@@ -8,6 +8,7 @@ final class Canvas: NSView { override var isFlipped: Bool { true } }
 final class SoftButton: NSButton {
     var primary = false
     var plain = false
+    var symbolName:String?
     private var tracking:NSTrackingArea?
     private var hoverTimer:Timer?
     private var hover:CGFloat=0
@@ -41,7 +42,11 @@ final class SoftButton: NSButton {
         let color = primary ? NSColor.white.withAlphaComponent(isEnabled ? 1 : 0.5) : ink.withAlphaComponent(isEnabled ? 1 : 0.35)
         let attrs: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize:12,weight:.medium),.foregroundColor:color]
         let text = NSAttributedString(string:title,attributes:attrs)
-        text.draw(at:NSPoint(x:(bounds.width-text.size().width)/2,y:(bounds.height-text.size().height)/2))
+        let symbol=symbolName.flatMap { NSImage(systemSymbolName:$0,accessibilityDescription:nil)?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors:[color])) }
+        let iconWidth:CGFloat=symbol == nil ? 0 : 20
+        let start=(bounds.width-text.size().width-iconWidth)/2
+        if let symbol=symbol { symbol.draw(in:NSRect(x:start,y:(bounds.height-14)/2,width:14,height:14),from:.zero,operation:.sourceOver,fraction:1,respectFlipped:true,hints:nil) }
+        text.draw(at:NSPoint(x:start+iconWidth,y:(bounds.height-text.size().height)/2))
     }
 }
 
@@ -343,8 +348,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         symbol("shippingbox.fill",110,22,19,accent)
         label("Linkbox",137,22,130,13,ink,.semibold)
-        latencyButton=button("轻量测速",#selector(testLatency));latencyButton.frame=NSRect(x:222,y:729,width:104,height:32);canvas.addSubview(latencyButton)
-        chainButton=button("全链路测速",#selector(testChain));chainButton.frame=NSRect(x:336,y:729,width:116,height:32);canvas.addSubview(chainButton)
+        latencyButton=button("轻量测速",#selector(testLatency));latencyButton.frame=NSRect(x:222,y:729,width:104,height:32);canvas.addSubview(latencyButton);(latencyButton as? SoftButton)?.plain=true;(latencyButton as? SoftButton)?.symbolName="bolt"
+        chainButton=button("全链路测速",#selector(testChain));chainButton.frame=NSRect(x:336,y:729,width:116,height:32);canvas.addSubview(chainButton);(chainButton as? SoftButton)?.plain=true;(chainButton as? SoftButton)?.symbolName="point.3.connected.trianglepath.dotted"
 
         rule(0,61,900)
         let overview=NSView(frame:NSRect(x:0,y:62,width:900,height:148));overview.wantsLayer=true;overview.layer?.backgroundColor=NSColor(calibratedRed:0.984,green:0.988,blue:0.992,alpha:1).cgColor;canvas.addSubview(overview)
@@ -409,7 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         rule(24,771,852)
         refreshButton=button("↻ 刷新状态",#selector(refresh));refreshButton.frame=NSRect(x:19,y:782,width:94,height:28);(refreshButton as? SoftButton)?.plain=true;canvas.addSubview(refreshButton)
         updateButton=button("↓ 更新订阅",#selector(updateSubscriptions));updateButton.frame=NSRect(x:119,y:782,width:94,height:28);(updateButton as? SoftButton)?.plain=true;canvas.addSubview(updateButton)
-        manageButton=button("管理节点",#selector(manageNodes));manageButton.frame=NSRect(x:219,y:782,width:94,height:28);canvas.addSubview(manageButton)
+        manageButton=button("管理节点",#selector(manageNodes));manageButton.frame=NSRect(x:219,y:782,width:94,height:28);canvas.addSubview(manageButton);(manageButton as? SoftButton)?.plain=true;(manageButton as? SoftButton)?.symbolName="slider.horizontal.3"
         toolbarText(feedback,348,280,11,796)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
         toolbarText(modeLabel,638,238,11,796);modeLabel.alignment = .right
