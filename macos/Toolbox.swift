@@ -384,7 +384,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         var columnX:CGFloat=24
         for (key,title,width) in columns {
             let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(["provider","chain_delay"].contains(key) ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
-            if ["delay","chain_delay","test_state"].contains(key) { l.alignment = .right };canvas.addSubview(l)
+            if ["delay","chain_delay"].contains(key) { l.alignment = .right }
+            if key == "test_state" { l.frame.origin.x=columnX+14;l.frame.size.width=78;l.alignment = .center };canvas.addSubview(l)
             columnX += width
         }
         rule(0,250,900)
@@ -416,10 +417,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),70,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
-        manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),152,218)
+        manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),155,218);manageButton.frame.size.width=22
         updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),520,218)
         chainButton=iconButton("全链路测速","speedometer",#selector(testChain),738,218)
-        settingsButton=iconButton("编辑节点","wrench",#selector(toggleNodeEditing),180,218)
+        settingsButton=iconButton("编辑节点","gearshape",#selector(toggleNodeEditing),177,218);settingsButton.frame.size.width=22
         deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:724,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
         toolbarText(feedback,430,446,11,31)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
@@ -494,7 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         deleteButton?.isEnabled = !busy && !selectedNodes.isEmpty
         deleteButton?.isHidden = !editingNodes
         modeLabel.isHidden=editingNodes
-        (settingsButton as? SoftButton)?.symbolName=editingNodes ? "checkmark" : "wrench";settingsButton?.setAccessibilityLabel(editingNodes ? "完成编辑" : "编辑节点");settingsButton?.toolTip=editingNodes ? "完成编辑" : "编辑节点：多选移出列表"
+        (settingsButton as? SoftButton)?.symbolName=editingNodes ? "checkmark" : "gearshape";settingsButton?.setAccessibilityLabel(editingNodes ? "完成编辑" : "编辑节点");settingsButton?.toolTip=editingNodes ? "完成编辑" : "编辑节点：多选移出列表"
         if editingNodes { for c in [manageButton,updateButton,refreshButton,checkButton,chainButton] { c?.isEnabled=false } }
     }
     @objc func toggleNodeEditing() {
