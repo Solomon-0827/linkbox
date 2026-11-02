@@ -320,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let menu = NSMenu()
         let item = NSMenuItem(); menu.addItem(item)
         let submenu = NSMenu(); submenu.addItem(withTitle: "退出链路盒子", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); item.submenu = submenu; NSApp.mainMenu = menu
-        window = NSWindow(contentRect: NSRect(x:0,y:0,width:900,height:820), styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView], backing:.buffered,defer:false)
+        window = NSWindow(contentRect: NSRect(x:0,y:0,width:900,height:770), styleMask:[.titled,.closable,.miniaturizable,.fullSizeContentView], backing:.buffered,defer:false)
         window.title = "链路盒子"
         window.delegate=self
         window.acceptsMouseMovedEvents=true
@@ -329,7 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.backgroundColor = NSColor(calibratedRed:0.953,green:0.965,blue:0.980,alpha:1)
         window.appearance = NSAppearance(named:.aqua)
         window.center()
-        let canvas = Canvas(frame:NSRect(x:0,y:0,width:900,height:820)); window.contentView = canvas
+        let canvas = Canvas(frame:NSRect(x:0,y:0,width:900,height:770)); window.contentView = canvas
         func label(_ text:String,_ x:CGFloat,_ y:CGFloat,_ w:CGFloat,_ size:CGFloat=13,_ color:NSColor=muted,_ weight:NSFont.Weight = .regular) {
             let l=NSTextField(labelWithString:text); l.frame=NSRect(x:x,y:y,width:w,height:size+9); l.font = .systemFont(ofSize:size,weight:weight); l.textColor=color; canvas.addSubview(l)
         }
@@ -367,7 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         for x:CGFloat in [192,370,548,726] { rule(x,129,1,55) }
         label("出口 IP",24,128,150,11,muted,.medium)
         field(identityLine,24,147,143,14)
-        let copy=button("⧉",#selector(copyExitIP));copy.frame=NSRect(x:164,y:145,width:22,height:24);(copy as? SoftButton)?.plain=true;copy.setAccessibilityLabel("复制出口 IP");canvas.addSubview(copy)
+        let copy=button("⧉",#selector(copyExitIP));copy.frame=NSRect(x:164,y:145,width:22,height:24);(copy as? SoftButton)?.plain=true;copy.setAccessibilityLabel("复制出口 IP");copy.toolTip="复制出口 IP";canvas.addSubview(copy)
         field(identityType,24,171,160,10,muted)
         label("地区 / ISP",208,128,150,11,muted,.medium)
         field(locationLine,208,147,150,12);field(providerLine,208,169,150,10,muted);providerLine.maximumNumberOfLines=2;providerLine.usesSingleLineMode=false;providerLine.lineBreakMode = .byWordWrapping;providerLine.frame.size.height=33
@@ -383,7 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let columns:[(String,String,CGFloat)] = [("rank","排名",50),("name","中转节点名称",392),("provider","来源订阅",100),("delay","入口延迟",100),("chain_delay","全链路延迟",110),("test_state","检测状态",100)]
         var columnX:CGFloat=24
         for (key,title,width) in columns {
-            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(["provider","chain_delay","test_state"].contains(key) ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
+            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(["provider","chain_delay"].contains(key) ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
             if ["delay","chain_delay","test_state"].contains(key) { l.alignment = .right };canvas.addSubview(l)
             columnX += width
         }
@@ -402,7 +402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.target=self;nodeTable.doubleAction=#selector(doubleClickNode)
         scroll.documentView=nodeTable;canvas.addSubview(scroll)
         rule(0,718,900)
-        spinner.frame=NSRect(x:24,y:790,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
+        spinner.frame=NSRect(x:410,y:25,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
         func toolbarText(_ text:NSTextField,_ x:CGFloat,_ width:CGFloat,_ size:CGFloat,_ centerY:CGFloat=740) {
             let value=text.stringValue;text.cell=CenteredTextCell(textCell:value);text.isBordered=false;text.isEditable=false;text.drawsBackground=false
             text.frame=NSRect(x:x,y:centerY-14,width:width,height:28);text.font = .systemFont(ofSize:size,weight:.medium);text.textColor=muted;canvas.addSubview(text)
@@ -412,17 +412,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         toolbarText(lastTestLabel,198,410,11,740);refreshLastTestTime()
         autoSwitch.setAccessibilityLabel("每小时自动测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
         func iconButton(_ label:String,_ symbol:String,_ action:Selector,_ x:CGFloat,_ y:CGFloat)->NSButton {
-            let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
+            let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);b.toolTip=label;(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
         }
         refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),70,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
         manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),152,218)
         updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),520,218)
         chainButton=iconButton("全链路测速","speedometer",#selector(testChain),738,218)
-        settingsButton=iconButton("编辑节点","wrench",#selector(toggleNodeEditing),840,218)
+        settingsButton=iconButton("编辑节点","wrench",#selector(toggleNodeEditing),180,218)
         deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:724,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
-        rule(24,771,852)
-        toolbarText(feedback,44,560,11,796)
+        toolbarText(feedback,430,446,11,31)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
         toolbarText(modeLabel,638,238,11,740);modeLabel.alignment = .right
         controls = [settingsButton,picker,manageButton,updateButton,refreshButton,checkButton,chainButton]
@@ -463,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func button(_ text: String,_ action: Selector) -> NSButton { let b = SoftButton(title:text,target:self,action:action); b.isBordered = false; b.setButtonType(.momentaryPushIn); return b }
     func setBusy(_ value: Bool,_ message: String) {
-        if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;(chainButton as? SoftButton)?.symbolName="speedometer";chainButton.setAccessibilityLabel("全链路测速") }
+        if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;(chainButton as? SoftButton)?.symbolName="speedometer";chainButton.setAccessibilityLabel("全链路测速");chainButton.toolTip="全链路测速（包含入口延迟）" }
         busy = value
         nodeTable.allowsEmptySelection = true
         nodeTable.allowsTypeSelect = !value
@@ -495,7 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         deleteButton?.isEnabled = !busy && !selectedNodes.isEmpty
         deleteButton?.isHidden = !editingNodes
         modeLabel.isHidden=editingNodes
-        (settingsButton as? SoftButton)?.symbolName=editingNodes ? "checkmark" : "wrench";settingsButton?.setAccessibilityLabel(editingNodes ? "完成编辑" : "编辑节点")
+        (settingsButton as? SoftButton)?.symbolName=editingNodes ? "checkmark" : "wrench";settingsButton?.setAccessibilityLabel(editingNodes ? "完成编辑" : "编辑节点");settingsButton?.toolTip=editingNodes ? "完成编辑" : "编辑节点：多选移出列表"
         if editingNodes { for c in [manageButton,updateButton,refreshButton,checkButton,chainButton] { c?.isEnabled=false } }
     }
     @objc func toggleNodeEditing() {
@@ -588,7 +587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             if key == "delay" { label.textColor=muted }
         }
         let cell=NSTableCellView();cell.textField=label;cell.addSubview(label);label.translatesAutoresizingMaskIntoConstraints=false
-        NSLayoutConstraint.activate([label.leadingAnchor.constraint(equalTo:cell.leadingAnchor,constant:6),label.trailingAnchor.constraint(equalTo:cell.trailingAnchor,constant:-8),label.centerYAnchor.constraint(equalTo:cell.centerYAnchor),label.heightAnchor.constraint(equalToConstant:22)])
+        NSLayoutConstraint.activate([label.leadingAnchor.constraint(equalTo:cell.leadingAnchor,constant:6),label.trailingAnchor.constraint(equalTo:cell.trailingAnchor,constant:key == "chain_delay" ? -32 : -8),label.centerYAnchor.constraint(equalTo:cell.centerYAnchor),label.heightAnchor.constraint(equalToConstant:22)])
         if key == "test_state" {
             label.isHidden=true
             let pill=StatusPill(label.stringValue,label.textColor ?? muted);cell.addSubview(pill);pill.translatesAutoresizingMaskIntoConstraints=false
@@ -643,7 +642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.reloadData()
         chainRunning=kind == "chain"
         invoke([kind],message:"准备检测 · \(nodeRows.count) 个节点") { _ in self.readTestProgress(kind,finished:true);self.showFastestNodes() }
-        if chainRunning { (chainButton as? SoftButton)?.symbolName="stop.fill";chainButton.setAccessibilityLabel("停止测速");chainButton.isEnabled=true }
+        if chainRunning { (chainButton as? SoftButton)?.symbolName="stop.fill";chainButton.setAccessibilityLabel("停止测速");chainButton.toolTip="停止本轮测速";chainButton.isEnabled=true }
         chainTimer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:true) { _ in self.readTestProgress(kind) }
     }
     @objc func testChain() {
