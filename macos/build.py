@@ -11,7 +11,7 @@ contents=APP/'Contents';(contents/'MacOS').mkdir(parents=True);(contents/'Resour
 shutil.copytree(BUILD/'backend/linkbox-backend',contents/'Resources/backend')
 shutil.copy2(ROOT/'assets/ProxyToolbox.icns',contents/'Resources/ProxyToolbox.icns')
 subprocess.run(['xcrun','swiftc','-O','-target','arm64-apple-macosx13.0','-framework','AppKit','-framework','WebKit',str(ROOT/'macos/Toolbox.swift'),'-o',str(contents/'MacOS/ProxyToolbox')],check=True)
-info={'CFBundleDisplayName':'链路盒子','CFBundleExecutable':'ProxyToolbox','CFBundleIconFile':'ProxyToolbox.icns','CFBundleIdentifier':'local.solomon.proxytoolbox','CFBundleName':'链路盒子','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.1.0','CFBundleVersion':'110','LSMinimumSystemVersion':'13.0','NSHighResolutionCapable':True,'NSRequiresAquaSystemAppearance':True}
+info={'CFBundleDisplayName':'链路盒子','CFBundleExecutable':'ProxyToolbox','CFBundleIconFile':'ProxyToolbox.icns','CFBundleIdentifier':'local.solomon.proxytoolbox','CFBundleName':'链路盒子','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.2.0','CFBundleVersion':'120','LSMinimumSystemVersion':'13.0','NSHighResolutionCapable':True,'NSRequiresAquaSystemAppearance':True}
 (contents/'Info.plist').write_bytes(plistlib.dumps(info))
 shutil.copytree(ROOT/'examples',contents/'Resources/examples')
 subprocess.run(['codesign','--force','--deep','--sign','-',str(APP)],check=True)

@@ -9,13 +9,13 @@ const {downloadArtifact}=require('@electron/get');
  if(process.platform==='win32')execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',`Expand-Archive -LiteralPath '${runtime.replaceAll("'","''")}' -DestinationPath '${folder.replaceAll("'","''")}' -Force`]);
  else execFileSync('/usr/bin/unzip',['-q',runtime,'-d',folder]);
  const stage=path.join(work,'stage');await fs.rm(stage,{recursive:true,force:true});await fs.mkdir(stage,{recursive:true});
- for(const f of ['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js'])await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
+ for(const f of ['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','icons.js'])await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
  const pkg=JSON.parse(await fs.readFile(path.join(__dirname,'package.json'),'utf8'));delete pkg.devDependencies;delete pkg.scripts;await fs.writeFile(path.join(stage,'package.json'),JSON.stringify(pkg));
  for(const dep of ['yaml','https-proxy-agent','agent-base','debug','ms'])await fs.cp(path.join(__dirname,'node_modules',dep),path.join(stage,'node_modules',dep),{recursive:true});
  const asar=await import('@electron/asar');await asar.createPackage(stage,path.join(folder,'resources','app.asar'));await fs.rm(path.join(folder,'resources','default_app.asar'),{force:true});
  await fs.rename(path.join(folder,'electron.exe'),path.join(folder,'LinkBox.exe'));
  const R=await import('resedit'),exe=R.NtExecutable.from(await fs.readFile(path.join(folder,'LinkBox.exe')),{ignoreCert:true}),res=R.NtExecutableResource.from(exe);
- const info=R.Resource.VersionInfo.fromEntries(res.entries)[0];if(info){info.setFileVersion(1,1,0,0);info.setProductVersion(1,1,0,0);info.setStringValues({lang:1033,codepage:1200},{FileDescription:'链路盒子',ProductName:'链路盒子',OriginalFilename:'LinkBox.exe',CompanyName:'Solomon-0827'});info.outputToResourceEntries(res.entries);}
+ const info=R.Resource.VersionInfo.fromEntries(res.entries)[0];if(info){info.setFileVersion(...pkg.version.split('.').map(Number),0);info.setProductVersion(...pkg.version.split('.').map(Number),0);info.setStringValues({lang:1033,codepage:1200},{FileDescription:'链路盒子',ProductName:'链路盒子',OriginalFilename:'LinkBox.exe',CompanyName:'Solomon-0827'});info.outputToResourceEntries(res.entries);}
  const ico=R.Data.IconFile.from(await fs.readFile(path.join(__dirname,'icon.ico')));for(const group of R.Resource.IconGroupEntry.fromEntries(res.entries))R.Resource.IconGroupEntry.replaceIconsForResource(res.entries,group.id,group.lang,ico.icons.map(x=>x.data));res.outputResource(exe);await fs.writeFile(path.join(folder,'LinkBox.exe'),Buffer.from(exe.generate()));
  await fs.cp(path.join(root,'examples'),path.join(folder,'resources/examples'),{recursive:true});await fs.copyFile(path.join(root,'README.md'),path.join(folder,'README.md'));
  const zip=path.join(out,'linkbox-windows-x64.zip');await fs.rm(zip,{force:true});

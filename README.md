@@ -2,13 +2,13 @@
 
 管理 Clash Verge 的中转节点，保持固定出口，独立检查整条代理链路。
 
-[下载最新版](https://github.com/Solomon-0827/linkbox/releases/latest) · [使用与配置](docs/setup.md) · [发布说明](docs/release-v1.1.0.md)
+[下载最新版](https://github.com/Solomon-0827/linkbox/releases/latest) · [使用与配置](docs/setup.md) · [发布说明](docs/release-v1.2.0.md)
 
 ## 功能
 
 - macOS 原生浅色界面、Windows 桌面界面；关闭窗口后继续后台运行。
 - 双击选择中转入口，固定出口保持不变。
-- 入口测速、全链路测速，最多 **5 条线路并发**；独立临时内核不启用 TUN，不切换正在使用的节点。
+- 全链路测速同时测量入口延迟，最多 **5 条线路并发**；独立临时内核不启用 TUN，不切换正在使用的节点。
 - macOS「管理节点」自动读取 Clash Verge 本地订阅，按订阅分组选择节点，支持全部/分组全选与取消；保存时保留当前入口。
 - 本机保存节点筛选规则：屏蔽整个订阅或指定节点，更新订阅后仍保留筛选。
 - 启动及每小时自动测速、最后测速时间、结果排序与停止测速。
