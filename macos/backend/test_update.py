@@ -5,7 +5,7 @@ from contextlib import ExitStack
 import yaml,runtime,subscription_update as u
 
 class UpdateTests(unittest.TestCase):
- def exercise(self,fail_validation=False,fail_reload=False,selection=None):
+ def exercise(self,fail_validation=False,fail_reload=False,selection=None,persisted=False):
   with tempfile.TemporaryDirectory() as tmp,ExitStack() as stack:
    base=Path(tmp);cfg=base/'config';cfg.mkdir();(cfg/'profiles').mkdir()
    pin={'name':'current','type':'ss','server':'example.invalid','port':443}
@@ -13,6 +13,9 @@ class UpdateTests(unittest.TestCase):
    target=cfg/'clash-verge.yaml';original=u.dump(conf);target.write_bytes(original)
    (base/'subscriptions.json').write_text(json.dumps({'sources':[{'name':'kept','url':'https://example.invalid/sub'},{'name':'retired','url':'https://example.invalid/old'}]}))
    (base/'node-policy.json').write_text(json.dumps({'blocked_providers':['retired'],'excluded_nodes':{'kept':['bad']}}))
+   if persisted:
+    (base/'node-policy.json').write_text(json.dumps({'blocked_providers':['kept'],'selected_nodes':{'kept':['fast']}}))
+    (base/'subscriptions.json').write_text(json.dumps({'sources':[{'name':'kept','url':'https://example.invalid/sub'}]}))
    state={'entry':'current','exit':u.t.EXIT,'dialer':u.t.ENTRY,'mode':'global','tun':True}
    for obj,key,value in [(runtime,'BASE',base),(u.t,'BASE',base),(u.c,'CONFIG_DIR',cfg)]:stack.enter_context(patch.object(obj,key,value))
    stack.enter_context(patch.object(u.c,'active_state',return_value=(state,[])))
@@ -30,11 +33,11 @@ class UpdateTests(unittest.TestCase):
     changed=yaml.safe_load(target.read_text());group=changed['proxy-groups'][0]
     self.assertEqual(group['proxies'],['current']);self.assertEqual(group['use'],['kept'])
     self.assertEqual(changed['proxies'],[pin]);self.assertNotIn('retired',changed['proxy-providers'])
-    if selection is None:self.assertIn('^bad$',changed['proxy-providers']['kept']['exclude-filter'])
+    if selection is None and not persisted:self.assertIn('^bad$',changed['proxy-providers']['kept']['exclude-filter'])
     else:
      self.assertIn('^fast$',changed['proxy-providers']['kept']['filter'])
      saved=json.loads((base/'node-policy.json').read_text())
-     self.assertEqual(saved['selected_nodes'],selection)
+     self.assertEqual(saved['selected_nodes'],{'kept':['fast']} if persisted else selection)
     self.assertEqual(api.call_args.args[:2],('PUT','/configs?force=false'))
     live=yaml.safe_load(api.call_args.args[2]['payload']);self.assertEqual(live['proxy-providers']['kept']['type'],'inline')
     self.assertNotIn('path',live['proxy-providers']['kept'])
@@ -43,3 +46,5 @@ class UpdateTests(unittest.TestCase):
  def test_reload_error_restores_local_files(self):self.exercise(fail_reload=True)
 
  def test_explicit_selection_persists_allowlist_and_pin(self):self.exercise(selection={'kept':['fast']})
+
+ def test_refresh_honors_saved_selection_over_old_provider_block(self):self.exercise(persisted=True)

@@ -34,8 +34,9 @@ def provider_for(name, fallback='本地节点'):
 def allowed(name, provider=None):
     policy=read_json('node-policy.json')
     provider=provider_for(name,provider or '本地节点')
-    if name==policy.get('pinned_entry'):return True
-    if 'selected_nodes' in policy:return name in policy['selected_nodes'].get(provider,[])
+    if 'selected_nodes' in policy:
+        if name==policy.get('pinned_entry'):return True
+        return name in policy['selected_nodes'].get(provider,[])
     if provider.lower() in [str(p).lower() for p in policy.get('blocked_providers',[])]:return False
     excluded=policy.get('excluded_nodes',{})
     return name not in excluded.get(provider,[]) and name not in excluded.get('*',[])

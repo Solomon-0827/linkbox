@@ -46,16 +46,17 @@ def run(prepared=None, selection=None, sources_override=None, verify=None):
         if before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链路不符，未修改')
         path=c.CONFIG_DIR/'clash-verge.yaml';original_config=path.read_bytes();conf=yaml.safe_load(original_config)
         registry=runtime.read_json('subscriptions.json').get('sources',[]) if sources_override is None else sources_override
-        blocked={x.lower() for x in runtime.read_json('node-policy.json').get('blocked_providers',[])}
+        policy=runtime.read_json('node-policy.json')
+        selected=selection if selection is not None else policy.get('selected_nodes')
+        blocked={x.lower() for x in policy.get('blocked_providers',[])}
         if not registry and sources_override is None:
             registry=[{'name':name,'url':p.get('url')} for name,p in conf.get('proxy-providers',{}).items() if p.get('type')=='http']
-        sources=[x for x in registry if selection is not None or x.get('name','').lower() not in blocked]
-        if not sources and selection is None:raise RuntimeError('没有可更新的订阅；请按 README 设置本机 subscriptions.json')
+        sources=[x for x in registry if selected is not None or x.get('name','').lower() not in blocked]
+        if not sources and selected is None:raise RuntimeError('没有可更新的订阅；请按 README 设置本机 subscriptions.json')
         if len({x['name'] for x in sources})!=len(sources):raise RuntimeError('订阅名称重复')
         old_nodes,_=c.load_nodes();pin=copy.deepcopy(old_nodes.get(before['entry']))
         if not pin:raise RuntimeError('无法保留当前入口；未修改')
-        updates={};definitions={};mapping={};dns={};policy=runtime.read_json('node-policy.json');excluded=policy.get('excluded_nodes',{})
-        selected=selection if selection is not None else policy.get('selected_nodes')
+        updates={};definitions={};mapping={};dns={};excluded=policy.get('excluded_nodes',{})
         for source in sources:
             name=source['name']
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}',name):raise RuntimeError('订阅名称请使用英文字母、数字或短横线')
