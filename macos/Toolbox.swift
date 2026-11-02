@@ -31,13 +31,13 @@ final class SoftButton: NSButton {
     }
     override func draw(_ dirtyRect: NSRect) {
         let amount=isEnabled ? hover : 0
-        let base=primary ? accent : NSColor.white
+        let base=primary ? accent : NSColor(calibratedRed:0.95,green:0.965,blue:0.985,alpha:1)
         let target=primary ? NSColor(calibratedRed:0.10,green:0.29,blue:0.77,alpha:1) : NSColor(calibratedRed:0.92,green:0.95,blue:1,alpha:1)
         let fill=base.blended(withFraction:isHighlighted ? 0.85 : amount,of:target) ?? base
         (isEnabled ? (isHighlighted ? fill.withAlphaComponent(0.7) : fill) : fill.withAlphaComponent(0.35)).setFill()
-        let path=NSBezierPath(roundedRect:bounds.insetBy(dx:isHighlighted ? 1.5 : 0.5,dy:isHighlighted ? 1.5 : 0.5),xRadius:5,yRadius:5)
+        let path=NSBezierPath(roundedRect:bounds.insetBy(dx:isHighlighted ? 1.5 : 0.5,dy:isHighlighted ? 1.5 : 0.5),xRadius:8,yRadius:8)
         if !plain || amount>0 || isHighlighted { path.fill() }
-        if !primary && !plain { NSColor(calibratedWhite:0.82,alpha:isEnabled ? 1 : 0.5).setStroke();path.lineWidth=1;path.stroke() }
+        if !primary && !plain { NSColor(calibratedWhite:0.90,alpha:isEnabled ? 1 : 0.5).setStroke();path.lineWidth=1;path.stroke() }
         let color = primary ? NSColor.white.withAlphaComponent(isEnabled ? 1 : 0.5) : ink.withAlphaComponent(isEnabled ? 1 : 0.35)
         let attrs: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize:12,weight:.medium),.foregroundColor:color]
         let text = NSAttributedString(string:title,attributes:attrs)
@@ -55,7 +55,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:820,height:640),styleMask:[.titled],backing:.buffered,defer:false)
     let summary=NSTextField(labelWithString:"")
     let sourceTable=NSTableView()
-    let sourceTitle=NSTextField(labelWithString:"")
+    let groupCheck=NSButton(checkboxWithTitle:"全选本组",target:nil,action:nil)
     let scroll=NSScrollView()
     let document=Canvas(frame:.zero)
     var checks:[NSButton]=[]
@@ -89,11 +89,9 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         sourceTable.addTableColumn(NSTableColumn(identifier:NSUserInterfaceItemIdentifier("subscription")));sourceTable.tableColumns[0].width=190
         sourceTable.headerView=nil;sourceTable.rowHeight=60;sourceTable.intercellSpacing=NSSize(width:0,height:0);sourceTable.dataSource=self;sourceTable.delegate=self;sourceTable.allowsEmptySelection=false;sourceTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         sourceTable.backgroundColor=NSColor(calibratedRed:0.96,green:0.97,blue:0.99,alpha:1);sidebar.documentView=sourceTable;view.addSubview(sidebar)
-        sourceTitle.frame=NSRect(x:240,y:140,width:360,height:24);sourceTitle.font = .systemFont(ofSize:14,weight:.semibold);sourceTitle.textColor=ink;view.addSubview(sourceTitle)
-        _=button("全选本组",#selector(selectGroup),NSRect(x:610,y:134,width:86,height:30))
-        _=button("取消本组",#selector(clearGroup),NSRect(x:706,y:134,width:86,height:30))
-        scroll.frame=NSRect(x:236,y:178,width:560,height:390);scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.borderType = .lineBorder
-        document.frame=NSRect(x:0,y:0,width:538,height:390);scroll.documentView=document;view.addSubview(scroll)
+        groupCheck.frame=NSRect(x:12,y:6,width:240,height:28);groupCheck.target=self;groupCheck.action=#selector(toggleGroup);groupCheck.allowsMixedState=true
+        scroll.frame=NSRect(x:236,y:130,width:560,height:438);scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.borderType = .lineBorder
+        document.frame=NSRect(x:0,y:0,width:538,height:438);scroll.documentView=document;view.addSubview(scroll)
         for source in catalog["sources"] as? [[String:Any]] ?? [] {
             guard let id=source["id"] as? String else { continue }
             sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? id;groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
@@ -127,9 +125,10 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     }
     func renderSource() {
         for v in document.subviews { v.removeFromSuperview() }
-        sourceTitle.stringValue=sourceNames[activeSource] ?? "暂无订阅"
+        updateGroupCheck()
         let items=groups[activeSource] ?? []
-        var y:CGFloat=0
+        document.addSubview(groupCheck)
+        var y:CGFloat=44
         for b in items {
             let value=(nodeNames[b.tag] ?? "")+(b.isEnabled ? "" : "  · 当前入口")
             let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=b.isEnabled ? ink : accent
@@ -141,12 +140,23 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         }
         if items.isEmpty {
             let value=sourceIDs.isEmpty ? "未发现订阅，请先在 Clash Verge 添加订阅。" : warnings[activeSource] ?? "暂无节点"
-            let label=NSTextField(wrappingLabelWithString:value);label.frame=NSRect(x:18,y:24,width:500,height:60);label.font = .systemFont(ofSize:12);label.textColor=muted;document.addSubview(label)
+            let label=NSTextField(wrappingLabelWithString:value);label.frame=NSRect(x:18,y:56,width:500,height:60);label.font = .systemFont(ofSize:12);label.textColor=muted;document.addSubview(label)
         }
-        document.setFrameSize(NSSize(width:538,height:max(y,390)))
+        document.setFrameSize(NSSize(width:538,height:max(y,438)))
         scroll.contentView.scroll(to:.zero);scroll.reflectScrolledClipView(scroll.contentView)
     }
+    func updateGroupCheck() {
+        let items=groups[activeSource] ?? [],count=items.filter{$0.state == .on}.count
+        groupCheck.state=count == 0 ? .off : count == items.count ? .on : .mixed
+        groupCheck.isEnabled=items.contains{$0.isEnabled}
+        groupCheck.title="全选本组 · \(count)/\(items.count)"
+    }
+    @objc func toggleGroup() {
+        let items=groups[activeSource] ?? []
+        set(items,items.allSatisfy{$0.state == .on} ? .off : .on)
+    }
     func updateCounts() {
+        updateGroupCheck()
         summary.stringValue="已选 \(checks.filter{$0.state == .on}.count) / \(checks.count) 个节点 · \(groups.count) 个订阅"
         sourceTable.reloadData(forRowIndexes:IndexSet(integersIn:0..<sourceIDs.count),columnIndexes:IndexSet(integer:0))
     }
@@ -287,6 +297,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var updateButton: NSButton!
     var refreshButton: NSButton!
     var checkButton: NSButton!
+    var settingsButton:NSButton!
+    var deleteButton:NSButton!
+    var editingNodes=false
+    var selectedNodes=Set<String>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named:.aqua)
@@ -329,9 +343,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         symbol("shippingbox.fill",110,22,19,accent)
         label("Linkbox",137,22,130,13,ink,.semibold)
-        latencyButton=button("轻量测速",#selector(testLatency));latencyButton.frame=NSRect(x:658,y:15,width:100,height:32);canvas.addSubview(latencyButton)
-        chainButton=button("全链路测速",#selector(testChain));chainButton.frame=NSRect(x:770,y:15,width:106,height:32);canvas.addSubview(chainButton)
-        (latencyButton as? SoftButton)?.primary=true
+        latencyButton=button("轻量测速",#selector(testLatency));latencyButton.frame=NSRect(x:222,y:729,width:104,height:32);canvas.addSubview(latencyButton)
+        chainButton=button("全链路测速",#selector(testChain));chainButton.frame=NSRect(x:336,y:729,width:116,height:32);canvas.addSubview(chainButton)
+
         rule(0,61,900)
         let overview=NSView(frame:NSRect(x:0,y:62,width:900,height:148));overview.wantsLayer=true;overview.layer?.backgroundColor=NSColor(calibratedRed:0.984,green:0.988,blue:0.992,alpha:1).cgColor;canvas.addSubview(overview)
         symbol("desktopcomputer",24,87,17,muted)
@@ -364,9 +378,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             columnX += width
         }
         rule(0,250,900)
-        let scroll=NSScrollView(frame:NSRect(x:24,y:251,width:852,height:459))
+        let scroll=NSScrollView(frame:NSRect(x:24,y:251,width:852,height:421))
         scroll.hasVerticalScroller=true;scroll.scrollerStyle = .overlay;scroll.drawsBackground=true;scroll.backgroundColor = .white;scroll.borderType = .noBorder
-        nodeTable.frame=NSRect(x:0,y:0,width:852,height:459);nodeTable.style = .plain;nodeTable.headerView=nil
+        nodeTable.frame=NSRect(x:0,y:0,width:852,height:421);nodeTable.style = .plain;nodeTable.headerView=nil
         for (key,title,width) in columns {
             let column=NSTableColumn(identifier:NSUserInterfaceItemIdentifier(key));column.title=title;column.minWidth=width;column.maxWidth=width;column.width=width;nodeTable.addTableColumn(column)
         }
@@ -377,19 +391,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.delegate=self;nodeTable.dataSource=self;nodeTable.allowsMultipleSelection=false
         nodeTable.target=self;nodeTable.doubleAction=#selector(doubleClickNode)
         scroll.documentView=nodeTable;canvas.addSubview(scroll)
-        rule(0,710,900)
+        rule(0,672,900)
         spinner.frame=NSRect(x:326,y:790,width:12,height:12);spinner.style = .spinning;spinner.controlSize = .small;spinner.isDisplayedWhenStopped=false;canvas.addSubview(spinner)
         func toolbarText(_ text:NSTextField,_ x:CGFloat,_ width:CGFloat,_ size:CGFloat,_ centerY:CGFloat=740) {
             let value=text.stringValue;text.cell=CenteredTextCell(textCell:value);text.isBordered=false;text.isEditable=false;text.drawsBackground=false
             text.frame=NSRect(x:x,y:centerY-14,width:width,height:28);text.font = .systemFont(ofSize:size,weight:.medium);text.textColor=muted;canvas.addSubview(text)
         }
-        toolbarText(NSTextField(labelWithString:"每小时测速"),72,94,12)
-        rule(179,729,1,22)
-        toolbarText(lastTestLabel,198,410,11);refreshLastTestTime()
-        autoSwitch.setAccessibilityLabel("每小时自动测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
-        let reportButton=button("检查报告",#selector(reports));reportButton.frame=NSRect(x:623,y:726,width:74,height:28);(reportButton as? SoftButton)?.plain=true;canvas.addSubview(reportButton)
-        checkButton=button("检查网络",#selector(check));checkButton.frame=NSRect(x:701,y:726,width:74,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
-        let ipButton=button("Net.Coffee ↗",#selector(showIP));ipButton.frame=NSRect(x:781,y:726,width:95,height:28);canvas.addSubview(ipButton)
+        toolbarText(NSTextField(labelWithString:"每小时测速"),72,94,12,695)
+        rule(179,684,1,22)
+        toolbarText(lastTestLabel,198,410,11,695);refreshLastTestTime()
+        autoSwitch.setAccessibilityLabel("每小时自动测速");autoSwitch.frame=NSRect(x:24,y:682,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
+        let reportButton=button("检查报告",#selector(reports));reportButton.frame=NSRect(x:24,y:729,width:88,height:32);(reportButton as? SoftButton)?.plain=true;canvas.addSubview(reportButton)
+        checkButton=button("检查网络",#selector(check));checkButton.frame=NSRect(x:122,y:729,width:90,height:32);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
+        let ipButton=button("Net.Coffee ↗",#selector(showIP));ipButton.frame=NSRect(x:766,y:729,width:110,height:32);canvas.addSubview(ipButton)
+        settingsButton=button("设置",#selector(toggleNodeEditing));settingsButton.frame=NSRect(x:682,y:729,width:74,height:32);canvas.addSubview(settingsButton)
+        deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:679,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
         rule(24,771,852)
         refreshButton=button("↻ 刷新状态",#selector(refresh));refreshButton.frame=NSRect(x:19,y:782,width:94,height:28);(refreshButton as? SoftButton)?.plain=true;canvas.addSubview(refreshButton)
         updateButton=button("↓ 更新订阅",#selector(updateSubscriptions));updateButton.frame=NSRect(x:119,y:782,width:94,height:28);(updateButton as? SoftButton)?.plain=true;canvas.addSubview(updateButton)
@@ -397,7 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         toolbarText(feedback,348,280,11,796)
         feedback.maximumNumberOfLines=2;feedback.usesSingleLineMode=false;feedback.lineBreakMode = .byWordWrapping
         toolbarText(modeLabel,638,238,11,796);modeLabel.alignment = .right
-        controls = [picker,manageButton,updateButton,refreshButton,checkButton,latencyButton,chainButton]
+        controls = [settingsButton,picker,manageButton,updateButton,refreshButton,checkButton,latencyButton,chainButton]
         let tray=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
         tray.button?.image=NSImage(systemSymbolName:"link",accessibilityDescription:"链路盒子")
         let trayMenu=NSMenu()
@@ -416,7 +432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         hourlyTestTimer?.invalidate();hourlyTestTimer=nil
         guard autoTestsEnabled else { return }
         let timer=Timer(timeInterval:3600,repeats:true) { [weak self] _ in
-            guard let self=self,self.autoTestsEnabled,!self.busy,self.nodePicker == nil else { return }
+            guard let self=self,self.autoTestsEnabled,!self.busy,self.nodePicker == nil,!self.editingNodes else { return }
             self.invoke(["status"],message:"正在读取 Clash 状态…") { _ in
                 if self.autoTestsEnabled { self.beginTest("chain") }
             }
@@ -440,6 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.allowsEmptySelection = true
         nodeTable.allowsTypeSelect = !value
         for c in controls { c.isEnabled = !value }
+        updateEditingControls()
         if value { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         feedback.stringValue = message == "状态已更新。没有修改代理配置。" ? "\(nodeRows.count) 个节点 · 双击切换中转" : message
     }
@@ -457,8 +474,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let da=a[sortKey] as? Double ?? Double.greatestFiniteMagnitude,db=b[sortKey] as? Double ?? Double.greatestFiniteMagnitude
             return da == db ? (a["name"] as? String ?? "") < (b["name"] as? String ?? "") : da < db
         }
+        selectedNodes.removeAll();updateEditingControls()
         nodeTable.reloadData()
         nodeTable.deselectAll(nil)
+    }
+    func updateEditingControls() {
+        deleteButton?.title="删除已选（\(selectedNodes.count)）"
+        deleteButton?.isEnabled = !busy && !selectedNodes.isEmpty
+        deleteButton?.isHidden = !editingNodes
+        settingsButton?.title=editingNodes ? "完成" : "设置"
+        if editingNodes { for c in [manageButton,updateButton,refreshButton,checkButton,latencyButton,chainButton] { c?.isEnabled=false } }
+    }
+    @objc func toggleNodeEditing() {
+        guard !busy else { return }
+        editingNodes.toggle();selectedNodes.removeAll();setBusy(false,editingNodes ? "勾选要移出列表的节点 · 当前入口保留" : "状态已更新。没有修改代理配置。")
+        nodeTable.reloadData()
+    }
+    @objc func selectNodeForRemoval(_ sender:NSButton) {
+        guard editingNodes,!busy,sender.tag<nodeRows.count,let name=nodeRows[sender.tag]["name"] as? String,name != current else { return }
+        if sender.state == .on { selectedNodes.insert(name) } else { selectedNodes.remove(name) }
+        updateEditingControls()
+    }
+    @objc func removeSelectedNodes() {
+        guard !busy,editingNodes,!selectedNodes.isEmpty,let data=try? JSONSerialization.data(withJSONObject:["names":Array(selectedNodes),"entry":current]) else { return }
+        invoke(["remove-list-nodes"],message:"正在更新节点列表…",input:data) { _ in self.selectedNodes.removeAll();self.updateEditingControls() }
     }
     func showFastestNodes() {
         guard !nodeRows.isEmpty else { return }
@@ -467,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc func doubleClickNode() {
         let row=nodeTable.clickedRow
-        guard !busy,row>=0,row<nodeRows.count,let name=nodeRows[row]["name"] as? String else { return }
+        guard !busy,!editingNodes,row>=0,row<nodeRows.count,let name=nodeRows[row]["name"] as? String else { return }
         picker.selectItem(withTitle:name)
         switchNode()
     }
@@ -508,6 +547,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
         guard row<nodeRows.count,let key=tableColumn?.identifier.rawValue else{return nil}
+        if key == "rank",editingNodes {
+            let name=nodeRows[row]["name"] as? String ?? ""
+            let cell=NSTableCellView();let check=NSButton(checkboxWithTitle:"",target:self,action:#selector(selectNodeForRemoval(_:)));check.tag=row;check.state=selectedNodes.contains(name) ? .on : .off;check.isEnabled = !busy && name != current;check.setAccessibilityLabel(name == current ? "当前入口，保留" : "选择删除 " + name);cell.addSubview(check);check.translatesAutoresizingMaskIntoConstraints=false
+            NSLayoutConstraint.activate([check.centerXAnchor.constraint(equalTo:cell.centerXAnchor),check.centerYAnchor.constraint(equalTo:cell.centerYAnchor)])
+            return cell
+        }
         let item=nodeRows[row];let label=NSTextField(labelWithString:"");label.cell=CenteredTextCell(textCell:"");label.isBordered=false;label.isEditable=false;label.drawsBackground=false
         label.font = .systemFont(ofSize:13);label.textColor=ink;label.lineBreakMode = .byTruncatingTail
         switch key {

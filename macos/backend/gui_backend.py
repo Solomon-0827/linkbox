@@ -111,6 +111,40 @@ def change(target,previous):
     return {'message':warning or '已切换中转入口，美国静态出口保持不变。建议运行网络检查。','state':after}
 
 
+def remove_list_nodes(request):
+    """Only edit the local candidate policy; never reload or switch Clash."""
+    names=request.get('names')
+    if not isinstance(names,list) or not names or not all(isinstance(n,str) for n in names):
+        raise RuntimeError('请选择要删除的节点')
+    with open(t.BASE/'latency.lock','a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise RuntimeError('正在测速，请稍后编辑节点')
+        before=snapshot(False)
+        if request.get('entry')!=before['entry'] or before['entry'] in names:
+            raise RuntimeError('当前入口已变化或被选中，请刷新列表；当前入口不能删除')
+        if not set(names)<=set(before['nodes']):
+            raise RuntimeError('节点列表已变化，请刷新后重试')
+        path=t.BASE/'node-policy.json'
+        original=path.read_bytes() if path.exists() else None
+        policy=json.loads(original) if original is not None else {}
+        removed=set(names)
+        if 'selected_nodes' in policy:
+            policy['selected_nodes']={key:[n for n in items if n not in removed] for key,items in policy['selected_nodes'].items()}
+        excluded=policy.setdefault('excluded_nodes',{})
+        excluded['*']=sorted(set(excluded.get('*',[]))|removed)
+        if policy.get('pinned_entry') in removed:policy.pop('pinned_entry')
+        _,proxies=t.state()
+        if proxies.get(t.ENTRY,{}).get('now')!=before['entry'] or (path.read_bytes() if path.exists() else None)!=original:
+            raise RuntimeError('状态已变化，请刷新后重试')
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w',dir=t.BASE,prefix='.node-policy-',delete=False) as temp:
+            json.dump(policy,temp,ensure_ascii=False,indent=2)
+            tmp=Path(temp.name)
+        try:os.replace(tmp,path)
+        finally:tmp.unlink(missing_ok=True)
+    return {'message':f'已从列表移除 {len(removed)} 个节点，可通过管理节点重新加入。','state':snapshot()}
+
+
 def ip_info():
     # Explicitly use Clash. A failed proxy request must never silently go direct.
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({'https':'http://127.0.0.1:7897'}),urllib.request.HTTPSHandler(context=runtime.ssl_context()))
@@ -139,6 +173,7 @@ def main():
         import subscription_update
         result=subscription_update.run()
         result['state']=snapshot()
+    elif action=='remove-list-nodes':result=remove_list_nodes(json.load(sys.stdin))
     elif action=='latency':result=latency()
     elif action=='chain':
         import chain_test
