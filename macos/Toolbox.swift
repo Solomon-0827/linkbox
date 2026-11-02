@@ -45,93 +45,114 @@ final class SoftButton: NSButton {
     }
 }
 
-final class SubscriptionPicker: NSObject {
-    let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:760,height:640),styleMask:[.titled],backing:.buffered,defer:false)
-    let summary = NSTextField(labelWithString:"")
+final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:820,height:640),styleMask:[.titled],backing:.buffered,defer:false)
+    let summary=NSTextField(labelWithString:"")
+    let sourceTable=NSTableView()
+    let sourceTitle=NSTextField(labelWithString:"")
+    let scroll=NSScrollView()
+    let document=Canvas(frame:.zero)
     var checks:[NSButton]=[]
     var groups:[String:[NSButton]]=[:]
-    var groupLabels:[String:NSTextField]=[:]
-    var groupNames:[String:String]=[:]
+    var sourceIDs:[String]=[]
+    var sourceNames:[String:String]=[:]
     var nodeNames:[Int:String]=[:]
-    var sourceIDs:[Int:String]=[:]
-    var scrollView:NSScrollView!
-    var subscriptionOffsets:[Int:CGFloat]=[:]
-    var fingerprint:String
-    var onSave:([String:Any])->Void
-    var onCancel:()->Void
+    var warnings:[String:String]=[:]
+    var activeSource:String=""
+    let fingerprint:String
+    let onSave:([String:Any])->Void
+    let onCancel:()->Void
     init(catalog:[String:Any],save:@escaping ([String:Any])->Void,cancel:@escaping ()->Void) {
         fingerprint=catalog["fingerprint"] as? String ?? "";onSave=save;onCancel=cancel
         super.init()
         panel.title="管理节点";panel.appearance=NSAppearance(named:.aqua)
-        let view=Canvas(frame:NSRect(x:0,y:0,width:760,height:640));panel.contentView=view
+        let view=Canvas(frame:NSRect(x:0,y:0,width:820,height:640));panel.contentView=view
         view.wantsLayer=true;view.layer?.backgroundColor=NSColor.white.cgColor
-        func text(_ value:String,_ frame:NSRect,_ size:CGFloat=12,_ color:NSColor=muted)->NSTextField {
-            let label=NSTextField(wrappingLabelWithString:value);label.frame=frame;label.font = .systemFont(ofSize:size);label.textColor=color;view.addSubview(label);return label
+        func text(_ value:String,_ frame:NSRect,_ size:CGFloat=12,_ color:NSColor=muted) {
+            let label=NSTextField(wrappingLabelWithString:value);label.frame=frame;label.font = .systemFont(ofSize:size);label.textColor=color;view.addSubview(label)
         }
-        _=text("选择加入列表的节点",NSRect(x:24,y:18,width:500,height:28),19,ink)
-        _=text("按 Clash Verge 订阅分组 · 保存后生效 · 当前入口自动保留",NSRect(x:24,y:52,width:710,height:22))
         func button(_ title:String,_ action:Selector,_ frame:NSRect)->NSButton {
             let b=SoftButton(title:title,target:self,action:action);b.isBordered=false;b.frame=frame;view.addSubview(b);return b
         }
+        text("选择加入列表的节点",NSRect(x:24,y:18,width:650,height:28),19,ink)
+        text("左侧选择订阅，右侧勾选节点 · 保存后生效 · 当前入口自动保留",NSRect(x:24,y:52,width:770,height:22))
         _=button("全部选中",#selector(selectAll),NSRect(x:24,y:86,width:88,height:30))
         _=button("全部取消",#selector(clearAll),NSRect(x:122,y:86,width:88,height:30))
-        summary.frame=NSRect(x:230,y:92,width:300,height:22);summary.font = .systemFont(ofSize:12);summary.textColor=muted;view.addSubview(summary)
-        let jump=NSPopUpButton(frame:NSRect(x:548,y:86,width:188,height:30));jump.addItem(withTitle:"跳转到订阅");jump.target=self;jump.action=#selector(jumpToSubscription(_:));view.addSubview(jump)
-        let scroll=NSScrollView(frame:NSRect(x:24,y:130,width:712,height:438));scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.borderType = .lineBorder
-        let document=Canvas(frame:NSRect(x:0,y:0,width:690,height:438));scroll.documentView=document;view.addSubview(scroll);scrollView=scroll
-        var y:CGFloat=0
+        summary.frame=NSRect(x:230,y:92,width:560,height:22);summary.font = .systemFont(ofSize:12);summary.textColor=muted;view.addSubview(summary)
+        let sidebar=NSScrollView(frame:NSRect(x:24,y:130,width:194,height:438));sidebar.hasVerticalScroller=true;sidebar.autohidesScrollers=true;sidebar.borderType = .lineBorder
+        sourceTable.addTableColumn(NSTableColumn(identifier:NSUserInterfaceItemIdentifier("subscription")));sourceTable.tableColumns[0].width=190
+        sourceTable.headerView=nil;sourceTable.rowHeight=60;sourceTable.intercellSpacing=NSSize(width:0,height:0);sourceTable.dataSource=self;sourceTable.delegate=self;sourceTable.allowsEmptySelection=false;sourceTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        sourceTable.backgroundColor=NSColor(calibratedRed:0.96,green:0.97,blue:0.99,alpha:1);sidebar.documentView=sourceTable;view.addSubview(sidebar)
+        sourceTitle.frame=NSRect(x:240,y:140,width:360,height:24);sourceTitle.font = .systemFont(ofSize:14,weight:.semibold);sourceTitle.textColor=ink;view.addSubview(sourceTitle)
+        _=button("全选本组",#selector(selectGroup),NSRect(x:610,y:134,width:86,height:30))
+        _=button("取消本组",#selector(clearGroup),NSRect(x:706,y:134,width:86,height:30))
+        scroll.frame=NSRect(x:236,y:178,width:560,height:390);scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.borderType = .lineBorder
+        document.frame=NSRect(x:0,y:0,width:538,height:390);scroll.documentView=document;view.addSubview(scroll)
         for source in catalog["sources"] as? [[String:Any]] ?? [] {
             guard let id=source["id"] as? String else { continue }
-            groups[id]=[];groupNames[id]=source["name"] as? String ?? id
-            subscriptionOffsets[jump.numberOfItems]=y;jump.addItem(withTitle:groupNames[id] ?? id)
-            let header=NSView(frame:NSRect(x:0,y:y,width:690,height:48));header.wantsLayer=true;header.layer?.backgroundColor=NSColor(calibratedRed:0.95,green:0.97,blue:1,alpha:1).cgColor;document.addSubview(header)
-            let label=NSTextField(labelWithString:"");label.frame=NSRect(x:14,y:14,width:440,height:22);label.font = .systemFont(ofSize:13,weight:.semibold);label.textColor=ink;header.addSubview(label);groupLabels[id]=label
-            for (title,action,x) in [("全选",#selector(selectGroup(_:)),CGFloat(520)),("取消",#selector(clearGroup(_:)),CGFloat(596))] {
-                let b=SoftButton(title:title,target:self,action:action);b.isBordered=false;b.identifier=NSUserInterfaceItemIdentifier(id);b.frame=NSRect(x:x,y:9,width:66,height:30);header.addSubview(b)
-            }
-            y+=48
-            let nodes=source["nodes"] as? [[String:Any]] ?? []
-            if nodes.isEmpty {
-                let warning=NSTextField(wrappingLabelWithString:source["warning"] as? String ?? "暂无节点")
-                warning.frame=NSRect(x:14,y:y+10,width:660,height:36);warning.font = .systemFont(ofSize:12);warning.textColor=muted;document.addSubview(warning);y+=54
-            }
-            for node in nodes {
+            sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? id;groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
+            for node in source["nodes"] as? [[String:Any]] ?? [] {
                 guard let name=node["name"] as? String else { continue }
                 let current=node["current"] as? Bool ?? false
-                let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)))
-                b.frame=NSRect(x:14,y:y+9,width:22,height:24);b.tag=checks.count;b.state=(node["selected"] as? Bool ?? false) || current ? .on : .off
-                b.isEnabled = !current;b.setAccessibilityLabel(name+(current ? "，当前入口，自动保留" : ""));document.addSubview(b)
-                checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name;sourceIDs[b.tag]=id
-                let label=NSTextField(wrappingLabelWithString:name+(current ? "  · 当前入口" : ""))
-                label.frame=NSRect(x:46,y:y+13,width:628,height:24);label.font = .systemFont(ofSize:12);label.textColor=current ? accent : ink;document.addSubview(label)
-                y+=40
+                let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)));b.tag=checks.count
+                b.state=(node["selected"] as? Bool ?? false) || current ? .on : .off;b.isEnabled = !current
+                b.setAccessibilityLabel(name+(current ? "，当前入口，自动保留" : ""))
+                checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name
             }
-            y+=10
         }
-        if groups.isEmpty { let l=NSTextField(labelWithString:"未发现订阅，请先在 Clash Verge 添加订阅。");l.frame=NSRect(x:20,y:30,width:650,height:24);document.addSubview(l) }
-        document.setFrameSize(NSSize(width:690,height:max(y,438)))
-        _=button("取消",#selector(SubscriptionPicker.cancel),NSRect(x:536,y:590,width:90,height:32))
-        let apply=button("保存选择",#selector(SubscriptionPicker.save),NSRect(x:638,y:590,width:98,height:32));(apply as? SoftButton)?.primary=true
-        updateCounts()
+        _=button("取消",#selector(SubscriptionPicker.cancel),NSRect(x:596,y:590,width:90,height:32))
+        let apply=button("保存选择",#selector(SubscriptionPicker.save),NSRect(x:698,y:590,width:98,height:32));(apply as? SoftButton)?.primary=true
+        sourceTable.reloadData()
+        if !sourceIDs.isEmpty { sourceTable.selectRowIndexes(IndexSet(integer:0),byExtendingSelection:false);activeSource=sourceIDs[0] }
+        renderSource();updateCounts()
+    }
+    func numberOfRows(in tableView:NSTableView)->Int { sourceIDs.count }
+    func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
+        let id=sourceIDs[row],items=groups[id] ?? []
+        let cell=Canvas(frame:NSRect(x:0,y:0,width:190,height:60))
+        let name=NSTextField(wrappingLabelWithString:sourceNames[id] ?? id);name.frame=NSRect(x:12,y:8,width:166,height:24);name.font = .systemFont(ofSize:13,weight:.medium);name.textColor=ink;cell.addSubview(name)
+        let count=NSTextField(labelWithString:"已选 \(items.filter{$0.state == .on}.count) / \(items.count)");count.frame=NSRect(x:12,y:35,width:166,height:18);count.font = .systemFont(ofSize:11);count.textColor=muted;cell.addSubview(count)
+        return cell
+    }
+    func tableViewSelectionDidChange(_ notification:Notification) {
+        let row=sourceTable.selectedRow;guard row>=0,row<sourceIDs.count else { return }
+        activeSource=sourceIDs[row];renderSource()
+    }
+    func renderSource() {
+        for v in document.subviews { v.removeFromSuperview() }
+        sourceTitle.stringValue=sourceNames[activeSource] ?? "暂无订阅"
+        let items=groups[activeSource] ?? []
+        var y:CGFloat=0
+        for b in items {
+            let value=(nodeNames[b.tag] ?? "")+(b.isEnabled ? "" : "  · 当前入口")
+            let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=b.isEnabled ? ink : accent
+            let measured=(value as NSString).boundingRect(with:NSSize(width:476,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:NSFont.systemFont(ofSize:12)])
+            let height=max(CGFloat(40),ceil(measured.height)+20)
+            b.frame=NSRect(x:12,y:y+(height-24)/2,width:22,height:24);document.addSubview(b)
+            label.frame=NSRect(x:44,y:y+(height-ceil(measured.height))/2-1,width:476,height:ceil(measured.height)+3);document.addSubview(label)
+            y+=height
+        }
+        if items.isEmpty {
+            let value=sourceIDs.isEmpty ? "未发现订阅，请先在 Clash Verge 添加订阅。" : warnings[activeSource] ?? "暂无节点"
+            let label=NSTextField(wrappingLabelWithString:value);label.frame=NSRect(x:18,y:24,width:500,height:60);label.font = .systemFont(ofSize:12);label.textColor=muted;document.addSubview(label)
+        }
+        document.setFrameSize(NSSize(width:538,height:max(y,390)))
+        scroll.contentView.scroll(to:.zero);scroll.reflectScrolledClipView(scroll.contentView)
     }
     func updateCounts() {
         summary.stringValue="已选 \(checks.filter{$0.state == .on}.count) / \(checks.count) 个节点 · \(groups.count) 个订阅"
-        for (id,items) in groups { groupLabels[id]?.stringValue="\(groupNames[id] ?? id)  ·  \(items.filter{$0.state == .on}.count) / \(items.count)" }
+        sourceTable.reloadData(forRowIndexes:IndexSet(integersIn:0..<sourceIDs.count),columnIndexes:IndexSet(integer:0))
     }
     func set(_ items:[NSButton],_ state:NSControl.StateValue) { for b in items where b.isEnabled { b.state=state };updateCounts() }
-    @objc func jumpToSubscription(_ sender:NSPopUpButton) {
-        guard let y=subscriptionOffsets[sender.indexOfSelectedItem] else { return }
-        scrollView.contentView.scroll(to:NSPoint(x:0,y:y));scrollView.reflectScrolledClipView(scrollView.contentView)
-    }
     @objc func toggled(_ sender:NSButton) { updateCounts() }
     @objc func selectAll() { set(checks,.on) }
     @objc func clearAll() { set(checks,.off) }
-    @objc func selectGroup(_ sender:NSButton) { set(groups[sender.identifier?.rawValue ?? ""] ?? [],.on) }
-    @objc func clearGroup(_ sender:NSButton) { set(groups[sender.identifier?.rawValue ?? ""] ?? [],.off) }
+    @objc func selectGroup() { set(groups[activeSource] ?? [],.on) }
+    @objc func clearGroup() { set(groups[activeSource] ?? [],.off) }
     @objc func cancel() { onCancel() }
     @objc func save() {
-        var selected=Dictionary(uniqueKeysWithValues:groups.keys.map{($0,[String]())})
-        for b in checks where b.state == .on { if let id=sourceIDs[b.tag],let name=nodeNames[b.tag] { selected[id,default:[]].append(name) } }
+        var selected=[String:[String]]()
+        for id in sourceIDs { selected[id]=(groups[id] ?? []).filter{$0.state == .on}.compactMap{nodeNames[$0.tag]} }
         onSave(["fingerprint":fingerprint,"selected":selected])
     }
 }
