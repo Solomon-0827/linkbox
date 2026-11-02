@@ -45,6 +45,12 @@ final class SoftButton: NSButton {
     }
 }
 
+final class SubscriptionRow:NSTableRowView {
+    override func drawSelection(in dirtyRect:NSRect) {
+        accent.withAlphaComponent(0.10).setFill();bounds.fill()
+        accent.setFill();NSRect(x:0,y:8,width:3,height:bounds.height-16).fill()
+    }
+}
 final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:820,height:640),styleMask:[.titled],backing:.buffered,defer:false)
     let summary=NSTextField(labelWithString:"")
@@ -107,6 +113,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         renderSource();updateCounts()
     }
     func numberOfRows(in tableView:NSTableView)->Int { sourceIDs.count }
+    func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { SubscriptionRow() }
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
         let id=sourceIDs[row],items=groups[id] ?? []
         let cell=Canvas(frame:NSRect(x:0,y:0,width:190,height:60))
