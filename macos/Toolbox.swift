@@ -38,14 +38,16 @@ final class SoftButton: NSButton {
     }
     override func draw(_ dirtyRect: NSRect) {
         let amount=isEnabled ? hover : 0
+        let iconOnly=plain && symbolName != nil && title.isEmpty
         let base=primary ? accent : NSColor(calibratedRed:0.95,green:0.965,blue:0.985,alpha:1)
         let target=primary ? NSColor(calibratedRed:0.10,green:0.29,blue:0.77,alpha:1) : NSColor(calibratedRed:0.92,green:0.95,blue:1,alpha:1)
         let fill=base.blended(withFraction:isHighlighted ? 0.85 : amount,of:target) ?? base
         (isEnabled ? (isHighlighted ? fill.withAlphaComponent(0.7) : fill) : fill.withAlphaComponent(0.35)).setFill()
         let path=NSBezierPath(roundedRect:bounds.insetBy(dx:isHighlighted ? 1.5 : 0.5,dy:isHighlighted ? 1.5 : 0.5),xRadius:8,yRadius:8)
-        if !plain || amount>0 || isHighlighted { path.fill() }
+        if !iconOnly && (!plain || amount>0 || isHighlighted) { path.fill() }
         if !primary && !plain { NSColor(calibratedWhite:0.90,alpha:isEnabled ? 1 : 0.5).setStroke();path.lineWidth=1;path.stroke() }
-        let color = primary ? NSColor.white.withAlphaComponent(isEnabled ? 1 : 0.5) : ink.withAlphaComponent(isEnabled ? 1 : 0.35)
+        let iconTint=ink.blended(withFraction:spinning || isHighlighted ? 1 : amount,of:accent) ?? ink
+        let color = primary ? NSColor.white.withAlphaComponent(isEnabled ? 1 : 0.5) : (iconOnly ? iconTint : ink).withAlphaComponent(isEnabled ? 1 : 0.35)
         let attrs: [NSAttributedString.Key:Any] = [.font:NSFont.systemFont(ofSize:12,weight:.medium),.foregroundColor:color]
         let text = NSAttributedString(string:title,attributes:attrs)
         let symbol=symbolName.flatMap { NSImage(systemSymbolName:$0,accessibilityDescription:nil)?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors:[color])) }
@@ -463,13 +465,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func button(_ text: String,_ action: Selector) -> NSButton { let b = SoftButton(title:text,target:self,action:action); b.isBordered = false; b.setButtonType(.momentaryPushIn); return b }
     func setBusy(_ value: Bool,_ message: String) {
-        if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;(chainButton as? SoftButton)?.symbolName="speedometer";chainButton.setAccessibilityLabel("全链路测速");chainButton.toolTip="全链路测速（包含入口延迟）" }
+        if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;(chainButton as? SoftButton)?.spinning=false;(chainButton as? SoftButton)?.symbolName="speedometer";chainButton.setAccessibilityLabel("全链路测速");chainButton.toolTip="全链路测速（包含入口延迟）" }
         busy = value
         nodeTable.allowsEmptySelection = true
         nodeTable.allowsTypeSelect = !value
         for c in controls { c.isEnabled = !value }
         updateEditingControls()
-        if value { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        if value && !chainRunning { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         feedback.stringValue = message == "状态已更新。没有修改代理配置。" ? "" : message
     }
     func render(_ s: [String:Any]) {
@@ -643,7 +645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.reloadData()
         chainRunning=kind == "chain"
         invoke([kind],message:"准备检测 · \(nodeRows.count) 个节点") { _ in self.readTestProgress(kind,finished:true);self.showFastestNodes() }
-        if chainRunning { (chainButton as? SoftButton)?.symbolName="stop.fill";chainButton.setAccessibilityLabel("停止测速");chainButton.toolTip="停止本轮测速";chainButton.isEnabled=true }
+        if chainRunning { (chainButton as? SoftButton)?.spinning=true;chainButton.setAccessibilityLabel("停止测速");chainButton.toolTip="停止本轮测速";chainButton.isEnabled=true }
         chainTimer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:true) { _ in self.readTestProgress(kind) }
     }
     @objc func testChain() {
