@@ -417,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         func iconButton(_ label:String,_ symbol:String,_ action:Selector,_ x:CGFloat,_ y:CGFloat)->NSButton {
             let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);b.toolTip=label;(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
         }
-        refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),70,80)
+        refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),76,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
         manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),155,218);manageButton.frame.size.width=22
         updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),520,218)
