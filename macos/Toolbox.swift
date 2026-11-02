@@ -670,6 +670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc func updateSubscriptions() { invoke(["update-subscriptions"],message:"正在更新保留的订阅…") { _ in self.refreshOnline();self.showFastestNodes() } }
     @objc func refresh() {
         guard !busy else{return}
+        resetOnline()
+        refreshingOnline=["status"]
         (refreshButton as? SoftButton)?.spinning=true
         invoke(["status"],message:"正在刷新状态…") { _ in self.refreshOnline() }
     }
