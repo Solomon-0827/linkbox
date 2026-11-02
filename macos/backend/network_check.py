@@ -166,13 +166,8 @@ def main():
     os.umask(0o077)
     token = secrets.token_urlsafe(24)
     report = {'time': dt.datetime.now().astimezone().isoformat(), 'expected_ip': EXPECTED, 'native': None, 'browser': None}
-    directory = BASE / 'reports'
-    directory.mkdir(parents=True,exist_ok=True)
-    output = directory / (dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3) + '.json')
     lock = threading.Lock()
     done = threading.Event()
-    def save():
-        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -201,7 +196,6 @@ def main():
                 data = json.loads(self.rfile.read(size))
                 with lock:
                     report['browser'] = data
-                    save()
                 done.set()
                 self.send(b'{}')
             except (ValueError, json.JSONDecodeError):
@@ -216,8 +210,6 @@ def main():
     url = f'http://127.0.0.1:{server.server_port}/{token}/'
     print('只读检查：不更改代理、不重启应用、不终止连接。', flush=True)
     print('浏览器检测页面：' + url, flush=True)
-    print('报告：' + str(output), flush=True)
-    save()
     if '--no-open' not in __import__('sys').argv:
         subprocess.run(['/usr/bin/open', url], check=False)
     with lock:
@@ -225,10 +217,9 @@ def main():
     result = native_checks()
     with lock:
         report['native'] = result
-        save()
     print('系统检查完成，等待浏览器 WebRTC 测试（最长 180 秒）。', flush=True)
     done.wait(180)
-    print('检查完成。浏览器未返回的项目会保留为“未验证”。报告：' + str(output), flush=True)
+    print('检查完成。未返回的项目保留为未验证；需要时请在页面下载报告。', flush=True)
     # Give the page time to fetch the finished native report before closing localhost.
     time.sleep(10)
     server.shutdown()

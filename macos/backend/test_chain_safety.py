@@ -15,7 +15,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(config['bind-address'],'127.0.0.1')
         self.assertEqual(config['proxies'][1]['dialer-proxy'],'TEST_ENTRY')
         self.assertEqual(config['proxies'][0]['interface-name'],'en9')
-        self.assertEqual(config['rules'],['MATCH,TEST_US_EXIT'])
+        self.assertEqual(config['rules'],['DOMAIN,www.gstatic.com,TEST_ENTRY','MATCH,TEST_US_EXIT'])
     def test_reject_nested_entry(self):
         with self.assertRaises(RuntimeError):
             c.isolated_config({'dialer-proxy':'other'},{},12345,'en9')
