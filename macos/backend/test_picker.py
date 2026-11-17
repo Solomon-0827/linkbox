@@ -16,6 +16,8 @@ class PickerTests(unittest.TestCase):
         self.stack.enter_context(patch.object(runtime,'BASE',self.base))
         self.stack.enter_context(patch.object(runtime,'CONFIG_DIR',self.root))
         self.stack.enter_context(patch.object(p.t,'state',return_value=({}, {p.t.ENTRY:{'all':['one'], 'now':'one'}})))
+        self.stack.enter_context(patch.object(p.t,'api',side_effect=AssertionError('Tests must not contact the live Clash controller')))
+        self.stack.enter_context(patch.object(p.t,'node_inventory',return_value={'one':({},'existing')}))
         self.url='https://example.invalid/api/v1/client/'+'a'*24
         self.node={'name':'one','type':'ss','server':'secret.example.invalid','port':443,'password':'private-test-value'}
         (self.root/'profiles.yaml').write_text(yaml.safe_dump({'items':[{'uid':'abc','type':'remote','name':'我的订阅','file':'abc.yaml','url':self.url}]}))
