@@ -28,7 +28,7 @@ def fetch(url):
         with opener.open(urllib.request.Request(url,headers={'User-Agent':'clash.meta'}),timeout=45) as r:raw=r.read(8*1024*1024+1)
         if len(raw)>8*1024*1024:raise ValueError()
         doc=yaml.safe_load(raw)
-        if not isinstance(doc,dict) or not isinstance(doc.get('proxies'),list) or not doc['proxies']:raise ValueError()
+        if not isinstance(doc,dict) or not isinstance(doc.get('proxies'),list):raise ValueError()
         names=set()
         for n in doc['proxies']:
             if not isinstance(n,dict) or not all(n.get(k) for k in ['name','type','server','port']) or n['name'] in names:raise ValueError()
@@ -36,7 +36,7 @@ def fetch(url):
         return doc
     except Exception:raise RuntimeError('订阅下载或解析失败；未改动当前配置') from None
 
-def run(prepared=None, selection=None, sources_override=None, verify=None):
+def run(prepared=None, selection=None, sources_override=None, verify=None, additional_updates=None, verge_sync=False):
     os.umask(0o077)
     with open(t.BASE/'latency.lock','a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -56,7 +56,7 @@ def run(prepared=None, selection=None, sources_override=None, verify=None):
         if len({x['name'] for x in sources})!=len(sources):raise RuntimeError('订阅名称重复')
         old_nodes,_=c.load_nodes();pin=copy.deepcopy(old_nodes.get(before['entry']))
         if not pin:raise RuntimeError('无法保留当前入口；未修改')
-        updates={};definitions={};mapping={};dns={};excluded=policy.get('excluded_nodes',{})
+        updates=dict(additional_updates or {});definitions={};mapping={};dns={};excluded=policy.get('excluded_nodes',{})
         for source in sources:
             name=source['name']
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}',name):raise RuntimeError('订阅名称请使用英文字母、数字或短横线')
@@ -86,6 +86,7 @@ def run(prepared=None, selection=None, sources_override=None, verify=None):
         script=c.CONFIG_DIR/'profiles/Script.js';existing=script.read_text() if script.exists() else 'function main(config) { return config; }'
         wrapper='\n'+MARK+'\nconst linkboxPreviousMain=main;\nmain=function(config,profileName){const r=linkboxPreviousMain(config,profileName);const m='+json.dumps(managed,ensure_ascii=False)+';r["proxy-providers"]={...(r["proxy-providers"]||{}),...m.providers};r.proxies=(r.proxies||[]).filter(p=>p.name!==m.pin.name);r.proxies.push(m.pin);const g=(r["proxy-groups"]||[]).find(g=>g.name==="中转入口");if(g){g.proxies=[m.pin.name];g.use=Object.keys(m.providers);delete g["include-all"];delete g["include-all-proxies"];delete g["include-all-providers"];}r.dns=r.dns||{};r.dns["nameserver-policy"]={...(r.dns["nameserver-policy"]||{}),...m.dns};r.dns["proxy-server-nameserver-policy"]={...(r.dns["proxy-server-nameserver-policy"]||{}),...m.dns};return r;};\n'
         updates[script]=(existing.split(MARK)[0].rstrip()+wrapper).encode();updates[path]=dump(updated)
+        if verge_sync:policy['verge_sync']=True
         if selection is not None:
             policy['selected_nodes']=selection
             policy['provider_labels']={s['name']:s.get('display_name',s['name']) for s in registry}
@@ -125,4 +126,4 @@ def run(prepared=None, selection=None, sources_override=None, verify=None):
                 else:atomic(p,originals[p])
             raise RuntimeError('更新未确认；文件已回退，请刷新状态核对。未切换节点或关闭连接。') from None
         if c.active_state()[0]!=before:raise RuntimeError('更新后检测到外部选择变化，请核对；未继续修改')
-        return {'message':'已更新 '+ '、'.join(definitions)+'；筛选规则和当前节点保持不变。'}
+        return {'message': '已同步 Clash Verge：失效节点已移除，新增节点请在管理节点中勾选；当前入口保留。' if verge_sync else '已更新 '+ '、'.join(definitions)+'；筛选规则和当前节点保持不变。'}

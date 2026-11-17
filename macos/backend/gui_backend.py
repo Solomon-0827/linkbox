@@ -170,8 +170,8 @@ def main():
         result=subscription_picker.apply(json.load(sys.stdin))
         result['state']=snapshot()
     elif action=='update-subscriptions':
-        import subscription_update
-        result=subscription_update.run()
+        import subscription_picker
+        result=subscription_picker.synchronize()
         result['state']=snapshot()
     elif action=='remove-list-nodes':result=remove_list_nodes(json.load(sys.stdin))
     elif action=='latency':result=latency()
