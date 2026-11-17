@@ -26,9 +26,12 @@ def source_key(url):
     return url
 
 
-def discover():
+def discover(strict=False):
     root = runtime.CONFIG_DIR
     profiles = document(root / 'profiles.yaml')
+    strict = strict or runtime.read_json('node-policy.json').get('verge_sync', False)
+    if strict and not isinstance(profiles.get('items'), list):
+        raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
     config = document(root / 'clash-verge.yaml')
     registry = runtime.read_json('subscriptions.json').get('sources', [])
     by_url = {source_key(s['url']): s for s in registry if s.get('url')}
@@ -51,23 +54,27 @@ def discover():
             names.add(n['name']); nodes.append(n)
         sources.append((source, {**doc, 'proxies': nodes}))
     for item in profiles.get('items', []):
-        if item.get('type') != 'remote' or not item.get('url'):
+        if item.get('type') != 'remote':
             continue
+        if strict and (not str(item.get('url', '')).startswith('https://') or not item.get('file')):
+            raise RuntimeError('Clash Verge 订阅信息不完整，未删除节点')
+        if not item.get('url'):continue
         # Only read local profile files under the known directory.
         filename = item.get('file', '')
-        if not filename or Path(filename).name != filename:
+        if not filename or Path(filename).name != filename or '\\' in filename:
+            if strict:raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
             continue
         old = by_url.get(source_key(item['url']), {})
         identifier = old.get('name') or 'verge_' + hashlib.sha256(str(item.get('uid', filename)).encode()).hexdigest()[:12]
         add({'name': identifier, 'display_name': item.get('name') or identifier,
-             'url': item['url']}, document(root / 'profiles' / filename))
+             'url': item['url'], 'profile_file': filename}, document(root / 'profiles' / filename))
     # Keep sources that were configured directly in LinkBox / provider collections.
-    for source in registry:
+    for source in ([] if strict else registry):
         provider = config.get('proxy-providers', {}).get(source.get('name'), {})
         cache = provider.get('path') or str(root / 'providers/linkbox' / (source.get('name', '') + '.yaml'))
         path = Path(cache); path = path if path.is_absolute() else root / path
         add({**source, 'display_name': source.get('display_name') or source.get('name', '')}, document(path))
-    for name, provider in config.get('proxy-providers', {}).items():
+    for name, provider in ([] if strict else config.get('proxy-providers', {}).items()):
         if provider.get('type') != 'http' or not provider.get('url'):
             continue
         path = Path(provider.get('path', '')); path = path if path.is_absolute() else root / path
@@ -125,3 +132,26 @@ def apply(request):
     result = update.run(prepared, selection=chosen, sources_override=registry, verify=unchanged)
     result['message'] = '已保存 ' + str(sum(map(len, chosen.values()))) + ' 个订阅节点；当前中转入口保留，未自动切换。'
     return result
+
+
+def synchronize():
+    sources, fingerprint = discover(strict=True)
+    _, proxies = t.state()
+    live = set(proxies.get(t.ENTRY, {}).get('all', []))
+    policy = runtime.read_json('node-policy.json')
+    inventory = t.node_inventory(proxies)
+    prepared, selected, caches = {}, {}, {}
+    for source, _ in sources:
+        name = source['name']
+        doc = update.fetch(source['url'])
+        prepared[name] = doc
+        selected[name] = [n['name'] for n in doc['proxies']
+                          if n['name'] in live and runtime.allowed(n['name'], name)
+                          and (n['name'] in policy['selected_nodes'].get(name, []) if 'selected_nodes' in policy
+                               else runtime.provider_for(n['name'], inventory.get(n['name'], ({}, ''))[1]) == name)]
+        caches[runtime.CONFIG_DIR / 'profiles' / source['profile_file']] = update.dump(doc)
+    def verify():
+        if discover(strict=True)[1] != fingerprint:
+            raise RuntimeError('Clash Verge 订阅已变化，未删除节点，请重试')
+    return update.run(prepared, selection=selected, sources_override=[s for s,_ in sources],
+                      verify=verify, additional_updates=caches, verge_sync=True)
