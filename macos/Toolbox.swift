@@ -385,7 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let columns:[(String,String,CGFloat)] = [("rank","排名",50),("name","中转节点名称",392),("provider","来源订阅",100),("delay","入口延迟",100),("chain_delay","全链路延迟",110),("test_state","检测状态",100)]
         var columnX:CGFloat=24
         for (key,title,width) in columns {
-            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(["provider","chain_delay"].contains(key) ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
+            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(key == "chain_delay" ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
             if ["delay","chain_delay"].contains(key) { l.alignment = .right }
             if key == "test_state" { l.frame.origin.x=columnX+14;l.frame.size.width=78;l.alignment = .center };canvas.addSubview(l)
             columnX += width
@@ -420,7 +420,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),76,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
         manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),155,218);manageButton.frame.size.width=22
-        updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),520,218)
+        updateButton=button("更新全部订阅",#selector(updateSubscriptions))
+        updateButton.frame=NSRect(x:210,y:220,width:124,height:24)
+        updateButton.toolTip="更新 Clash Verge 中的全部订阅"
+        (updateButton as? SoftButton)?.symbolName="arrow.clockwise"
+        canvas.addSubview(updateButton)
         chainButton=iconButton("全链路测速","speedometer",#selector(testChain),738,218)
         settingsButton=iconButton("编辑节点","gearshape",#selector(toggleNodeEditing),177,218);settingsButton.frame.size.width=22
         deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:724,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
@@ -465,6 +469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func button(_ text: String,_ action: Selector) -> NSButton { let b = SoftButton(title:text,target:self,action:action); b.isBordered = false; b.setButtonType(.momentaryPushIn); return b }
     func setBusy(_ value: Bool,_ message: String) {
+        if !value { (updateButton as? SoftButton)?.spinning=false }
         if !value { chainTimer?.invalidate();chainTimer=nil;chainRunning=false;(chainButton as? SoftButton)?.spinning=false;(chainButton as? SoftButton)?.symbolName="speedometer";chainButton.setAccessibilityLabel("全链路测速");chainButton.toolTip="全链路测速（包含入口延迟）" }
         busy = value
         nodeTable.allowsEmptySelection = true
@@ -670,7 +675,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             self.nodePicker=picker;self.window.beginSheet(picker.panel)
         }
     }
-    @objc func updateSubscriptions() { invoke(["update-subscriptions"],message:"正在更新保留的订阅…") { _ in self.refreshOnline();self.showFastestNodes() } }
+    @objc func updateSubscriptions() {
+        guard !busy,!editingNodes else { return }
+        (updateButton as? SoftButton)?.spinning=true
+        invoke(["update-subscriptions"],message:"正在更新全部订阅…") { _ in
+            self.refreshOnline()
+            self.showFastestNodes()
+        }
+    }
     @objc func refresh() {
         guard !busy else{return}
         resetOnline()

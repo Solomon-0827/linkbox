@@ -2,3 +2,7 @@
 #picker[open]{display:flex;flex-direction:column;height:min(660px,88vh);overflow:hidden}#picker .dialog-head,#picker .picker-toolbar,#picker .dialog-actions,#pickerNotice{flex-shrink:0}#picker .picker-columns{height:auto;flex:1;min-height:100px}
 
 .ip-value{display:flex;align-items:center;gap:3px}.ip-value .icon{width:19px;height:20px}.ip-value svg{width:13px;height:13px}
+
+.list-actions{display:flex;align-items:center;flex-shrink:0;gap:8px}
+.list-actions button{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;padding:5px 9px;font-size:11px}
+.list-actions button svg{display:block;width:14px;height:14px}

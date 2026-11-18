@@ -1,5 +1,5 @@
 'use strict';
-const $=s=>document.querySelector(s);let E='',state=null,filter='all',progress={running:false},checking=false,testing=false,lastReport=null,refreshGeneration=0,editing=false,selected=new Set(),pickerData=null,pickerSource='',pickerSaving=false;
+const $=s=>document.querySelector(s);let E='',state=null,filter='all',progress={running:false},checking=false,testing=false,lastReport=null,refreshGeneration=0,editing=false,selected=new Set(),pickerData=null,pickerSource='',pickerSaving=false,updating=false;
 const fmt=t=>t?new Date(t).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'尚无记录';
 const say=t=>$('#notice').textContent=t||'';
 async function call(a,d){const r=await window.linkbox.call(a,d);if(!r.ok)throw Error(r.error);return r.data;}
@@ -11,7 +11,7 @@ function renderRows(){if(!state)return;const q=$('#search').value.trim().toLower
  const name=document.createElement('td');name.className='node-name';name.textContent=n.name;const provider=document.createElement('td');provider.className='provider';provider.textContent=n.provider;
  const cell=(value,chain=false)=>{const td=document.createElement('td');td.className='delay'+(chain?' chain-delay':'');td.append(document.createTextNode(value!=null?String(value):'—'));if(value!=null){const unit=document.createElement('small');unit.textContent='ms';td.append(unit)}return td};
  const testingNode=running&&progress.active?.includes(n.name),pending=running&&!progress.results?.[n.name]&&!testingNode,phase=testingNode?'testing':pending?'pending':n.status||'pending';const status=document.createElement('td'),pill=document.createElement('span');status.className='status-cell';pill.className='state '+phase;pill.textContent=phase==='testing'?'检测中':phase==='done'?'已完成':phase==='failed'?'未连通':'待检测';status.append(pill);tr.append(rank,name,provider,cell(n.entranceDelay),cell(n.chainDelay??(n.kind==='chain'?n.delay:null),true),status);tr.ondblclick=()=>{if(!editing)switchNode(n.name)};tr.onkeydown=e=>{if(e.key==='Enter'&&!editing)switchNode(n.name)};fragment.append(tr);}
- $('#nodeRows').replaceChildren(fragment);$('#empty').hidden=nodes.length>0;$('#chain').classList.toggle('spinning',!!running);$('#chain').title=running?'停止本轮测速':'全链路测速（含入口延迟）';$('#chain').setAttribute('aria-label',running?'停止本轮测速':'全链路测速');$('#chain').disabled=editing;$('#update').disabled=running||editing;$('#manage').disabled=running||editing;$('#edit').disabled=running;renderFooter();}
+ $('#nodeRows').replaceChildren(fragment);$('#empty').hidden=nodes.length>0;$('#chain').classList.toggle('spinning',!!running);$('#chain').title=running?'停止本轮测速':'全链路测速（含入口延迟）';$('#chain').setAttribute('aria-label',running?'停止本轮测速':'全链路测速');$('#chain').disabled=editing;$('#update').disabled=running||editing||updating;$('#manage').disabled=running||editing;$('#edit').disabled=running;renderFooter();}
 function renderFooter(){text('#testCount',progress.running?`· ${progress.completed||0}/${progress.total||0} · 全链路`:`· ${state?.nodes.length||0} 个节点 · 全链路`);$('#mode').hidden=editing;$('#deleteNodes').hidden=!editing;$('#deleteNodes').disabled=!selected.size;text('#deleteNodes',`移除所选${selected.size?'（'+selected.size+'）':''}`)}
 async function refresh(skipInfo=false,generation=null){try{const old=state?.entry,next=await call('state');if(generation!==null&&generation!==refreshGeneration)return false;state=next;progress=state.progress||{};render();if(!skipInfo&&old&&old!==state.entry)refreshInfo();return true}catch(e){text('#connection','未连接 Clash');$('#settingsButton').classList.add('off');text('#relay','请先启动 Clash Verge');say(e.message);return false}}
 async function refreshInfo(generation=++refreshGeneration){if(generation!==refreshGeneration)return;$('#refresh').classList.add('spinning');await Promise.allSettled([
@@ -21,7 +21,25 @@ async function refreshInfo(generation=++refreshGeneration){if(generation!==refre
 async function switchNode(name){if(!state||name===state.entry||progress.running||editing)return;try{state=await call('switch',{name,previous:state.entry});render();say('中转入口已切换，美国静态出口保持不变。');refreshInfo()}catch(e){say(e.message)}}
 async function benchmark(){if(testing||progress.running){await call('cancel');return}testing=true;progress={running:true,kind:'chain',total:state?.nodes.length||0,completed:0,results:{},active:[]};renderRows();say('');try{const r=await call('benchmark','chain');say(r.reason||'');}catch(e){say(e.message)}finally{testing=false;await refresh();$('#tableWrap').scrollTop=0}}
 $('#refresh').onclick=async()=>{const generation=++refreshGeneration;say('');$('#refresh').classList.add('spinning');if(await refresh(true,generation))await refreshInfo(generation);else if(generation===refreshGeneration)$('#refresh').classList.remove('spinning')};$('#chain').onclick=()=>benchmark().catch(e=>say(e.message));
-$('#update').onclick=async()=>{const b=$('#update');b.disabled=true;b.classList.add('spinning');try{const r=await call('update');say(r.message);await refresh()}catch(e){say(e.message)}finally{b.classList.remove('spinning');b.disabled=!!progress.running||editing}};
+$('#update').onclick=async()=>{
+ if(updating||progress.running||editing)return;
+ const button=$('#update');
+ updating=true;
+ button.disabled=true;
+ button.classList.add('spinning');
+ say('正在更新全部订阅…');
+ try{
+  const result=await call('update');
+  say(result.message);
+  await refresh();
+ }catch(error){
+  say(error.message);
+ }finally{
+  updating=false;
+  button.classList.remove('spinning');
+  button.disabled=!!progress.running||editing;
+ }
+};
 $('#hourly').onchange=async()=>{try{await call('settings',{hourly:$('#hourly').checked})}catch(e){say(e.message);await refresh()}};
 function renderProviders(){const names=['all',...new Set(state.nodes.map(n=>n.provider))];if(!names.includes(filter))filter='all';$('.segments').replaceChildren(...names.map(name=>{const b=document.createElement('button');b.textContent=name==='all'?'全部':name;b.className=name===filter?'selected':'';b.onclick=()=>{filter=name;renderProviders();renderRows()};return b}))}
 $('#settingsButton').onclick=()=>{$('#settings').showModal();activity()};document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$('#'+b.dataset.close).close());document.querySelectorAll('dialog').forEach(d=>d.addEventListener('close',activity));

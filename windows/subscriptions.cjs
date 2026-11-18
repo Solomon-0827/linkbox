@@ -8,13 +8,38 @@ async function policy(b){return doc(path.join(b.dataDir,'node-policy.json'))}
 async function atomic(p,data){await fs.mkdir(path.dirname(p),{recursive:true});const t=p+'.linkbox-'+crypto.randomUUID();try{await fs.writeFile(t,data,{mode:0o600});await fs.rename(t,p)}finally{await fs.rm(t,{force:true})}}
 function sourceKey(url){const u=new URL(url);return /\/(client|subscribe)\/[A-Za-z0-9_-]{20,}$/.test(u.pathname)?u.pathname+'?'+u.searchParams.toString():url}
 function clean(d,label){if(!d||!Array.isArray(d.proxies))return {proxies:[]};const seen=new Set();return {...d,proxies:d.proxies.filter(n=>{if(!n||!['name','type','server','port'].every(k=>n[k])||[ENTRY,EXIT,'DIRECT','REJECT'].includes(n.name)||NOTICE.test(n.name))return false;if(seen.has(n.name))throw Error('订阅含重名节点：'+label);seen.add(n.name);return true})}}
-async function discover(b,strict=false){const c=await b.config(),profiles=await doc(path.join(b.root,'profiles.yaml')),registry=(await doc(path.join(b.dataDir,'subscriptions.json'))).sources||[],sources=[],seen=new Set(),old=new Map(registry.filter(s=>s.url).map(s=>[sourceKey(s.url),s]));
- strict=strict||(await policy(b)).verge_sync;if(strict&&!Array.isArray(profiles.items))throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
- const add=(source,d)=>{if(!source.url?.startsWith('https://')||seen.has(sourceKey(source.url)))return;seen.add(sourceKey(source.url));sources.push({source,document:clean(d,source.display_name)})};
- for(const i of profiles.items||[]){if(strict&&i.type==='remote'&&(!i.url?.startsWith('https://')||!i.file||/[\\/]/.test(i.file)))throw Error('Clash Verge 订阅信息不完整，未删除节点');if(i.type!=='remote'||!i.url||!i.file||/[\\/]/.test(i.file)||path.basename(i.file)!==i.file)continue;const name=old.get(sourceKey(i.url))?.name||'verge_'+hash(i.uid||i.file).slice(0,12);add({name,display_name:i.name||name,url:i.url,profile_file:i.file},await doc(path.join(b.root,'profiles',i.file)))}
- for(const s of (strict?[]:registry)){const p=c['proxy-providers']?.[s.name]||{};add({...s,display_name:s.display_name||s.name},await doc(path.resolve(b.root,p.path||path.join('providers','linkbox',s.name+'.yaml'))))}
- for(const [name,p]of Object.entries(strict?{}:c['proxy-providers']||{}))if(p.type==='http'&&p.url)add({name,display_name:name,url:p.url},p.path?await doc(path.resolve(b.root,p.path)):{proxies:p.payload||[]});
- if(new Set(sources.map(x=>x.source.name)).size!==sources.length)throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');return {sources,fingerprint:hash([sources,await policy(b)])};}
+async function discover(b, forUpdate = false) {
+ await b.config(); // Resolve the local Verge configuration directory.
+ const profiles = await doc(path.join(b.root, 'profiles.yaml'));
+ if (!Array.isArray(profiles.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+  throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
+ }
+ // Keep saved IDs across updates without using old entries as sources.
+ const registry = (await doc(path.join(b.dataDir, 'subscriptions.json'))).sources || [];
+ const saved = new Map(registry.filter(source => source.url).map(source => [sourceKey(source.url), source]));
+ const sources = [];
+ const seen = new Set();
+ for (const item of profiles.items) {
+  if (item.type !== 'remote') continue;
+  const {url, file} = item;
+  if (typeof url !== 'string' || !url.startsWith('https://') ||
+      typeof file !== 'string' || !file || file === '.' || file === '..' || path.basename(file) !== file || file.includes('/') || file.includes('\\')) {
+   if (forUpdate) throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
+   continue;
+  }
+  const key = sourceKey(url);
+  if (seen.has(key)) continue;
+  seen.add(key);
+  const name = saved.get(key)?.name || 'verge_' + hash(item.uid || file).slice(0, 12);
+  const source = {name, display_name: item.name || name, url, profile_file: file};
+  const document = clean(await doc(path.join(b.root, 'profiles', file)), source.display_name);
+  sources.push({source, document});
+ }
+ if (new Set(sources.map(entry => entry.source.name)).size !== sources.length) {
+  throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
+ }
+ return {sources, fingerprint: hash([sources, await policy(b)])};
+}
 async function catalog(b){const d=await discover(b),s=await b.state(),p=await policy(b),live=new Set(s.nodes.map(n=>n.name));const owner=d.sources.find(x=>x.source.name===p.node_providers?.[s.entry]&&x.document.proxies.some(n=>n.name===s.entry))||d.sources.find(x=>x.document.proxies.some(n=>n.name===s.entry));return {fingerprint:d.fingerprint,current:s.entry,sources:d.sources.map(({source,document})=>({id:source.name,name:source.display_name,warning:document.proxies.length?'':'本地暂无缓存，请先在 Clash Verge 更新此订阅',nodes:document.proxies.map(n=>({name:n.name,type:n.type,current:n.name===s.entry&&source.name===owner?.source.name,selected:live.has(n.name)&&(p.node_providers?.[n.name]?p.node_providers[n.name]===source.name:true)}))}))}}
 function validateSelection(d,r){if(r?.fingerprint!==d.fingerprint)throw Error('订阅或筛选已变化，请重新打开管理节点');const selected=r.selected;if(!selected||Array.isArray(selected)||Object.keys(selected).sort().join('\0')!==d.sources.map(x=>x.source.name).sort().join('\0'))throw Error('节点选择无效');const owners=new Set();for(const {source,document}of d.sources){const values=selected[source.name],available=new Set(document.proxies.map(n=>n.name));if(!Array.isArray(values)||new Set(values).size!==values.length||values.some(n=>typeof n!=='string'||!available.has(n)))throw Error('订阅节点已变化或格式无效');for(const n of values){if(owners.has(n))throw Error('不同订阅含同名节点「'+n+'」，请只选择其中一个');owners.add(n)}}return selected}
 const escape=s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
