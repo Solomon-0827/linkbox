@@ -67,6 +67,7 @@ final class SubscriptionRow:NSTableRowView {
 final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     let panel = NSPanel(contentRect:NSRect(x:0,y:0,width:820,height:640),styleMask:[.titled],backing:.buffered,defer:false)
     let summary=NSTextField(labelWithString:"")
+    let updateStatus=NSTextField(wrappingLabelWithString:"")
     let sourceTable=NSTableView()
     let groupCheck=NSButton(checkboxWithTitle:"全选本组",target:nil,action:nil)
     let scroll=NSScrollView()
@@ -78,11 +79,20 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     var nodeNames:[Int:String]=[:]
     var warnings:[String:String]=[:]
     var activeSource:String=""
-    let fingerprint:String
+    private var fingerprint=""
+    private var initialChecks=Set<Int>()
+    private var currentChecks=Set<Int>()
+    private var updateButton:SoftButton!
+    private var toolbarButtons:[NSButton]=[]
+    private var saveButton:NSButton!
+    private var updating=false
+    var catalogCurrent=true
     let onSave:([String:Any])->Void
     let onCancel:()->Void
-    init(catalog:[String:Any],save:@escaping ([String:Any])->Void,cancel:@escaping ()->Void) {
-        fingerprint=catalog["fingerprint"] as? String ?? "";onSave=save;onCancel=cancel
+    let onUpdate:(SubscriptionPicker)->Void
+    init(catalog:[String:Any],save:@escaping ([String:Any])->Void,cancel:@escaping ()->Void,
+         update:@escaping (SubscriptionPicker)->Void) {
+        onSave=save;onCancel=cancel;onUpdate=update
         super.init()
         panel.title="管理节点";panel.appearance=NSAppearance(named:.aqua)
         let view=Canvas(frame:NSRect(x:0,y:0,width:820,height:640));panel.contentView=view
@@ -90,14 +100,18 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         func text(_ value:String,_ frame:NSRect,_ size:CGFloat=12,_ color:NSColor=muted) {
             let label=NSTextField(wrappingLabelWithString:value);label.frame=frame;label.font = .systemFont(ofSize:size);label.textColor=color;view.addSubview(label)
         }
-        func button(_ title:String,_ action:Selector,_ frame:NSRect)->NSButton {
+        func button(_ title:String,_ action:Selector,_ frame:NSRect)->SoftButton {
             let b=SoftButton(title:title,target:self,action:action);b.isBordered=false;b.frame=frame;view.addSubview(b);return b
         }
         text("选择加入列表的节点",NSRect(x:24,y:18,width:650,height:28),19,ink)
         text("左侧选择订阅，右侧勾选节点 · 保存后生效 · 当前入口自动保留",NSRect(x:24,y:52,width:770,height:22))
-        _=button("全部选中",#selector(selectAll),NSRect(x:24,y:86,width:88,height:30))
-        _=button("全部取消",#selector(clearAll),NSRect(x:122,y:86,width:88,height:30))
-        summary.frame=NSRect(x:230,y:92,width:560,height:22);summary.font = .systemFont(ofSize:12);summary.textColor=muted;view.addSubview(summary)
+        toolbarButtons=[
+            button("全部选中",#selector(selectAll),NSRect(x:24,y:86,width:88,height:30)),
+            button("全部取消",#selector(clearAll),NSRect(x:122,y:86,width:88,height:30))
+        ]
+        summary.frame=NSRect(x:230,y:92,width:408,height:22);summary.font = .systemFont(ofSize:12);summary.textColor=muted;view.addSubview(summary)
+        updateButton=button("更新全部订阅",#selector(updateAll),NSRect(x:654,y:86,width:142,height:30))
+        updateButton.symbolName="arrow.clockwise"
         let sidebar=NSScrollView(frame:NSRect(x:24,y:130,width:194,height:438));sidebar.hasVerticalScroller=true;sidebar.autohidesScrollers=true;sidebar.borderType = .lineBorder
         sourceTable.addTableColumn(NSTableColumn(identifier:NSUserInterfaceItemIdentifier("subscription")));sourceTable.tableColumns[0].width=190
         sourceTable.headerView=nil;sourceTable.rowHeight=60;sourceTable.intercellSpacing=NSSize(width:0,height:0);sourceTable.dataSource=self;sourceTable.delegate=self;sourceTable.allowsEmptySelection=false;sourceTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
@@ -105,6 +119,28 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         groupCheck.frame=NSRect(x:12,y:6,width:240,height:28);groupCheck.target=self;groupCheck.action=#selector(toggleGroup);groupCheck.allowsMixedState=true
         scroll.frame=NSRect(x:236,y:130,width:560,height:438);scroll.hasVerticalScroller=true;scroll.autohidesScrollers=true;scroll.borderType = .lineBorder
         document.frame=NSRect(x:0,y:0,width:538,height:438);scroll.documentView=document;view.addSubview(scroll)
+        updateStatus.frame=NSRect(x:24,y:582,width:550,height:46)
+        updateStatus.font = .systemFont(ofSize:12);updateStatus.textColor=muted;view.addSubview(updateStatus)
+        toolbarButtons.append(button("取消",#selector(SubscriptionPicker.cancel),NSRect(x:596,y:590,width:90,height:32)))
+        saveButton=button("保存选择",#selector(SubscriptionPicker.save),NSRect(x:698,y:590,width:98,height:32))
+        (saveButton as? SoftButton)?.primary=true
+        loadCatalog(catalog)
+    }
+    func loadCatalog(_ catalog:[String:Any]) {
+        let previousSource=activeSource
+        var changes=[String:[String:Bool]]()
+        for (id, buttons) in groups {
+            for button in buttons where !currentChecks.contains(button.tag) {
+                let checked=button.state == .on
+                if checked != initialChecks.contains(button.tag), let name=nodeNames[button.tag] {
+                    changes[id,default:[:]][name]=checked
+                }
+            }
+        }
+        checks.removeAll();groups.removeAll();sourceIDs.removeAll();sourceNames.removeAll()
+        nodeNames.removeAll();warnings.removeAll();initialChecks.removeAll();currentChecks.removeAll()
+        fingerprint=catalog["fingerprint"] as? String ?? ""
+        catalogCurrent=true
         for source in catalog["sources"] as? [[String:Any]] ?? [] {
             guard let id=source["id"] as? String else { continue }
             sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? id;groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
@@ -112,16 +148,35 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
                 guard let name=node["name"] as? String else { continue }
                 let current=node["current"] as? Bool ?? false
                 let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)));b.tag=checks.count
-                b.state=(node["selected"] as? Bool ?? false) || current ? .on : .off;b.isEnabled = !current
+                let selected=(node["selected"] as? Bool ?? false) || current
+                if selected { initialChecks.insert(b.tag) }
+                if current { currentChecks.insert(b.tag) }
+                b.state=(current || (changes[id]?[name] ?? selected)) ? .on : .off
+                b.isEnabled = !updating && !current
                 b.setAccessibilityLabel(name+(current ? "，当前入口，自动保留" : ""))
                 checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name
             }
         }
-        _=button("取消",#selector(SubscriptionPicker.cancel),NSRect(x:596,y:590,width:90,height:32))
-        let apply=button("保存选择",#selector(SubscriptionPicker.save),NSRect(x:698,y:590,width:98,height:32));(apply as? SoftButton)?.primary=true
+        activeSource=sourceIDs.contains(previousSource) ? previousSource : sourceIDs.first ?? ""
         sourceTable.reloadData()
-        if !sourceIDs.isEmpty { sourceTable.selectRowIndexes(IndexSet(integer:0),byExtendingSelection:false);activeSource=sourceIDs[0] }
+        if let index=sourceIDs.firstIndex(of:activeSource) {
+            sourceTable.selectRowIndexes(IndexSet(integer:index),byExtendingSelection:false)
+        }
         renderSource();updateCounts()
+    }
+    func setUpdating(_ value:Bool, message:String) {
+        updating=value
+        updateStatus.stringValue=message
+        updateButton.isEnabled = !value
+        updateButton.spinning=value
+        for button in toolbarButtons { button.isEnabled = !value }
+        saveButton.isEnabled = !value && catalogCurrent
+        for button in checks { button.isEnabled = !value && !currentChecks.contains(button.tag) }
+        updateGroupCheck()
+    }
+    @objc private func updateAll() {
+        guard !updating else { return }
+        onUpdate(self)
     }
     func numberOfRows(in tableView:NSTableView)->Int { sourceIDs.count }
     func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { SubscriptionRow() }
@@ -143,8 +198,9 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         document.addSubview(groupCheck)
         var y:CGFloat=44
         for b in items {
-            let value=(nodeNames[b.tag] ?? "")+(b.isEnabled ? "" : "  · 当前入口")
-            let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=b.isEnabled ? ink : accent
+            let current=currentChecks.contains(b.tag)
+            let value=(nodeNames[b.tag] ?? "")+(current ? "  · 当前入口" : "")
+            let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=current ? accent : ink
             let measured=(value as NSString).boundingRect(with:NSSize(width:476,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:NSFont.systemFont(ofSize:12)])
             let height=max(CGFloat(40),ceil(measured.height)+20)
             b.frame=NSRect(x:12,y:y+(height-24)/2,width:22,height:24);document.addSubview(b)
@@ -179,8 +235,9 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     @objc func clearAll() { set(checks,.off) }
     @objc func selectGroup() { set(groups[activeSource] ?? [],.on) }
     @objc func clearGroup() { set(groups[activeSource] ?? [],.off) }
-    @objc func cancel() { onCancel() }
+    @objc func cancel() { if !updating { onCancel() } }
     @objc func save() {
+        guard !updating,catalogCurrent else { return }
         var selected=[String:[String]]()
         for id in sourceIDs { selected[id]=(groups[id] ?? []).filter{$0.state == .on}.compactMap{nodeNames[$0.tag]} }
         onSave(["fingerprint":fingerprint,"selected":selected])
@@ -385,7 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let columns:[(String,String,CGFloat)] = [("rank","排名",50),("name","中转节点名称",392),("provider","来源订阅",100),("delay","入口延迟",100),("chain_delay","全链路延迟",110),("test_state","检测状态",100)]
         var columnX:CGFloat=24
         for (key,title,width) in columns {
-            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(key == "chain_delay" ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
+            let l=NSTextField(labelWithString:title);l.frame=NSRect(x:columnX+6,y:224,width:width-(["provider","chain_delay"].contains(key) ? 38 : 14),height:18);l.font = .systemFont(ofSize:12,weight:.medium);l.textColor=muted
             if ["delay","chain_delay"].contains(key) { l.alignment = .right }
             if key == "test_state" { l.frame.origin.x=columnX+14;l.frame.size.width=78;l.alignment = .center };canvas.addSubview(l)
             columnX += width
@@ -420,11 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),76,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
         manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),155,218);manageButton.frame.size.width=22
-        updateButton=button("更新全部订阅",#selector(updateSubscriptions))
-        updateButton.frame=NSRect(x:210,y:220,width:124,height:24)
-        updateButton.toolTip="更新 Clash Verge 中的全部订阅"
-        (updateButton as? SoftButton)?.symbolName="arrow.clockwise"
-        canvas.addSubview(updateButton)
+        updateButton=iconButton("更新订阅","arrow.down.circle",#selector(updateSubscriptions),520,218)
         chainButton=iconButton("全链路测速","speedometer",#selector(testChain),738,218)
         settingsButton=iconButton("编辑节点","gearshape",#selector(toggleNodeEditing),177,218);settingsButton.frame.size.width=22
         deleteButton=button("删除已选",#selector(removeSelectedNodes));deleteButton.frame=NSRect(x:642,y:724,width:234,height:32);deleteButton.isHidden=true;canvas.addSubview(deleteButton)
@@ -530,9 +583,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         picker.selectItem(withTitle:name)
         switchNode()
     }
-    func invoke(_ args: [String], message: String, input:Data? = nil, complete: @escaping ([String:Any]) -> Void) {
+    func invoke(_ args: [String], message: String, input:Data? = nil,
+                failed: ((String)->Void)? = nil, complete: @escaping ([String:Any]) -> Void) {
         guard !busy else { return }
         setBusy(true,message)
+        let reportFailure: (String)->Void = { error in
+            self.finishRefresh("status")
+            self.current=""
+            self.setBusy(false,error)
+            if args.first == "switch" { self.refreshOnline() }
+            failed?(error)
+        }
         let script = Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend").path
         DispatchQueue.global(qos: .userInitiated).async {
             let p = Process(); p.executableURL = URL(fileURLWithPath: script); p.arguments = args
@@ -544,9 +605,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
                 let parsed = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
                 DispatchQueue.main.async {
-                    guard let result = parsed else { self.finishRefresh("status");self.current = ""; self.setBusy(false,"操作未完成：未收到有效结果，请确认工具文件完整。"); return }
+                    guard let result = parsed else { reportFailure("操作未完成：未收到有效结果，请确认工具文件完整。"); return }
                     if result["ok"] as? Bool != true {
-                        self.finishRefresh("status");self.current = ""; self.setBusy(false,result["error"] as? String ?? "操作失败"); if args.first == "switch" { self.refreshOnline() }; return
+                        reportFailure(result["error"] as? String ?? "操作失败");return
                     }
                     if let state = result["state"] as? [String:Any] { self.render(state) }
                     self.setBusy(false,result["message"] as? String ?? "状态已更新。没有修改代理配置。")
@@ -554,7 +615,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     complete(result)
                 }
             } catch {
-                DispatchQueue.main.async { self.finishRefresh("status");self.current = ""; self.setBusy(false,"无法启动工具：\(error.localizedDescription)") }
+                DispatchQueue.main.async { reportFailure("无法启动工具：\(error.localizedDescription)") }
             }
         }
     }
@@ -671,8 +732,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             },cancel:{ [weak self] in
                 guard let self=self,let picker=self.nodePicker else { return }
                 self.window.endSheet(picker.panel);self.nodePicker=nil
+            },update:{ [weak self] picker in
+                self?.updatePickerSubscriptions(picker)
             })
             self.nodePicker=picker;self.window.beginSheet(picker.panel)
+        }
+    }
+    private func updatePickerSubscriptions(_ picker:SubscriptionPicker) {
+        guard !busy,nodePicker === picker else { return }
+        picker.setUpdating(true,message:"正在更新全部订阅…")
+        invoke(["update-subscriptions"],message:"正在更新全部订阅…",failed:{ error in
+            picker.setUpdating(false,message:error)
+        }) { result in
+            self.showFastestNodes()
+            self.refreshOnline()
+            picker.catalogCurrent=false
+            picker.setUpdating(true,message:"正在读取最新节点…")
+            let readFailed: (String)->Void = { error in
+                picker.setUpdating(false,message:"订阅已更新，列表读取失败。\(error)")
+            }
+            self.invoke(["subscription-catalog"],message:"正在读取最新节点…",failed:readFailed) { updated in
+                guard let catalog=updated["catalog"] as? [String:Any] else {
+                    readFailed("请关闭后重新打开管理节点。")
+                    return
+                }
+                picker.loadCatalog(catalog)
+                picker.setUpdating(false,message:result["message"] as? String ?? "订阅已更新")
+            }
         }
     }
     @objc func updateSubscriptions() {
