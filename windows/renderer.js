@@ -36,9 +36,9 @@ async function updateSubscriptions(fromPicker){
   const result=await call('update');
   updateFinished=true;
   if(fromPicker)pickerCatalogCurrent=false;
-  await refresh();
+  const mainListUpdated=await refresh();
   if(fromPicker)await loadPicker();
-  notify(result.message);
+  notify(mainListUpdated?result.message:result.message+' 主列表读取失败，请刷新状态。');
  }catch(error){
   notify(fromPicker&&updateFinished?'订阅已更新，列表读取失败。'+error.message:error.message);
  }finally{
