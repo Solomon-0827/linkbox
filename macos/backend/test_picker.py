@@ -64,9 +64,15 @@ class PickerTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs['selection'],{'existing':['one']})
             self.assertTrue(run.call_args.kwargs['verge_sync'])
             self.assertIn(self.root/'profiles/abc.yaml',run.call_args.kwargs['additional_updates'])
+    def test_picker_hides_deleted_sources_before_first_successful_sync(self):
+        cache=self.root/'providers/linkbox/existing.yaml'
+        cache.parent.mkdir(parents=True)
+        cache.write_bytes((self.root/'profiles/abc.yaml').read_bytes())
+        (self.root/'profiles.yaml').write_text('items: []')
+        self.assertEqual(p.catalog()['sources'],[])
     def test_sync_ignores_deleted_registry_and_protects_missing_index(self):
         (self.root/'profiles.yaml').write_text('items: []')
-        self.assertEqual(p.discover(strict=True)[0],[])
+        self.assertEqual(p.discover()[0],[])
         (self.root/'profiles.yaml').unlink()
         with patch.object(p.update,'run') as run:
             with self.assertRaises(RuntimeError):p.synchronize()

@@ -26,13 +26,13 @@ def source_key(url):
     return url
 
 
-def discover(strict=False):
+def discover():
     root = runtime.CONFIG_DIR
     profiles = document(root / 'profiles.yaml')
-    strict = strict or runtime.read_json('node-policy.json').get('verge_sync', False)
-    if strict and not isinstance(profiles.get('items'), list):
+    items = profiles.get('items')
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
-    config = document(root / 'clash-verge.yaml')
+    # The saved registry can preserve IDs, but only Verge can list sources.
     registry = runtime.read_json('subscriptions.json').get('sources', [])
     by_url = {source_key(s['url']): s for s in registry if s.get('url')}
     sources = []
@@ -53,32 +53,19 @@ def discover(strict=False):
                 raise RuntimeError('订阅含重名节点，请先在 Clash Verge 修复：' + source['display_name'])
             names.add(n['name']); nodes.append(n)
         sources.append((source, {**doc, 'proxies': nodes}))
-    for item in profiles.get('items', []):
+    for item in items:
         if item.get('type') != 'remote':
             continue
-        if strict and (not str(item.get('url', '')).startswith('https://') or not item.get('file')):
+        if not isinstance(item.get('url'), str) or not item['url'].startswith('https://') or not item.get('file'):
             raise RuntimeError('Clash Verge 订阅信息不完整，未删除节点')
-        if not item.get('url'):continue
         # Only read local profile files under the known directory.
         filename = item.get('file', '')
-        if not filename or Path(filename).name != filename or '\\' in filename:
-            if strict:raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
-            continue
+        if not isinstance(filename, str) or Path(filename).name != filename or filename == '..' or '\\' in filename:
+            raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
         old = by_url.get(source_key(item['url']), {})
         identifier = old.get('name') or 'verge_' + hashlib.sha256(str(item.get('uid', filename)).encode()).hexdigest()[:12]
         add({'name': identifier, 'display_name': item.get('name') or identifier,
              'url': item['url'], 'profile_file': filename}, document(root / 'profiles' / filename))
-    # Keep sources that were configured directly in LinkBox / provider collections.
-    for source in ([] if strict else registry):
-        provider = config.get('proxy-providers', {}).get(source.get('name'), {})
-        cache = provider.get('path') or str(root / 'providers/linkbox' / (source.get('name', '') + '.yaml'))
-        path = Path(cache); path = path if path.is_absolute() else root / path
-        add({**source, 'display_name': source.get('display_name') or source.get('name', '')}, document(path))
-    for name, provider in ([] if strict else config.get('proxy-providers', {}).items()):
-        if provider.get('type') != 'http' or not provider.get('url'):
-            continue
-        path = Path(provider.get('path', '')); path = path if path.is_absolute() else root / path
-        add({'name': name, 'display_name': name, 'url': provider['url']}, document(path))
     if len({s['name'] for s, _ in sources}) != len(sources):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     fingerprint = hashlib.sha256(json.dumps([sources, runtime.read_json('node-policy.json')], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -135,7 +122,7 @@ def apply(request):
 
 
 def synchronize():
-    sources, fingerprint = discover(strict=True)
+    sources, fingerprint = discover()
     _, proxies = t.state()
     live = set(proxies.get(t.ENTRY, {}).get('all', []))
     policy = runtime.read_json('node-policy.json')
@@ -151,7 +138,7 @@ def synchronize():
                                else runtime.provider_for(n['name'], inventory.get(n['name'], ({}, ''))[1]) == name)]
         caches[runtime.CONFIG_DIR / 'profiles' / source['profile_file']] = update.dump(doc)
     def verify():
-        if discover(strict=True)[1] != fingerprint:
+        if discover()[1] != fingerprint:
             raise RuntimeError('Clash Verge 订阅已变化，未删除节点，请重试')
     return update.run(prepared, selection=selected, sources_override=[s for s,_ in sources],
                       verify=verify, additional_updates=caches, verge_sync=True)

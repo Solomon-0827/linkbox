@@ -8,18 +8,42 @@ async function policy(b){return doc(path.join(b.dataDir,'node-policy.json'))}
 async function atomic(p,data){await fs.mkdir(path.dirname(p),{recursive:true});const t=p+'.linkbox-'+crypto.randomUUID();try{await fs.writeFile(t,data,{mode:0o600});await fs.rename(t,p)}finally{await fs.rm(t,{force:true})}}
 function sourceKey(url){const u=new URL(url);return /\/(client|subscribe)\/[A-Za-z0-9_-]{20,}$/.test(u.pathname)?u.pathname+'?'+u.searchParams.toString():url}
 function clean(d,label){if(!d||!Array.isArray(d.proxies))return {proxies:[]};const seen=new Set();return {...d,proxies:d.proxies.filter(n=>{if(!n||!['name','type','server','port'].every(k=>n[k])||[ENTRY,EXIT,'DIRECT','REJECT'].includes(n.name)||NOTICE.test(n.name))return false;if(seen.has(n.name))throw Error('订阅含重名节点：'+label);seen.add(n.name);return true})}}
-async function discover(b,strict=false){const c=await b.config(),profiles=await doc(path.join(b.root,'profiles.yaml')),registry=(await doc(path.join(b.dataDir,'subscriptions.json'))).sources||[],sources=[],seen=new Set(),old=new Map(registry.filter(s=>s.url).map(s=>[sourceKey(s.url),s]));
- strict=strict||(await policy(b)).verge_sync;if(strict&&!Array.isArray(profiles.items))throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
- const add=(source,d)=>{if(!source.url?.startsWith('https://')||seen.has(sourceKey(source.url)))return;seen.add(sourceKey(source.url));sources.push({source,document:clean(d,source.display_name)})};
- for(const i of profiles.items||[]){if(strict&&i.type==='remote'&&(!i.url?.startsWith('https://')||!i.file||/[\\/]/.test(i.file)))throw Error('Clash Verge 订阅信息不完整，未删除节点');if(i.type!=='remote'||!i.url||!i.file||/[\\/]/.test(i.file)||path.basename(i.file)!==i.file)continue;const name=old.get(sourceKey(i.url))?.name||'verge_'+hash(i.uid||i.file).slice(0,12);add({name,display_name:i.name||name,url:i.url,profile_file:i.file},await doc(path.join(b.root,'profiles',i.file)))}
- for(const s of (strict?[]:registry)){const p=c['proxy-providers']?.[s.name]||{};add({...s,display_name:s.display_name||s.name},await doc(path.resolve(b.root,p.path||path.join('providers','linkbox',s.name+'.yaml'))))}
- for(const [name,p]of Object.entries(strict?{}:c['proxy-providers']||{}))if(p.type==='http'&&p.url)add({name,display_name:name,url:p.url},p.path?await doc(path.resolve(b.root,p.path)):{proxies:p.payload||[]});
- if(new Set(sources.map(x=>x.source.name)).size!==sources.length)throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');return {sources,fingerprint:hash([sources,await policy(b)])};}
+async function discover(b) {
+ await b.config(); // Resolve the local Verge configuration directory.
+ const profiles = await doc(path.join(b.root, 'profiles.yaml'));
+ if (!Array.isArray(profiles.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+  throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
+ }
+ // Keep saved IDs across updates without using old entries as sources.
+ const registry = (await doc(path.join(b.dataDir, 'subscriptions.json'))).sources || [];
+ const saved = new Map(registry.filter(source => source.url).map(source => [sourceKey(source.url), source]));
+ const sources = [];
+ const seen = new Set();
+ for (const item of profiles.items) {
+  if (item.type !== 'remote') continue;
+  const {url, file} = item;
+  if (typeof url !== 'string' || !url.startsWith('https://') ||
+      typeof file !== 'string' || !file || file === '.' || file === '..' || path.basename(file) !== file || file.includes('/') || file.includes('\\')) {
+   throw Error('Clash Verge 订阅信息不完整，未删除节点');
+  }
+  const key = sourceKey(url);
+  if (seen.has(key)) continue;
+  seen.add(key);
+  const name = saved.get(key)?.name || 'verge_' + hash(item.uid || file).slice(0, 12);
+  const source = {name, display_name: item.name || name, url, profile_file: file};
+  const document = clean(await doc(path.join(b.root, 'profiles', file)), source.display_name);
+  sources.push({source, document});
+ }
+ if (new Set(sources.map(entry => entry.source.name)).size !== sources.length) {
+  throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
+ }
+ return {sources, fingerprint: hash([sources, await policy(b)])};
+}
 async function catalog(b){const d=await discover(b),s=await b.state(),p=await policy(b),live=new Set(s.nodes.map(n=>n.name));const owner=d.sources.find(x=>x.source.name===p.node_providers?.[s.entry]&&x.document.proxies.some(n=>n.name===s.entry))||d.sources.find(x=>x.document.proxies.some(n=>n.name===s.entry));return {fingerprint:d.fingerprint,current:s.entry,sources:d.sources.map(({source,document})=>({id:source.name,name:source.display_name,warning:document.proxies.length?'':'本地暂无缓存，请先在 Clash Verge 更新此订阅',nodes:document.proxies.map(n=>({name:n.name,type:n.type,current:n.name===s.entry&&source.name===owner?.source.name,selected:live.has(n.name)&&(p.node_providers?.[n.name]?p.node_providers[n.name]===source.name:true)}))}))}}
 function validateSelection(d,r){if(r?.fingerprint!==d.fingerprint)throw Error('订阅或筛选已变化，请重新打开管理节点');const selected=r.selected;if(!selected||Array.isArray(selected)||Object.keys(selected).sort().join('\0')!==d.sources.map(x=>x.source.name).sort().join('\0'))throw Error('节点选择无效');const owners=new Set();for(const {source,document}of d.sources){const values=selected[source.name],available=new Set(document.proxies.map(n=>n.name));if(!Array.isArray(values)||new Set(values).size!==values.length||values.some(n=>typeof n!=='string'||!available.has(n)))throw Error('订阅节点已变化或格式无效');for(const n of values){if(owners.has(n))throw Error('不同订阅含同名节点「'+n+'」，请只选择其中一个');owners.add(n)}}return selected}
 const escape=s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
 async function run(b,request=null){if(b.busy)throw Error('已有操作正在运行');b.busy=true;try{
- const d=await discover(b,!request),p=await policy(b);let selected=request?validateSelection(d,request):p.selected_nodes;const before=await b.state();if(!request){selected=Object.fromEntries(d.sources.map(({source})=>[source.name,(p.selected_nodes?.[source.name]||before.nodes.filter(n=>(n.providerId||n.provider)===source.name).map(n=>n.name))]));p.verge_sync=true;}b.assertChain(before);const {config,nodes}=await b.loadNodes(),pin=nodes.get(before.entry);if(!pin)throw Error('无法保留当前入口，未修改');
+ const d=await discover(b),p=await policy(b);let selected=request?validateSelection(d,request):p.selected_nodes;const before=await b.state();if(!request){selected=Object.fromEntries(d.sources.map(({source})=>[source.name,(p.selected_nodes?.[source.name]||before.nodes.filter(n=>(n.providerId||n.provider)===source.name).map(n=>n.name))]));p.verge_sync=true;}b.assertChain(before);const {config,nodes}=await b.loadNodes(),pin=nodes.get(before.entry);if(!pin)throw Error('无法保留当前入口，未修改');
  const configFile=b.configFile,scriptFile=path.join(b.root,'profiles','Script.js'),configBaseline=await read(configFile),scriptBaseline=await read(scriptFile),updates=new Map(),definitions={},mapping={},dns={},sources=[];
  for(const {source,document:cached}of d.sources){const name=source.name;if(request&&(selected!==undefined?!selected[name]?.length:(p.blocked_providers||[]).some(x=>x.toLowerCase()===name.toLowerCase())))continue;if(!/^[A-Za-z0-9_-]{1,60}$/.test(name))throw Error('订阅标识需使用字母、数字或短横线');let document=cached;
  if(!request){try{const raw=YAML.parse(await b.textRequest(source.url,before.mixedPort,{timeout:45000,max:8*1024*1024}));if(!Array.isArray(raw?.proxies)||raw.proxies.some(n=>!n||!['name','type','server','port'].every(k=>n[k])))throw Error();document=clean(raw,source.display_name);selected[name]=selected[name].filter(n=>document.proxies.some(x=>x.name===n));if(source.profile_file)updates.set(path.join(b.root,'profiles',source.profile_file),YAML.stringify(document))}catch{throw Error('订阅下载或解析失败，未改动当前配置')}}
@@ -31,7 +55,7 @@ async function run(b,request=null){if(b.busy)throw Error('已有操作正在运�
  updates.set(scriptFile,base+wrapper);updates.set(configFile,YAML.stringify(updated));p.node_providers={...p.node_providers,...mapping};p.pinned_entry=pin.name;if(selected!==undefined){p.selected_nodes=selected;p.provider_labels=Object.fromEntries(d.sources.map(x=>[x.source.name,x.source.display_name]))}updates.set(path.join(b.dataDir,'node-policy.json'),JSON.stringify(p,null,2));updates.set(path.join(b.dataDir,'subscriptions.json'),JSON.stringify({sources},null,2));
  const originals=new Map();for(const file of updates.keys())originals.set(file,await read(file));
  const temp=await fs.mkdtemp(path.join(b.root,'linkbox-validate-'));try{const check=structuredClone(updated);for(const [name,def]of Object.entries(definitions)){const file=path.join(temp,name+'.yaml');await fs.writeFile(file,updates.get(def.path),{mode:0o600});check['proxy-providers'][name]={...def,type:'file',path:file};delete check['proxy-providers'][name].url}const file=path.join(temp,'config.yaml');await fs.writeFile(file,YAML.stringify(check),{mode:0o600});if(b.validateConfig)await b.validateConfig(file);else await exec(await b.corePath(),['-t','-d',b.root,'-f',file],{windowsHide:true,timeout:30000,maxBuffer:2e6})}catch{throw Error('配置校验失败，未改动当前代理')}finally{await fs.rm(temp,{recursive:true,force:true})}
- const equal=(a,c)=>a===null?c===null:c!==null&&a.equals(c);if((await discover(b,!request)).fingerprint!==d.fingerprint||sig(await b.state())!==sig(before)||!equal(configBaseline,await read(configFile))||!equal(scriptBaseline,await read(scriptFile)))throw Error('配置或节点已变化，已取消更新');for(const [file,raw]of originals)if(!equal(raw,await read(file)))throw Error('文件已被其他操作修改，已取消更新');
+ const equal=(a,c)=>a===null?c===null:c!==null&&a.equals(c);if((await discover(b)).fingerprint!==d.fingerprint||sig(await b.state())!==sig(before)||!equal(configBaseline,await read(configFile))||!equal(scriptBaseline,await read(scriptFile)))throw Error('配置或节点已变化，已取消更新');for(const [file,raw]of originals)if(!equal(raw,await read(file)))throw Error('文件已被其他操作修改，已取消更新');
  const live=structuredClone(updated);for(const def of Object.values(live['proxy-providers']||{}))if(def.path){const file=path.resolve(b.root,def.path),document=updates.has(file)?YAML.parse(updates.get(file)):await doc(file);if(!Array.isArray(document.proxies))throw Error('代理缓存不完整，未修改');def.type='inline';def.payload=document.proxies;delete def.url;delete def.path}
  const backup=path.join(b.dataDir,'backups','update-'+Date.now());await fs.mkdir(backup,{recursive:true});let i=0;for(const [file,raw]of originals)if(raw!==null)await fs.writeFile(path.join(backup,(i++)+'-'+path.basename(file)),raw,{mode:0o600});const written=[];
  try{for(const [file,data]of updates){await atomic(file,data);written.push(file)}// Only this validated internal path may perform a non-forcing reload.
