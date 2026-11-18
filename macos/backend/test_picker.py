@@ -70,6 +70,15 @@ class PickerTests(unittest.TestCase):
         cache.write_bytes((self.root/'profiles/abc.yaml').read_bytes())
         (self.root/'profiles.yaml').write_text('items: []')
         self.assertEqual(p.catalog()['sources'],[])
+    def test_unsupported_source_does_not_hide_usable_subscriptions(self):
+        index=self.root/'profiles.yaml'
+        doc=yaml.safe_load(index.read_text())
+        doc['items'].append({'type':'remote','url':'http://example.invalid/legacy','file':'legacy.yaml'})
+        index.write_text(yaml.safe_dump(doc))
+        self.assertEqual([s['id'] for s in p.catalog()['sources']],['existing'])
+        with patch.object(p.update,'run') as run:
+            with self.assertRaisesRegex(RuntimeError,'HTTPS'):p.synchronize()
+            run.assert_not_called()
     def test_sync_ignores_deleted_registry_and_protects_missing_index(self):
         (self.root/'profiles.yaml').write_text('items: []')
         self.assertEqual(p.discover()[0],[])

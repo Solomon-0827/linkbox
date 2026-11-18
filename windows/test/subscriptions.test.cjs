@@ -11,6 +11,16 @@ test('picker hides a deleted subscription before the first successful sync', asy
  assert.deepEqual((await sub.catalog(b)).sources,[]);
  await assert.rejects(sub.run(b,previouslyOpen),/变化/);
 });
+test('unsupported source does not hide usable subscriptions', async t => {
+ const {b,write,requests}=await fixture(t);
+ await write('profiles.yaml',{items:[
+  {uid:'a',type:'remote',name:'Provider A',file:'a.yaml',url:'https://example.invalid/a'},
+  {uid:'b',type:'remote',name:'Legacy',file:'b.yaml',url:'http://example.invalid/b'}
+ ]});
+ assert.deepEqual((await sub.catalog(b)).sources.map(s=>s.name),['Provider A']);
+ await assert.rejects(b.updateSubscriptions(),/HTTPS/);
+ assert.equal(requests.length,0);
+});
 test('catalog groups local subscriptions without exposing credentials; current is pinned',async t=>{const {b}=await fixture(t),c=await sub.catalog(b);assert.equal(c.sources.length,2);assert.equal(c.sources[0].nodes[0].current,true);assert.equal(c.sources[0].nodes[1].selected,false);assert.ok(!JSON.stringify(c).includes('example.invalid'));assert.ok(!JSON.stringify(c).includes('fixture'))});
 test('selection preserves live credentials and reloads only validated payload without forcing connections',async t=>{const {b,root,requests,state}=await fixture(t),r=await selection(b);await sub.run(b,r);assert.equal(state.entry,'live');assert.equal(requests.length,1);assert.equal(requests[0][1],'PUT');assert.equal(requests[0][2],'/configs?force=false');const live=YAML.parse(requests[0][3].payload);assert.equal(live.proxies.find(n=>n.name==='live').password,'fixture');assert.deepEqual(live['proxy-groups'][0].proxies,['live']);assert.equal(live['proxy-groups'][0].use.length,2);assert.ok(Object.values(live['proxy-providers']).every(p=>p.type==='inline'));const saved=YAML.parse(await fs.readFile(path.join(root,'clash-verge.yaml'),'utf8'));assert.ok(Object.values(saved['proxy-providers']).every(p=>p.type==='http'));assert.match(await fs.readFile(path.join(root,'profiles/Script.js'),'utf8'),/linkboxPreviousMain/);assert.equal(b.busy,false)});
 test('stale fingerprint, duplicates and changed cache fail before any reload',async t=>{const {b,write,requests}=await fixture(t),r=await selection(b);await write('profiles/a.yaml',{proxies:[node('live'),node('new')]});await assert.rejects(sub.run(b,r),/变化/);assert.equal(requests.length,0);const d=await sub.discover(b),keys=d.sources.map(x=>x.source.name);assert.throws(()=>sub.validateSelection(d,{fingerprint:d.fingerprint,selected:{[keys[0]]:['live','live'],[keys[1]]:[]}}),/格式/);await write('profiles/b.yaml',{proxies:[node('live')]});await assert.rejects(sub.run(b,await selection(b)),/同名/);assert.equal(requests.length,0)});

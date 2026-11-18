@@ -26,7 +26,7 @@ def source_key(url):
     return url
 
 
-def discover():
+def discover(for_update=False):
     root = runtime.CONFIG_DIR
     profiles = document(root / 'profiles.yaml')
     items = profiles.get('items')
@@ -57,11 +57,15 @@ def discover():
         if item.get('type') != 'remote':
             continue
         if not isinstance(item.get('url'), str) or not item['url'].startswith('https://') or not item.get('file'):
-            raise RuntimeError('Clash Verge 订阅信息不完整，未删除节点')
+            if for_update:
+                raise RuntimeError('Clash Verge 订阅需要 HTTPS 地址及本地文件，未更新节点')
+            continue
         # Only read local profile files under the known directory.
         filename = item.get('file', '')
         if not isinstance(filename, str) or Path(filename).name != filename or filename == '..' or '\\' in filename:
-            raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
+            if for_update:
+                raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
+            continue
         old = by_url.get(source_key(item['url']), {})
         identifier = old.get('name') or 'verge_' + hashlib.sha256(str(item.get('uid', filename)).encode()).hexdigest()[:12]
         add({'name': identifier, 'display_name': item.get('name') or identifier,
@@ -122,7 +126,7 @@ def apply(request):
 
 
 def synchronize():
-    sources, fingerprint = discover()
+    sources, fingerprint = discover(for_update=True)
     _, proxies = t.state()
     live = set(proxies.get(t.ENTRY, {}).get('all', []))
     policy = runtime.read_json('node-policy.json')
@@ -138,7 +142,7 @@ def synchronize():
                                else runtime.provider_for(n['name'], inventory.get(n['name'], ({}, ''))[1]) == name)]
         caches[runtime.CONFIG_DIR / 'profiles' / source['profile_file']] = update.dump(doc)
     def verify():
-        if discover()[1] != fingerprint:
+        if discover(for_update=True)[1] != fingerprint:
             raise RuntimeError('Clash Verge 订阅已变化，未删除节点，请重试')
     return update.run(prepared, selection=selected, sources_override=[s for s,_ in sources],
                       verify=verify, additional_updates=caches, verge_sync=True)
