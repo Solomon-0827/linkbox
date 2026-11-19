@@ -103,12 +103,12 @@ def change(target,previous,guard=None):
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     if guard is not None:
         import chain_test
+        if chain_test.physical_network()!=guard['network'] or chain_test.active_state()[0]!=guard['before']:
+            raise RuntimeError('当前网络或节点已变化，未自动切换。')
         nodes,exit_node=chain_test.load_nodes()
         if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
-                chain_test.physical_network()!=guard['network'] or
-                chain_test.active_state()[0]!=guard['before'] or
                 (t.BASE/'chain-cancel').exists()):
-            raise RuntimeError('当前网络或节点已变化，未自动切换。')
+            raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global':

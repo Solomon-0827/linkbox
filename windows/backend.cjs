@@ -124,8 +124,8 @@ class Backend{
  if(kind==='chain'&&!this.history.reason&&this.progress.completed===this.progress.total&&authorized()){
   const target=autoCandidate(this.progress.results,before.entry,options.metric);
   if(target){
-   const fresh=await this.loadNodes().then(result=>({...result,dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP})).catch(()=>null);
    const currentNetwork=await this.network(),current=await this.state();
+   const fresh=await this.loadNodes().then(result=>({...result,dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP})).catch(()=>null);
    const sameRouting=fresh?.nodes.has(target)&&isDeepStrictEqual(
     [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
     [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);

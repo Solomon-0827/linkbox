@@ -64,7 +64,7 @@ class ParallelTests(unittest.TestCase):
         network={'interface':'en0'}
         guard={'network':network,'before':state,'routing_fingerprint':c.routing_fingerprint(original,exit_node,c.DNS_POLICY,'a','b')}
         for fresh,physical in [(original,{'interface':'en1'}),({**original,'b':{'server':'new.invalid'}},network)]:
-            with patch.object(g,'snapshot',return_value=state),patch.object(c,'load_nodes',return_value=(fresh,exit_node)),patch.object(c,'physical_network',return_value=physical),patch.object(g.t,'api') as api:
+            with patch.object(g,'snapshot',return_value=state),patch.object(c,'load_nodes',return_value=(fresh,exit_node)),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
                 with self.assertRaisesRegex(RuntimeError,'未自动切换'):
                     g.change('b','a',guard)
                 api.assert_not_called()
