@@ -6,7 +6,8 @@ const {downloadArtifact}=require('@electron/get');
  await fs.mkdir(out,{recursive:true});await fs.mkdir(work,{recursive:true});
  const runtime=await downloadArtifact({version:'42.11.18',artifactName:'electron',platform:'win32',arch:'x64'});
  await fs.rm(folder,{recursive:true,force:true});await fs.mkdir(folder,{recursive:true});
- if(process.platform==='win32')execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',`Expand-Archive -LiteralPath '${runtime.replaceAll("'","''")}' -DestinationPath '${folder.replaceAll("'","''")}' -Force`]);
+ // Use Windows' bundled bsdtar to avoid PowerShell Archive module overload differences.
+ if(process.platform==='win32')execFileSync('tar.exe',['-xf',runtime,'-C',folder]);
  else execFileSync('/usr/bin/unzip',['-q',runtime,'-d',folder]);
  const stage=path.join(work,'stage');await fs.rm(stage,{recursive:true,force:true});await fs.mkdir(stage,{recursive:true});
  for(const f of ['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','icons.js'])await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
@@ -19,7 +20,7 @@ const {downloadArtifact}=require('@electron/get');
  const ico=R.Data.IconFile.from(await fs.readFile(path.join(__dirname,'icon.ico')));for(const group of R.Resource.IconGroupEntry.fromEntries(res.entries))R.Resource.IconGroupEntry.replaceIconsForResource(res.entries,group.id,group.lang,ico.icons.map(x=>x.data));res.outputResource(exe);await fs.writeFile(path.join(folder,'LinkBox.exe'),Buffer.from(exe.generate()));
  await fs.cp(path.join(root,'examples'),path.join(folder,'resources/examples'),{recursive:true});await fs.copyFile(path.join(root,'README.md'),path.join(folder,'README.md'));
  const zip=path.join(out,'linkbox-windows-x64.zip');await fs.rm(zip,{force:true});
- if(process.platform==='win32')execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',`Compress-Archive -LiteralPath '${folder.replaceAll("'","''")}' -DestinationPath '${zip.replaceAll("'","''")}' -Force`]);
+ if(process.platform==='win32')execFileSync('tar.exe',['-a','-cf',zip,'-C',work,path.basename(folder)]);
  else execFileSync('python3',['-c','import shutil,sys;shutil.make_archive(sys.argv[1][:-4],"zip",sys.argv[2],sys.argv[3])',zip,work,path.basename(folder)]);
  await fs.writeFile(zip+'.sha256',crypto.createHash('sha256').update(await fs.readFile(zip)).digest('hex')+'  '+path.basename(zip)+'\n');console.log(zip);
 })().catch(e=>{console.error(e.message);process.exit(1)});

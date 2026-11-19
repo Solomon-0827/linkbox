@@ -6,4 +6,29 @@
 #pickerUpdate{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
 #pickerUpdate svg{display:block;width:14px;height:14px}
 
-.auto-controls{display:inline-flex;align-items:center;gap:4px;flex-shrink:0}.auto-controls .icon{width:24px;height:24px}#autoSettings{width:min(460px,90vw)}.auto-form{display:grid;gap:12px;margin:16px 0}.auto-form label{display:flex;align-items:center;justify-content:space-between;gap:16px}.auto-form input[type=number],.auto-form select{width:136px;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;background:white;color:inherit;font:inherit}.auto-form input[type=checkbox]{accent-color:#086bf1}#autoSettingsNotice:empty{display:none}
+.auto-controls{display:inline-flex;align-items:center;gap:4px;flex-shrink:0}.auto-controls .icon{width:24px;height:24px}#autoSettings{width:min(490px,calc(100vw - 24px));color:#1f2937}
+#autoSettings .dialog-head{margin-bottom:16px;align-items:flex-start}
+#autoSettings .dialog-head p{color:#596579;line-height:1.5}
+.auto-form{display:grid;gap:12px}
+.benchmark-group{min-width:0;padding:10px 14px 4px;border-radius:9px;background:#f5f7fc}
+.benchmark-group h3{margin:0 0 3px;font-size:11px;font-weight:650;color:#596579}
+.benchmark-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px;padding:5px 0;font-weight:550}
+.benchmark-row+.benchmark-row{border-top:1px solid #e1e5ec}
+.benchmark-number{display:grid;grid-template-columns:68px 1fr;align-items:center;gap:9px;width:140px}
+.benchmark-number>span,.benchmark-row small{font-size:11px;color:#596579;font-weight:400}
+.benchmark-number input,.benchmark-row select{min-width:0;padding:5px 8px;border:1px solid #d5dce7;border-radius:6px;background:white;color:inherit;font:inherit}
+.benchmark-number input{text-align:right;font-variant-numeric:tabular-nums}
+.benchmark-row select{width:140px}
+.benchmark-row select:focus-visible{outline:2px solid #87b4f8;outline-offset:2px}
+.benchmark-toggle{display:grid;grid-template-columns:auto 1fr auto;justify-items:start;gap:12px}
+.benchmark-toggle-control{position:relative;display:flex;cursor:pointer}
+.benchmark-toggle-control input{position:absolute;opacity:0;margin:0;inset:0;width:100%;height:100%}
+.benchmark-toggle-control .switch{width:38px;height:21px;pointer-events:none}
+.benchmark-toggle-control .switch::after{width:17px;height:17px}
+.benchmark-toggle-control input:checked+.switch{background:#3078df}
+.benchmark-toggle-control input:checked+.switch::after{transform:translateX(17px)}
+.benchmark-toggle-control input:focus-visible+.switch{outline:2px solid #87b4f8;outline-offset:2px}
+#autoSettings .dialog-actions{align-items:center;border-top:1px solid #e1e5ec;padding-top:10px;margin-top:12px}
+#autoSettings .dialog-actions button{min-width:82px;flex-shrink:0}
+#autoSettingsNotice{margin:0;margin-right:auto;color:#a13535;font-size:11px;overflow-wrap:anywhere}
+#autoSettingsNotice:empty{visibility:hidden}
