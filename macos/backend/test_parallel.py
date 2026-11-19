@@ -9,11 +9,11 @@ import chain_test as c
 import gui_backend as g
 
 class ParallelTests(unittest.TestCase):
-    def exercise(self, mode):
+    def exercise(self, mode, concurrency=5):
         names=[str(i) for i in range(8)]
         state={'exit':c.t.EXIT,'dialer':c.t.ENTRY}
         active=0;peak=0;calls=[]
-        mutex=threading.Lock();gate=threading.Barrier(5)
+        mutex=threading.Lock();gate=threading.Barrier(concurrency)
         with tempfile.TemporaryDirectory() as tmp:
             base=Path(tmp)
             def measure(node,exit,network,cancelled):
@@ -21,7 +21,7 @@ class ParallelTests(unittest.TestCase):
                 with mutex:
                     calls.append(node['name']);active+=1;peak=max(peak,active)
                 try:
-                    if int(node['name'])<5:gate.wait(timeout=3)
+                    if int(node['name'])<concurrency:gate.wait(timeout=3)
                     if mode=='cancel':(base/'chain-cancel').touch()
                     for _ in range(8):
                         if cancelled():return [],[],{}
@@ -32,18 +32,43 @@ class ParallelTests(unittest.TestCase):
             def read_state():
                 return ({**state,'changed':True} if mode=='change' and calls else state),names
             with patch.object(c.t,'BASE',base),patch.object(c,'active_state',side_effect=read_state),patch.object(c,'physical_network',return_value={'interface':'en0'}),patch.object(c,'load_nodes',return_value=({n:{'name':n} for n in names},{})),patch.object(c,'test_node',side_effect=measure):
-                c.run()
+                c.run(concurrency)
             record=json.loads((base/'chain-results.json').read_text())
-            self.assertEqual(peak,5);self.assertEqual(active,0)
+            self.assertEqual(peak,concurrency);self.assertEqual(active,0)
             if mode=='normal':
                 self.assertEqual(len(record['results']),8)
                 self.assertTrue(all(row['delay']==42 for row in record['results'].values()))
             else:
-                self.assertEqual(len(calls),5);self.assertEqual(record['results'],{})
+                self.assertEqual(len(calls),concurrency);self.assertEqual(record['results'],{})
                 self.assertTrue(record['reason'])
-    def test_parallel_limit(self):self.exercise('normal')
+    def test_parallel_limit(self):self.exercise('normal',3)
     def test_cancel_cleanup(self):self.exercise('cancel')
     def test_change_discards_pending(self):self.exercise('change')
+    def test_automatic_candidate_uses_metric_and_requires_verified_exit(self):
+        record={'before':{'entry':'current'},'reason':'','selection_unchanged':True,'results':{
+            'current':{'delay':200,'chain_delay':400},'entrance':{'delay':80,'chain_delay':260},
+            'chain':{'delay':90,'chain_delay':190},'failed':{'delay':5,'chain_delay':None}}}
+        self.assertEqual(c.auto_candidate(record,'entrance'),'entrance')
+        self.assertEqual(c.auto_candidate(record,'chain'),'chain')
+        record['results']['current']['chain_delay']=202
+        self.assertIsNone(c.auto_candidate(record,'chain'))
+        record['results']['current']['chain_delay']=None
+        self.assertEqual(c.auto_candidate(record,'chain'),'chain')
+        record['reason']='cancelled'
+        self.assertIsNone(c.auto_candidate(record,'chain'))
+
+    def test_auto_switch_guard_blocks_live_write_after_network_or_node_change(self):
+        state={'mode':'global','exit':g.t.EXIT,'dialer':g.t.ENTRY,'entry':'a','nodes':['a','b']}
+        original={'a':{'server':'current.invalid'},'b':{'server':'old.invalid'}}
+        exit_node={'server':c.EXPECTED}
+        network={'interface':'en0'}
+        guard={'network':network,'before':state,'routing_fingerprint':c.routing_fingerprint(original,exit_node,c.DNS_POLICY,'a','b')}
+        for fresh,physical in [(original,{'interface':'en1'}),({**original,'b':{'server':'new.invalid'}},network)]:
+            with patch.object(g,'snapshot',return_value=state),patch.object(c,'load_nodes',return_value=(fresh,exit_node)),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
+                with self.assertRaisesRegex(RuntimeError,'未自动切换'):
+                    g.change('b','a',guard)
+                api.assert_not_called()
+
     def test_entrance_parallel(self):
         active=0;peak=0;lock=threading.Lock();gate=threading.Barrier(5)
         state={'nodes':list('abcdefghij')}
