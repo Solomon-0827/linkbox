@@ -32,3 +32,22 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
  await b.saveSettings({autoRelay:true});const testNode=b.testNode;b.testNode=async(...args)=>{b.cancel();return testNode(...args)};
  assert.equal((await b.benchmark('chain',()=>true)).switchedTo,undefined);assert.equal(writes.length,2);
 });
+
+test('automatic relay checks settings commits and fresh subscription definitions before writing',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-race-'));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const b=await new Backend(folder).init(),names=['current','candidate'];let endpoint='tested.invalid',loaded=0,writes=0;
+ b.state=async()=>({mode:'global',tun:true,entry:'current',exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name}))});
+ b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>{loaded++;return {nodes:new Map(names.map(name=>[name,{name,server:endpoint}])),exit:{}}};b.corePath=async()=>'/mock';
+ b.api=async()=>{writes++;};const result=node=>({delay:node.name==='current'?200:50,entranceDelay:50,kind:'chain'});
+ await b.saveSettings({autoRelay:true});
+ b.testNode=async node=>{endpoint='replacement.invalid';return result(node);};
+ assert.equal((await b.benchmark('chain',()=>true)).switchedTo,undefined);assert.equal(loaded,2);assert.equal(writes,0);
+ let releaseSave,beginSave,releaseTests,beginTests;
+ const saveGate=new Promise(resolve=>releaseSave=resolve),saveStarted=new Promise(resolve=>beginSave=resolve);
+ const testsGate=new Promise(resolve=>releaseTests=resolve),testsStarted=new Promise(resolve=>beginTests=resolve);
+ const rename=fs.rename;const stub=t.mock.method(fs,'rename',async(from,to)=>{if(to===path.join(folder,'settings.json')){beginSave();await saveGate;}return rename(from,to);});
+ b.testNode=async node=>{beginTests();await testsGate;return result(node);};
+ const saving=b.saveSettings({autoRelay:false});await saveStarted;
+ const running=b.benchmark('chain',()=>true);await testsStarted;releaseSave();await saving;releaseTests();
+ assert.equal((await running).switchedTo,undefined);assert.equal(b.settings.autoRelay,false);assert.equal(writes,0);stub.mock.restore();
+});

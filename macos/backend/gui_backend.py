@@ -103,7 +103,9 @@ def change(target,previous,guard=None):
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     if guard is not None:
         import chain_test
-        if (chain_test.physical_network()!=guard['network'] or
+        nodes,exit_node=chain_test.load_nodes()
+        if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
+                chain_test.physical_network()!=guard['network'] or
                 chain_test.active_state()[0]!=guard['before'] or
                 (t.BASE/'chain-cancel').exists()):
             raise RuntimeError('当前网络或节点已变化，未自动切换。')
@@ -183,10 +185,11 @@ def main():
     elif action=='latency':result=latency()
     elif action=='chain':
         import chain_test
-        message,record=chain_test.run(int(sys.argv[2]) if len(sys.argv)>2 else runtime.CONCURRENCY)
+        message,record,tested=chain_test.run(int(sys.argv[2]) if len(sys.argv)>2 else runtime.CONCURRENCY)
         result={'message':message,'state':snapshot()}
         if len(sys.argv)>3 and (target:=chain_test.auto_candidate(record,sys.argv[3])):
-            result['recommendation']={'target':target,'before':record['before'],'network':record['network']}
+            result['recommendation']={'target':target,'before':record['before'],'network':record['network'],
+                                      'routing_fingerprint':chain_test.routing_fingerprint(*tested,record['before']['entry'],target)}
     elif action=='ip-info':result={'ip_info':ip_info()}
     elif action=='switch':result=change(sys.argv[2],sys.argv[3])
     elif action=='auto-switch':result=change(sys.argv[2],sys.argv[3],json.load(sys.stdin))

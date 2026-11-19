@@ -57,12 +57,17 @@ class ParallelTests(unittest.TestCase):
         record['reason']='cancelled'
         self.assertIsNone(c.auto_candidate(record,'chain'))
 
-    def test_auto_switch_guard_blocks_live_write_after_network_change(self):
+    def test_auto_switch_guard_blocks_live_write_after_network_or_node_change(self):
         state={'mode':'global','exit':g.t.EXIT,'dialer':g.t.ENTRY,'entry':'a','nodes':['a','b']}
-        with patch.object(g,'snapshot',return_value=state),patch.object(c,'physical_network',return_value={'interface':'en1'}),patch.object(g.t,'api') as api:
-            with self.assertRaisesRegex(RuntimeError,'未自动切换'):
-                g.change('b','a',{'network':{'interface':'en0'},'before':state})
-            api.assert_not_called()
+        original={'a':{'server':'current.invalid'},'b':{'server':'old.invalid'}}
+        exit_node={'server':c.EXPECTED}
+        network={'interface':'en0'}
+        guard={'network':network,'before':state,'routing_fingerprint':c.routing_fingerprint(original,exit_node,c.DNS_POLICY,'a','b')}
+        for fresh,physical in [(original,{'interface':'en1'}),({**original,'b':{'server':'new.invalid'}},network)]:
+            with patch.object(g,'snapshot',return_value=state),patch.object(c,'load_nodes',return_value=(fresh,exit_node)),patch.object(c,'physical_network',return_value=physical),patch.object(g.t,'api') as api:
+                with self.assertRaisesRegex(RuntimeError,'未自动切换'):
+                    g.change('b','a',guard)
+                api.assert_not_called()
 
     def test_entrance_parallel(self):
         active=0;peak=0;lock=threading.Lock();gate=threading.Barrier(5)

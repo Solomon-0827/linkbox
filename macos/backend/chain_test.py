@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from threading import Event
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -167,6 +168,11 @@ def test_node(node, exit_node, network, cancelled):
         finally:stop_owned(p)
 
 
+def routing_fingerprint(nodes, exit_node, dns_policy, current, target):
+    data=[nodes.get(current),nodes[target],exit_node,dns_policy,EXPECTED]
+    return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
 def auto_candidate(record, metric):
     if metric not in ('entrance','chain') or record['reason'] or not record['selection_unchanged']:
         return None
@@ -199,7 +205,7 @@ def run(concurrency=runtime.CONCURRENCY):
         cancel=t.BASE/'chain-cancel';cancel.unlink(missing_ok=True)
         parent=os.getppid()
         cancelled=lambda:cancel.exists() or os.getppid()!=parent
-        before,names=active_state();network=physical_network();nodes,exit_node=load_nodes()
+        before,names=active_state();network=physical_network();nodes,exit_node=load_nodes();dns_policy=DNS_POLICY
         if before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链式配置与预期不符，未开始测试')
         results={};run_id=secrets.token_hex(8);progress=t.BASE/'chain-progress.json'
         running=[]
@@ -258,4 +264,4 @@ def run(concurrency=runtime.CONCURRENCY):
         message=(reason+'。' if reason else '')+f'全链路测速完成：{good}/{len(results)} 条获得有效延迟；'+('当前链路未改变。' if unchanged else '检测到外部链路变化。')+'已清理临时测试进程。'
         running=[]
         publish(len(results),'',message)
-        return message,record
+        return message,record,(nodes,exit_node,dns_policy)

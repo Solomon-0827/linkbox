@@ -1,6 +1,6 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),http=require('node:http'),https=require('node:https'),net=require('node:net');
-const {execFile,spawn}=require('node:child_process'),{promisify}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
+const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
 const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function jsonRead(p,fallback={}){try{return JSON.parse(await fs.readFile(p,'utf8'));}catch{return fallback;}}
@@ -41,19 +41,19 @@ function assessClaude(rows,connections,expectedProxyIP,expectedIP=EXPECTED){
  return {status:bad?'bad':good>0&&good===rows.length&&expectedProxyIP===expectedIP?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
 }
 class Backend{
- constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
+ constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
  async init(){await fs.mkdir(this.dataDir,{recursive:true});this.settings=await jsonRead(path.join(this.dataDir,'settings.json'),{hourly:true});this.history=await jsonRead(path.join(this.dataDir,'results.json'),{});return this;}
  async saveSettings(values){
  const connectionChange='configDir' in values||'corePath' in values;
  if(this.busy&&connectionChange)throw Error('请等待当前操作完成后再修改连接设置');
- this.autoRevision++;
+ this.autoRevision++;this.pendingSettings++;
  const write=this.settingsWrite.then(async()=>{
   if(this.busy&&connectionChange)throw Error('请等待当前操作完成后再修改连接设置');
   const next={...this.settings};
   for(const key of ['configDir','corePath','hourly','interval','concurrency','autoRelay','metric'])if(Object.hasOwn(values,key))next[key]=values[key];
   await writeJSON(path.join(this.dataDir,'settings.json'),next);this.settings=next;if(connectionChange)this.endpoint=null;
  });
- this.settingsWrite=write.catch(()=>{});await write;
+ this.settingsWrite=write.catch(()=>{});try{await write;}finally{this.pendingSettings--;this.autoRevision++;}
  }
  async powershell(script){const encoded=Buffer.from("[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$ErrorActionPreference='Stop';"+script,'utf16le').toString('base64');const {stdout}=await exec('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{windowsHide:true,timeout:12000,maxBuffer:2e6});return stdout.trim();}
  async config(){
@@ -100,32 +100,36 @@ class Backend{
  const raw=await this.powershell("$a=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up');$r=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {$a.ifIndex -contains $_.ifIndex} | ForEach-Object {$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.ifIndex;[pscustomobject]@{name=$_.InterfaceAlias;index=$_.ifIndex;gateway=$_.NextHop;metric=($_.RouteMetric+$i.InterfaceMetric)}} | Sort-Object metric);if(!$r.Count){throw 'No physical IPv4 route'};$n=$r[0];$ip=@(Get-NetIPAddress -InterfaceIndex $n.index -AddressFamily IPv4 | Where-Object AddressState -eq 'Preferred' | Select-Object -ExpandProperty IPAddress);[pscustomobject]@{name=$n.name;index=$n.index;gateway=$n.gateway;addresses=$ip} | ConvertTo-Json -Compress");return JSON.parse(raw);}
  async freePort(){const s=net.createServer();await new Promise((resolve,reject)=>{s.once('error',reject);s.listen(0,'127.0.0.1',resolve)});const port=s.address().port;await new Promise(r=>s.close(r));return port;}
  async stopChild(child){if(child.exitCode!==null)return;child.kill();await Promise.race([new Promise(r=>child.once('exit',r)),pause(1800)]);if(child.exitCode===null)child.kill('SIGKILL');}
- async testNode(node,exit,network,core,kind,signal){const folder=await fs.mkdtemp(path.join(this.dataDir,'probe-'));let child,entranceDelay=null;const samples=[];try{
- const port=await this.freePort(),config=isolatedConfig(node,exit,port,network.name,kind,this.dnsPolicy);const file=path.join(folder,'config.yaml');await fs.writeFile(file,YAML.stringify(config),{mode:0o600});
+ async testNode(node,exit,network,core,kind,signal,probe={dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP}){const folder=await fs.mkdtemp(path.join(this.dataDir,'probe-'));let child,entranceDelay=null;const samples=[];try{
+ const port=await this.freePort(),config=isolatedConfig(node,exit,port,network.name,kind,probe.dnsPolicy);const file=path.join(folder,'config.yaml');await fs.writeFile(file,YAML.stringify(config),{mode:0o600});
  child=spawn(core,['-d',folder,'-f',file],{windowsHide:true,stdio:'ignore'});this.children.add(child);let spawnError;child.once('error',e=>spawnError=e);
  let ready=false;for(let i=0;i<40;i++){if(signal.aborted)throw Error('已停止');if(spawnError||child.exitCode!==null)throw Error('隔离内核无法启动');ready=await new Promise(r=>{const s=net.connect(port,'127.0.0.1');s.setTimeout(100);s.once('connect',()=>{s.destroy();r(true)});s.once('error',()=>r(false));s.once('timeout',()=>{s.destroy();r(false)});});if(ready)break;await pause(100);}if(!ready)throw Error('临时端口未就绪');
  // Validate the temporary listener belongs to exactly our child before sending a probe.
  const owner=await this.powershell(`@(Get-NetTCPConnection -State Listen -LocalPort ${port} | Select-Object -ExpandProperty OwningProcess -Unique) | ConvertTo-Json -Compress`);if(!owner||[JSON.parse(owner)].flat().length!==1||JSON.parse(owner)!==child.pid&&JSON.parse(owner)[0]!==child.pid)throw Error('无法确认临时端口归属');
  if(kind==='chain'){const started=performance.now();try{await this.textRequest('https://www.gstatic.com/generate_204',port,{signal,timeout:8000,accept:[204]});entranceDelay=Math.round(performance.now()-started)}catch{}}
- for(let i=0;i<(kind==='chain'?3:1);i++){if(signal.aborted)throw Error('已停止');const start=performance.now();try{const res=await this.trace(port,signal);if(kind==='chain'&&res.ip!==this.expectedIP)throw Error('出口不符：'+res.ip);samples.push({ms:Math.round(performance.now()-start),ip:res.ip});}catch(e){if(!samples.length)throw e;}await pause(100);}
+ for(let i=0;i<(kind==='chain'?3:1);i++){if(signal.aborted)throw Error('已停止');const start=performance.now();try{const res=await this.trace(port,signal);if(kind==='chain'&&res.ip!==probe.expectedIP)throw Error('出口不符：'+res.ip);samples.push({ms:Math.round(performance.now()-start),ip:res.ip});}catch(e){if(!samples.length)throw e;}await pause(100);}
  if(kind==='chain'&&samples.length<2)throw Error('成功样本不足两次');const times=samples.map(x=>x.ms).sort((a,b)=>a-b);return {delay:Math.round((times[Math.floor((times.length-1)/2)]+times[Math.floor(times.length/2)])/2),samples,status:'done',kind,...(kind==='chain'?{entranceDelay}:{})};
  }catch(e){return {delay:null,status:'failed',kind,error:safeError(e),...(kind==='chain'?{entranceDelay}:{})}}finally{if(child){await this.stopChild(child);this.children.delete(child)}await fs.rm(folder,{recursive:true,force:true}).catch(()=>{});}}
  async benchmark(kind='chain',mayAutoSwitch=null){
- if(this.busy)throw Error('已有操作正在运行');if(!['chain','entrance'].includes(kind))throw Error('无效测速类型');this.busy=true;const abort=new AbortController();this.abort=abort;let reason='';const options=benchmarkSettings(this.settings),revision=this.autoRevision;
- try{const before=await this.state();this.assertChain(before);const network=await this.network(),{nodes,exit}=await this.loadNodes(),core=await this.corePath();
+ if(this.busy)throw Error('已有操作正在运行');if(!['chain','entrance'].includes(kind))throw Error('无效测速类型');this.busy=true;const abort=new AbortController();this.abort=abort;let reason='';const options=benchmarkSettings(this.settings),revision=this.autoRevision,settingsStable=!this.pendingSettings;
+ try{const before=await this.state();this.assertChain(before);const network=await this.network(),{nodes,exit}=await this.loadNodes(),probe={dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP},core=await this.corePath();
  this.progress={running:true,kind,total:before.nodes.length,completed:0,results:{},active:[]};const emit=()=>this.notify('progress',this.progress);emit();
  let next=0;const guard=setInterval(async()=>{try{if(signature(await this.state())!==signature(before)||JSON.stringify(await this.network())!==JSON.stringify(network)){reason='网络或节点已变化，本轮停止；未调整代理';abort.abort();}}catch{reason='无法继续确认当前网络，本轮停止';abort.abort();}},2500);this.guard.add(guard);
  try{await Promise.all(Array.from({length:options.concurrency},async()=>{while(!abort.signal.aborted){const row=before.nodes[next++];if(!row)break;this.progress.active.push(row.name);emit();let result;
- try{const node=nodes.get(row.name);if(!node)throw Error('订阅缓存缺少该节点，请先更新订阅');result=await this.testNode(node,exit,network,core,kind,abort.signal);}catch(e){result={delay:null,status:'failed',kind,error:safeError(e)};}
+ try{const node=nodes.get(row.name);if(!node)throw Error('订阅缓存缺少该节点，请先更新订阅');result=await this.testNode(node,exit,network,core,kind,abort.signal,probe);}catch(e){result={delay:null,status:'failed',kind,error:safeError(e)};}
  if(!abort.signal.aborted){if(signature(await this.state())!==signature(before)||JSON.stringify(await this.network())!==JSON.stringify(network)){reason='网络或节点变化，已丢弃本次结果';abort.abort();}else{this.progress.results[row.name]={...this.history.results?.[row.name],...result,[kind==='chain'?'chainDelay':'entranceDelay']:result.delay};this.progress.completed++;}}
  this.progress.active=this.progress.active.filter(x=>x!==row.name);emit();}}));}finally{clearInterval(guard);this.guard.delete(guard);}
  this.history={finishedAt:new Date().toISOString(),kind,reason:reason||(abort.signal.aborted?'手动停止':''),results:{...this.history.results,...this.progress.results}};await writeJSON(path.join(this.dataDir,'results.json'),this.history);
- const authorized=()=>mayAutoSwitch?.()&&options.autoRelay&&this.settings.hourly!==false&&revision===this.autoRevision&&!abort.signal.aborted;
+ const authorized=()=>mayAutoSwitch?.()&&settingsStable&&!this.pendingSettings&&options.autoRelay&&this.settings.autoRelay===true&&benchmarkSettings(this.settings).metric===options.metric&&this.settings.hourly!==false&&revision===this.autoRevision&&!abort.signal.aborted;
  if(kind==='chain'&&!this.history.reason&&this.progress.completed===this.progress.total&&authorized()){
   const target=autoCandidate(this.progress.results,before.entry,options.metric);
   if(target){
+   const fresh=await this.loadNodes().then(result=>({...result,dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP})).catch(()=>null);
    const currentNetwork=await this.network(),current=await this.state();
-   if(authorized()&&signature(current)===signature(before)&&JSON.stringify(currentNetwork)===JSON.stringify(network)&&current.nodes.some(n=>n.name===target)){
+   const sameRouting=fresh?.nodes.has(target)&&isDeepStrictEqual(
+    [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
+    [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);
+   if(sameRouting&&authorized()&&signature(current)===signature(before)&&JSON.stringify(currentNetwork)===JSON.stringify(network)&&current.nodes.some(n=>n.name===target)){
     await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name:target});
     const after=await this.state();
     if(signature(after)!==signature({...before,entry:target}))throw Error('自动切换后的状态待核对，请刷新 Clash 状态');
