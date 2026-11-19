@@ -58,6 +58,91 @@ final class SoftButton: NSButton {
     }
 }
 
+final class BenchmarkSettingsSheet: NSObject {
+    let panel=NSPanel(contentRect:NSRect(x:0,y:0,width:490,height:382),styleMask:[.titled],backing:.buffered,defer:false)
+    let interval:NSTextField
+    let concurrency:NSTextField
+    let replace=NSSwitch()
+    let metric=NSPopUpButton(frame:.zero,pullsDown:false)
+    let validation=NSTextField(labelWithString:"")
+    var onSave:((Int,Int,Bool,String)->Void)?
+
+    init(minutes:Int,parallel:Int,automatic:Bool,ranking:String) {
+        interval=NSTextField(string:String(minutes))
+        concurrency=NSTextField(string:String(parallel))
+        super.init()
+        panel.title="动态测速设置";panel.appearance=NSAppearance(named:.aqua)
+        let view=Canvas(frame:NSRect(x:0,y:0,width:490,height:382));panel.contentView=view
+        view.wantsLayer=true;view.layer?.backgroundColor=NSColor.white.cgColor
+        func text(_ value:String,_ x:CGFloat,_ y:CGFloat,_ w:CGFloat,_ size:CGFloat,_ color:NSColor,_ weight:NSFont.Weight = .regular) {
+            let label=NSTextField(labelWithString:value)
+            label.frame=NSRect(x:x,y:y,width:w,height:size+8)
+            label.font = .systemFont(ofSize:size,weight:weight);label.textColor=color;view.addSubview(label)
+        }
+        func line(_ x:CGFloat,_ y:CGFloat,_ width:CGFloat) {
+            let rule=NSView(frame:NSRect(x:x,y:y,width:width,height:1))
+            rule.wantsLayer=true;rule.layer?.backgroundColor=NSColor(calibratedWhite:0.89,alpha:1).cgColor;view.addSubview(rule)
+        }
+        func group(_ title:String,_ y:CGFloat) {
+            let card=NSView(frame:NSRect(x:24,y:y,width:442,height:116))
+            card.wantsLayer=true
+            card.layer?.backgroundColor=NSColor(calibratedRed:0.96,green:0.97,blue:0.99,alpha:1).cgColor
+            card.layer?.cornerRadius=9;view.addSubview(card)
+            text(title,38,y+10,414,11,muted,.semibold)
+            line(38,y+68,414)
+        }
+        func number(_ field:NSTextField,_ title:String,_ unit:String,_ y:CGFloat) {
+            text(title,38,y+5,205,13,ink,.medium)
+            field.frame=NSRect(x:313,y:y,width:68,height:25);field.alignment = .right
+            field.font = .monospacedDigitSystemFont(ofSize:13,weight:.regular)
+            field.setAccessibilityLabel(title);view.addSubview(field)
+            text(unit,390,y+5,62,11,muted)
+        }
+        text("动态测速设置",24,19,442,19,ink,.semibold)
+        text("调整后台测速频率，或按延迟选择更快的中转。",24,51,442,12,muted)
+        group("测速计划",82)
+        number(interval,"测速间隔","分钟",116)
+        number(concurrency,"并发测速量","条线路",160)
+        group("中转节点切换",210)
+        text("允许自动切换",38,248,160,13,ink,.medium)
+        text("仅切换到通过出口验证的中转",165,249,240,11,muted)
+        replace.frame=NSRect(x:411,y:242,width:42,height:27);replace.state=automatic ? .on : .off
+        replace.setAccessibilityLabel("允许自动替换中转节点");view.addSubview(replace)
+        text("节点切换依据",38,292,235,13,ink,.medium)
+        metric.frame=NSRect(x:313,y:287,width:140,height:28)
+        metric.addItems(withTitles:["全链路延迟","入口延迟"])
+        metric.selectItem(at:ranking == "entrance" ? 1 : 0)
+        metric.setAccessibilityLabel("节点切换依据");view.addSubview(metric)
+
+        line(24,337,442)
+        validation.frame=NSRect(x:24,y:350,width:257,height:23)
+        validation.textColor = .systemRed;validation.font = .systemFont(ofSize:11)
+        view.addSubview(validation)
+        func button(_ title:String,_ action:Selector,_ x:CGFloat,_ primary:Bool) -> SoftButton {
+            let b=SoftButton(title:title,target:self,action:action)
+            b.frame=NSRect(x:x,y:344,width:82,height:30);b.isBordered=false;b.primary=primary
+            view.addSubview(b);return b
+        }
+        let cancel=button("取消",#selector(cancel),290,false);cancel.keyEquivalent="\u{1b}"
+        let save=button("保存",#selector(save),384,true);save.keyEquivalent="\r"
+        interval.nextKeyView=concurrency;concurrency.nextKeyView=replace;replace.nextKeyView=metric
+        metric.nextKeyView=cancel;cancel.nextKeyView=save;save.nextKeyView=interval
+        panel.initialFirstResponder=interval
+    }
+
+    @objc func cancel() { panel.sheetParent?.endSheet(panel) }
+    @objc func save() {
+        func number(_ field:NSTextField,_ range:ClosedRange<Int>,_ message:String) -> Int? {
+            if let value=Int(field.stringValue.trimmingCharacters(in:.whitespaces)),range.contains(value) { return value }
+            validation.stringValue=message;panel.makeFirstResponder(field);field.selectText(nil);return nil
+        }
+        guard let minutes=number(interval,1...1440,"测速间隔须为 1–1440 分钟。"),
+              let parallel=number(concurrency,1...10,"并发测速量须为 1–10 条。") else { return }
+        onSave?(minutes,parallel,replace.state == .on,metric.indexOfSelectedItem == 1 ? "entrance" : "chain")
+        panel.sheetParent?.endSheet(panel)
+    }
+}
+
 final class SubscriptionRow:NSTableRowView {
     override func drawSelection(in dirtyRect:NSRect) {
         accent.withAlphaComponent(0.10).setFill();bounds.fill()
@@ -530,40 +615,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc func showAutoSettings() {
         guard !autoSettingsOpen,window.attachedSheet == nil else { return }
         autoSettingsOpen=true
-        let interval=NSTextField(string:String(testInterval)), concurrency=NSTextField(string:String(testConcurrency))
-        let replace=NSButton(checkboxWithTitle:"允许自动替换中转节点",target:nil,action:nil)
-        replace.state=autoRelay ? .on : .off
-        let metric=NSPopUpButton(frame:.zero,pullsDown:false)
-        metric.addItems(withTitles:["全链路延迟","入口延迟"]);metric.selectItem(at:autoMetric == "entrance" ? 1 : 0)
-        interval.setAccessibilityLabel("测速间隔（分钟）");concurrency.setAccessibilityLabel("并发测速量");metric.setAccessibilityLabel("节点切换依据")
-        let accessory=NSView(frame:NSRect(x:0,y:0,width:360,height:142))
-        func row(_ label:String,_ control:NSControl,_ y:CGFloat,_ width:CGFloat) {
-            let text=NSTextField(labelWithString:label);text.frame=NSRect(x:0,y:y+4,width:176,height:20);accessory.addSubview(text)
-            control.frame=NSRect(x:186,y:y,width:width,height:25);accessory.addSubview(control)
+        let sheet=BenchmarkSettingsSheet(minutes:testInterval,parallel:testConcurrency,automatic:autoRelay,ranking:autoMetric)
+        sheet.onSave={ [weak self] minutes, parallel, automatic, ranking in
+            guard let self else { return }
+            let defaults=UserDefaults.standard
+            defaults.set(minutes,forKey:"benchmarkInterval");defaults.set(parallel,forKey:"benchmarkConcurrency")
+            defaults.set(automatic,forKey:"benchmarkAutoRelay");defaults.set(ranking,forKey:"benchmarkMetric")
+            self.autoRevision=UUID();self.configureAutoTests()
         }
-        row("测速间隔（1–1440 分钟）",interval,112,88)
-        row("并发测速量（1–10）",concurrency,77,88)
-        replace.frame=NSRect(x:0,y:43,width:320,height:24);accessory.addSubview(replace)
-        row("节点切换依据",metric,8,155)
-        let alert=NSAlert();alert.messageText="动态测速设置"
-        alert.informativeText="设定自动测速的频率和并发数。自动换节点仅在自动测速后生效，候选节点须通过美国静态出口验证。"
-        alert.accessoryView=accessory;alert.addButton(withTitle:"保存");alert.addButton(withTitle:"取消")
-        func present() {
-            alert.beginSheetModal(for:window) { response in
-                guard response == .alertFirstButtonReturn else { self.autoSettingsOpen=false;return }
-                guard let minutes=Int(interval.stringValue.trimmingCharacters(in:.whitespaces)),(1...1440).contains(minutes),
-                      let parallel=Int(concurrency.stringValue.trimmingCharacters(in:.whitespaces)),(1...10).contains(parallel) else {
-                    alert.informativeText="请填写有效整数：测速间隔 1–1440 分钟，并发测速量 1–10。"
-                    DispatchQueue.main.async { present() };return
-                }
-                let defaults=UserDefaults.standard
-                defaults.set(minutes,forKey:"benchmarkInterval");defaults.set(parallel,forKey:"benchmarkConcurrency")
-                defaults.set(replace.state == .on,forKey:"benchmarkAutoRelay")
-                defaults.set(metric.indexOfSelectedItem == 1 ? "entrance" : "chain",forKey:"benchmarkMetric")
-                self.autoRevision=UUID();self.autoSettingsOpen=false;self.configureAutoTests()
-            }
+        window.beginSheet(sheet.panel) { [weak self, sheet] _ in
+            sheet.onSave=nil
+            self?.autoSettingsOpen=false
         }
-        present()
     }
     @objc func copyExitIP() {
         let value=identityLine.stringValue
