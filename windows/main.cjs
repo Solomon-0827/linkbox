@@ -1,9 +1,15 @@
 'use strict';
 const {app,BrowserWindow,ipcMain,Tray,Menu,nativeImage,shell,dialog,session,nativeTheme,clipboard}=require('electron');
 const path=require('node:path'),fs=require('node:fs/promises');
-const {Backend,writeJSON,safeError}=require('./backend.cjs');
+const {Backend,writeJSON,safeError,benchmarkSettings}=require('./backend.cjs');
 const subscriptions=require('./subscriptions.cjs');
-const DEMO=process.argv.includes('--demo');let win,tray,backend,quitting=false,timer,autoStarted=false,coffeeWindow,coffeePending,uiActive=false;
+const DEMO=process.argv.includes('--demo');let win,tray,backend,quitting=false,timer,coffeeWindow,coffeePending,uiActive=false;
+async function auto(){
+ if(DEMO||quitting||backend.settings.hourly===false||backend.busy||uiActive)return;
+ try{const result=await backend.benchmark('chain',()=>!quitting&&!uiActive);win?.webContents.send('automatic',{ok:true,switchedTo:result.switchedTo});}
+ catch(e){win?.webContents.send('automatic',{error:safeError(e)});}
+}
+function scheduleAuto(){clearInterval(timer);if(!DEMO&&backend.settings.hourly!==false)timer=setInterval(auto,benchmarkSettings(backend.settings).interval*60000);}
 app.setName('链路盒子');nativeTheme.themeSource='light';if(process.platform==='win32')app.setAppUserModelId('local.linkbox.windows');
 if(!app.requestSingleInstanceLock()){app.quit();}else{
 app.on('second-instance',()=>{win?.show();win?.focus()});
@@ -16,9 +22,8 @@ app.whenReady().then(async()=>{
  session.defaultSession.setPermissionRequestHandler((_wc,_p,cb)=>cb(false));
  win.on('close',e=>{if(!quitting){e.preventDefault();win.hide();}});await win.loadFile('index.html');win.show();
  tray=new Tray(nativeImage.createFromPath(path.join(__dirname,'icon.png')).resize({width:32,height:32}));tray.setToolTip('链路盒子 · 后台运行');tray.setContextMenu(Menu.buildFromTemplate([{label:'打开链路盒子',click:()=>win.show()},{label:'停止测速',click:()=>backend.cancel()},{type:'separator'},{label:'退出链路盒子',click:()=>app.quit()}]));tray.on('double-click',()=>win.show());
- async function auto(){if(DEMO||backend.settings.hourly===false||backend.busy||uiActive)return;try{await backend.benchmark('chain');win.webContents.send('automatic',{ok:true});}catch(e){win.webContents.send('automatic',{error:safeError(e)});}}
- timer=setInterval(auto,3600000);
- if(!DEMO)setTimeout(async()=>{try{const s=await backend.state();backend.assertChain(s);autoStarted=true;await auto();}catch{}},12000);
+ scheduleAuto();
+ if(!DEMO)setTimeout(auto,12000);
 });
 }
 async function coffee(){if(coffeePending)return coffeePending;coffeePending=(async()=>{
@@ -29,7 +34,7 @@ const demoNodes=['日本 JP V1-3','香港 HK 01','新加坡 SG 02','日本 JP V1
 ipcMain.handle('linkbox',async(event,action,data)=>{
  if(event.sender!==win?.webContents||event.senderFrame!==win.webContents.mainFrame)throw Error('不允许的调用来源');
  try{
- if(DEMO){if(action==='state')return {ok:true,data:{mode:'global',tun:true,entry:'日本 JP V1-3',exit:'美国静态家宽',dialer:'中转入口',nodes:demoNodes,lastTest:new Date().toISOString(),expectedIP:'203.0.113.10',settings:{hourly:true},progress:{running:false}}};if(action==='ip')return {ok:true,data:{ip:'203.0.113.10',country:'United States',region:'California',city:'Los Angeles',asn:7018,isp:'AT&T Enterprises, LLC'}};if(action==='coffee')return {ok:true,data:{score:'100',ip:'203.0.113.10',props:{类型:'家庭住宅 IP'},dns:{结果:'未检测到泄露'},udp:{结果:'未检测到泄露'},time:new Date().toISOString()}};return {ok:true,data:{message:'预览模式不执行代理操作'}};}
+ if(DEMO){if(action==='benchmarkSettings')return {ok:true,data:benchmarkSettings(backend.settings)};if(action==='state')return {ok:true,data:{mode:'global',tun:true,entry:'日本 JP V1-3',exit:'美国静态家宽',dialer:'中转入口',nodes:demoNodes,lastTest:new Date().toISOString(),expectedIP:'203.0.113.10',settings:{hourly:true},progress:{running:false}}};if(action==='ip')return {ok:true,data:{ip:'203.0.113.10',country:'United States',region:'California',city:'Los Angeles',asn:7018,isp:'AT&T Enterprises, LLC'}};if(action==='coffee')return {ok:true,data:{score:'100',ip:'203.0.113.10',props:{类型:'家庭住宅 IP'},dns:{结果:'未检测到泄露'},udp:{结果:'未检测到泄露'},time:new Date().toISOString()}};return {ok:true,data:{message:'预览模式不执行代理操作'}};}
  let value;switch(action){
  case 'state':value=await backend.state();break;
  case 'ip':value=await backend.ipInfo();break;
@@ -45,7 +50,16 @@ ipcMain.handle('linkbox',async(event,action,data)=>{
  case 'saveSelection':value=await subscriptions.run(backend,data);break;
  case 'removeNodes':value=await subscriptions.remove(backend,data);break;
  case 'downloadReport':{if(!data||JSON.stringify(data).length>60000)throw Error('无效检查报告');const r=await dialog.showSaveDialog(win,{title:'下载网络检查报告',defaultPath:'LinkBox-network-check-'+new Date().toISOString().slice(0,10)+'.json',filters:[{name:'JSON',extensions:['json']}]});if(!r.canceled&&r.filePath)await writeJSON(r.filePath,data);value={};break;}
- case 'settings':await backend.saveSettings({hourly:!!data?.hourly});value={};break;
+ case 'benchmarkSettings':value=benchmarkSettings(backend.settings);break;
+ case 'settings':{
+  if(typeof data?.hourly==='boolean')await backend.saveSettings({hourly:data.hourly});
+  else{
+   const {interval,concurrency,autoRelay,metric}=data||{};
+   if(!Number.isInteger(interval)||interval<1||interval>1440||!Number.isInteger(concurrency)||concurrency<1||concurrency>10||typeof autoRelay!=='boolean'||!['chain','entrance'].includes(metric))throw Error('无效动态测速设置');
+   await backend.saveSettings({interval,concurrency,autoRelay,metric});
+  }
+  scheduleAuto();value={};break;
+ }
  case 'chooseConfig':case 'chooseCore':{const dir=action==='chooseConfig';const r=await dialog.showOpenDialog(win,{title:dir?'选择 Clash Verge 配置目录':'选择 verge-mihomo.exe',properties:[dir?'openDirectory':'openFile'],...(dir?{}:{filters:[{name:'Mihomo 内核',extensions:['exe']}]})});if(!r.canceled)await backend.saveSettings({[dir?'configDir':'corePath']:r.filePaths[0]});value={};break;}
  case 'source':await shell.openExternal('https://ip.net.coffee/claude/');value={};break;
  case 'importFolder':await shell.openPath(path.join(app.isPackaged?process.resourcesPath:__dirname,'examples'));value={};break;

@@ -12,3 +12,23 @@ test('a cancelled benchmark never runs remaining nodes',async()=>{const dir=awai
 test('network report records changes during checks without issuing mutations',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-'));try{const b=new Backend(dir);let calls=0;b.state=async()=>({mode:'global',tun:true,entry:++calls===1?'WiFi relay':'Ethernet relay',exit:'美国静态家宽',dialer:'中转入口',mixedPort:7897});b.trace=async()=>({ip:EXPECTED});b.ipv6Probe=async()=>({connected:false});b.api=async method=>{assert.equal(method,'GET');return {connections:[]}};const r=await b.networkCheck();assert.equal(r.stable,false);assert.equal(r.proxy.ip,EXPECTED);assert.equal(r.claude.status,'warn');assert.deepEqual(await fs.readdir(dir),[])}finally{await fs.rm(dir,{recursive:true,force:true})}});
 test('provider pruning and excluded nodes persist without hiding new eligible nodes',()=>{const {nodeAllowed,nodeProvider}=require('../backend.cjs');const p={blocked_providers:['retired'],node_providers:{old:'retired',slow:'kept',fast:'kept'},excluded_nodes:{kept:['slow']}};assert.equal(nodeAllowed(p,'old','local'),false);assert.equal(nodeAllowed(p,'slow','local'),false);assert.equal(nodeAllowed(p,'fast','local'),true);assert.equal(nodeAllowed(p,'new','kept'),true);assert.equal(nodeProvider(p,'fast'),'kept')});
 test('isolated probes retain provider DNS and never enable TUN',()=>{const policy={'+.example.invalid':['https://dns.example.invalid/dns-query']};const c=isolatedConfig({name:'a'},{name:'b'},12345,'Wi-Fi','chain',policy);assert.deepEqual(c.dns['proxy-server-nameserver-policy'],policy);assert.equal(c.tun.enable,false)});
+
+test('dynamic benchmark limits concurrency and only an opted-in scheduled run changes the relay',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-'));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const b=await new Backend(folder).init(),names=['current','entrance','chain','failed'];let entry='current',active=0,peak=0,writes=[];
+ b.state=async()=>({mode:'global',tun:true,entry,exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name}))});
+ b.network=async()=>({interface:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(names.map(name=>[name,{name}])),exit:{}});b.corePath=async()=>'/mock';
+ b.api=async(method,route,body)=>{writes.push([method,route,body.name]);entry=body.name};
+ b.testNode=async node=>{active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,8));active--;
+  const [entranceDelay,delay]={current:[200,400],entrance:[80,260],chain:[90,190],failed:[5,null]}[node.name];return {delay,entranceDelay,status:delay?'done':'failed',kind:'chain'};};
+ await Promise.all([b.saveSettings({interval:15,concurrency:2}),b.saveSettings({autoRelay:true,metric:'entrance'})]);
+ const restarted=await new Backend(folder).init();assert.deepEqual(restarted.settings,{hourly:true,interval:15,concurrency:2,autoRelay:true,metric:'entrance'});
+ await b.benchmark();assert.equal(peak,2);assert.equal(writes.length,0);
+ await b.benchmark('chain',()=>false);assert.equal(writes.length,0);
+ const run=await b.benchmark('chain',()=>true);assert.equal(run.switchedTo,'entrance');assert.deepEqual(writes,[['PUT','/proxies/'+encodeURIComponent('中转入口'),'entrance']]);
+ await b.saveSettings({metric:'chain'});const next=await b.benchmark('chain',()=>true);assert.equal(next.switchedTo,'chain');
+ entry='current';const scheduled=b.benchmark('chain',()=>true);await b.saveSettings({autoRelay:false});
+ assert.equal((await scheduled).switchedTo,undefined);assert.equal(writes.length,2);
+ await b.saveSettings({autoRelay:true});const testNode=b.testNode;b.testNode=async(...args)=>{b.cancel();return testNode(...args)};
+ assert.equal((await b.benchmark('chain',()=>true)).switchedTo,undefined);assert.equal(writes.length,2);
+});

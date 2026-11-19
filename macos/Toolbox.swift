@@ -319,6 +319,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var window: NSWindow!
     var statusItem:NSStatusItem?
     let autoSwitch = NSSwitch()
+    var autoSettingsOpen=false
+    var autoRevision=UUID()
+    var testInterval:Int { benchmarkNumber("benchmarkInterval",default:60,range:1...1440) }
+    var testConcurrency:Int { benchmarkNumber("benchmarkConcurrency",default:5,range:1...10) }
+    var autoRelay:Bool { UserDefaults.standard.bool(forKey:"benchmarkAutoRelay") }
+    var autoMetric:String { UserDefaults.standard.string(forKey:"benchmarkMetric") == "entrance" ? "entrance" : "chain" }
+    func benchmarkNumber(_ key:String,default fallback:Int,range:ClosedRange<Int>)->Int {
+        let value=UserDefaults.standard.integer(forKey:key)
+        return range.contains(value) ? value : fallback
+    }
     var autoTestsEnabled:Bool { UserDefaults.standard.object(forKey:"hourlyTestsEnabled") == nil || UserDefaults.standard.bool(forKey:"hourlyTestsEnabled") }
     var coffee: CoffeeReader?
     var generation = UUID()
@@ -467,13 +477,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let value=text.stringValue;text.cell=CenteredTextCell(textCell:value);text.isBordered=false;text.isEditable=false;text.drawsBackground=false
             text.frame=NSRect(x:x,y:centerY-14,width:width,height:28);text.font = .systemFont(ofSize:size,weight:.medium);text.textColor=muted;canvas.addSubview(text)
         }
-        toolbarText(NSTextField(labelWithString:"每小时测速"),72,94,12,740)
+        toolbarText(NSTextField(labelWithString:"动态测速"),72,52,12,740)
         rule(179,729,1,22)
         toolbarText(lastTestLabel,198,410,11,740);refreshLastTestTime()
-        autoSwitch.setAccessibilityLabel("每小时自动测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
+        autoSwitch.setAccessibilityLabel("动态测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
         func iconButton(_ label:String,_ symbol:String,_ action:Selector,_ x:CGFloat,_ y:CGFloat)->NSButton {
             let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);b.toolTip=label;(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
         }
+        _=iconButton("动态测速设置","gearshape",#selector(showAutoSettings),127,726)
         refreshButton=iconButton("刷新状态","arrow.clockwise",#selector(refresh),76,80)
         checkButton=button("网络检查 ⌄",#selector(showNetworkMenu));checkButton.frame=NSRect(x:770,y:80,width:106,height:28);(checkButton as? SoftButton)?.plain=true;canvas.addSubview(checkButton)
         manageButton=iconButton("管理节点","slider.horizontal.3",#selector(manageNodes),155,218);manageButton.frame.size.width=22
@@ -495,24 +506,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         invoke(["status"],message:"正在读取 Clash 状态…") { _ in
             self.refreshOnline()
-            if self.autoTestsEnabled { self.beginTest("chain") }
+            self.startAutomaticTest()
         }
         configureAutoTests()
     }
     func configureAutoTests() {
         hourlyTestTimer?.invalidate();hourlyTestTimer=nil
         guard autoTestsEnabled else { return }
-        let timer=Timer(timeInterval:3600,repeats:true) { [weak self] _ in
-            guard let self=self,self.autoTestsEnabled,!self.busy,self.nodePicker == nil,!self.editingNodes else { return }
-            self.invoke(["status"],message:"正在读取 Clash 状态…") { _ in
-                if self.autoTestsEnabled { self.beginTest("chain") }
-            }
+        let timer=Timer(timeInterval:TimeInterval(testInterval*60),repeats:true) { [weak self] _ in
+            self?.startAutomaticTest()
         }
         hourlyTestTimer=timer;RunLoop.main.add(timer,forMode:.common)
     }
+    func startAutomaticTest() {
+        guard autoTestsEnabled,!busy,nodePicker == nil,!editingNodes,!autoSettingsOpen,window.attachedSheet == nil else { return }
+        beginTest("chain",automatic:true)
+    }
     @objc func toggleAutoTests() {
+        autoRevision=UUID()
         UserDefaults.standard.set(autoSwitch.state == .on,forKey:"hourlyTestsEnabled")
         configureAutoTests()
+    }
+    @objc func showAutoSettings() {
+        guard !autoSettingsOpen,window.attachedSheet == nil else { return }
+        autoSettingsOpen=true
+        let interval=NSTextField(string:String(testInterval)), concurrency=NSTextField(string:String(testConcurrency))
+        let replace=NSButton(checkboxWithTitle:"允许自动替换中转节点",target:nil,action:nil)
+        replace.state=autoRelay ? .on : .off
+        let metric=NSPopUpButton(frame:.zero,pullsDown:false)
+        metric.addItems(withTitles:["全链路延迟","入口延迟"]);metric.selectItem(at:autoMetric == "entrance" ? 1 : 0)
+        interval.setAccessibilityLabel("测速间隔（分钟）");concurrency.setAccessibilityLabel("并发测速量");metric.setAccessibilityLabel("节点切换依据")
+        let accessory=NSView(frame:NSRect(x:0,y:0,width:360,height:142))
+        func row(_ label:String,_ control:NSControl,_ y:CGFloat,_ width:CGFloat) {
+            let text=NSTextField(labelWithString:label);text.frame=NSRect(x:0,y:y+4,width:176,height:20);accessory.addSubview(text)
+            control.frame=NSRect(x:186,y:y,width:width,height:25);accessory.addSubview(control)
+        }
+        row("测速间隔（1–1440 分钟）",interval,112,88)
+        row("并发测速量（1–10）",concurrency,77,88)
+        replace.frame=NSRect(x:0,y:43,width:320,height:24);accessory.addSubview(replace)
+        row("节点切换依据",metric,8,155)
+        let alert=NSAlert();alert.messageText="动态测速设置"
+        alert.informativeText="设定自动测速的频率和并发数。自动换节点仅在自动测速后生效，候选节点须通过美国静态出口验证。"
+        alert.accessoryView=accessory;alert.addButton(withTitle:"保存");alert.addButton(withTitle:"取消")
+        func present() {
+            alert.beginSheetModal(for:window) { response in
+                guard response == .alertFirstButtonReturn else { self.autoSettingsOpen=false;return }
+                guard let minutes=Int(interval.stringValue.trimmingCharacters(in:.whitespaces)),(1...1440).contains(minutes),
+                      let parallel=Int(concurrency.stringValue.trimmingCharacters(in:.whitespaces)),(1...10).contains(parallel) else {
+                    alert.informativeText="请填写有效整数：测速间隔 1–1440 分钟，并发测速量 1–10。"
+                    DispatchQueue.main.async { present() };return
+                }
+                let defaults=UserDefaults.standard
+                defaults.set(minutes,forKey:"benchmarkInterval");defaults.set(parallel,forKey:"benchmarkConcurrency")
+                defaults.set(replace.state == .on,forKey:"benchmarkAutoRelay")
+                defaults.set(metric.indexOfSelectedItem == 1 ? "entrance" : "chain",forKey:"benchmarkMetric")
+                self.autoRevision=UUID();self.autoSettingsOpen=false;self.configureAutoTests()
+            }
+        }
+        present()
     }
     @objc func copyExitIP() {
         let value=identityLine.stringValue
@@ -591,7 +642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             self.finishRefresh("status")
             self.current=""
             self.setBusy(false,error)
-            if args.first == "switch" { self.refreshOnline() }
+            if args.first == "switch" || args.first == "auto-switch" { self.refreshOnline() }
             failed?(error)
         }
         let script = Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend").path
@@ -701,7 +752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if !finished { refreshLastTestTime();lastTestLabel.stringValue=lastTestLabel.stringValue.replacingOccurrences(of:"\(nodeRows.count) 个节点",with:"\(count)/\(total)") }
         feedback.stringValue=finished && count != total ? "测速已停止" : ""
     }
-    func beginTest(_ kind:String) {
+    func beginTest(_ kind:String,automatic:Bool=false) {
         guard !busy else { return }
         try? FileManager.default.removeItem(at:base.appendingPathComponent("\(kind)-progress.json"))
         for i in nodeRows.indices {
@@ -710,12 +761,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         nodeTable.reloadData()
         chainRunning=kind == "chain"
-        invoke([kind],message:"准备检测 · \(nodeRows.count) 个节点") { _ in self.readTestProgress(kind,finished:true);self.showFastestNodes() }
+        let revision=autoRevision
+        var args=kind == "chain" ? [kind,String(testConcurrency)] : [kind]
+        if automatic && autoRelay { args.append(autoMetric) }
+        invoke(args,message:"准备检测 · \(nodeRows.count) 个节点") { result in
+            self.readTestProgress(kind,finished:true);self.showFastestNodes()
+            guard automatic,self.autoTestsEnabled,self.autoRelay,self.autoRevision==revision,
+                  !self.autoSettingsOpen,self.window.attachedSheet == nil,
+                  let recommendation=result["recommendation"] as? [String:Any],
+                  let target=recommendation["target"] as? String,
+                  let before=recommendation["before"] as? [String:Any],
+                  let previous=before["entry"] as? String,self.current==previous,
+                  let input=try? JSONSerialization.data(withJSONObject:recommendation) else { return }
+            self.invoke(["auto-switch",target,previous],message:"正在自动切换中转入口…",input:input) { outcome in
+                self.refreshOnline()
+                let message=outcome["message"] as? String ?? ""
+                self.feedback.stringValue=message.hasPrefix("实时切换成功，但") ? message : "已自动切换至 \(target)"
+            }
+        }
         if chainRunning { (chainButton as? SoftButton)?.spinning=true;chainButton.setAccessibilityLabel("停止测速");chainButton.toolTip="停止本轮测速";chainButton.isEnabled=true }
         chainTimer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:true) { _ in self.readTestProgress(kind) }
     }
     @objc func testChain() {
         if chainRunning {
+            autoRevision=UUID()
             try? Data().write(to:base.appendingPathComponent("chain-cancel"))
             chainButton.isEnabled=false;return
         }

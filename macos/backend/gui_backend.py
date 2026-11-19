@@ -94,13 +94,19 @@ def latency():
         return {'state':after,'message':f'入口测速完成：{sum(x["delay"] is not None for x in results.values())}/{len(results)} 本次可达。'+('当前链路未改变。' if unchanged else '检测到外部代理状态变化，请核对。')+' 仅作入口参考，不代表美国完整链路或下载速度。'}
     finally:lock.close()
 
-def change(target,previous):
+def change(target,previous,guard=None):
     s=snapshot()
     if s['mode']!='global' or s['exit']!=t.EXIT or s['dialer']!=t.ENTRY:
         raise RuntimeError('当前全局链路与预期不符，已取消。请先在 Clash 恢复全局 → 美国静态家宽。')
     if s['entry']!=previous or target not in s['nodes']:
         raise RuntimeError('节点状态已变化，请刷新后重新选择。')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
+    if guard is not None:
+        import chain_test
+        if (chain_test.physical_network()!=guard['network'] or
+                chain_test.active_state()[0]!=guard['before'] or
+                (t.BASE/'chain-cancel').exists()):
+            raise RuntimeError('当前网络或节点已变化，未自动切换。')
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global':
@@ -177,10 +183,13 @@ def main():
     elif action=='latency':result=latency()
     elif action=='chain':
         import chain_test
-        message=chain_test.run()
+        message,record=chain_test.run(int(sys.argv[2]) if len(sys.argv)>2 else runtime.CONCURRENCY)
         result={'message':message,'state':snapshot()}
+        if len(sys.argv)>3 and (target:=chain_test.auto_candidate(record,sys.argv[3])):
+            result['recommendation']={'target':target,'before':record['before'],'network':record['network']}
     elif action=='ip-info':result={'ip_info':ip_info()}
     elif action=='switch':result=change(sys.argv[2],sys.argv[3])
+    elif action=='auto-switch':result=change(sys.argv[2],sys.argv[3],json.load(sys.stdin))
     elif action=='check':
         import network_check,io,contextlib
         output=io.StringIO()

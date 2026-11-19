@@ -167,7 +167,31 @@ def test_node(node, exit_node, network, cancelled):
         finally:stop_owned(p)
 
 
-def run():
+def auto_candidate(record, metric):
+    if metric not in ('entrance','chain') or record['reason'] or not record['selection_unchanged']:
+        return None
+    current=record['before']['entry']
+    results=record['results']
+    key='delay' if metric=='entrance' else 'chain_delay'
+    def delay(row, field):
+        value=row.get(field)
+        return value if type(value) is int and value>0 else None
+    if current not in results:
+        return None
+    choices=[(delay(row,key),name) for name,row in results.items()
+             if name!=current and delay(row,'chain_delay') and delay(row,key)]
+    if not choices:
+        return None
+    fastest,name=min(choices)
+    baseline=delay(results[current],key)
+    if not delay(results[current],'chain_delay') or (baseline and baseline-fastest>=max(20,baseline*.10)):
+        return name
+    return None
+
+
+def run(concurrency=runtime.CONCURRENCY):
+    if type(concurrency) is not int or not 1 <= concurrency <= 10:
+        raise ValueError("并发测速量须为 1–10")
     os.umask(0o077)
     with open(t.BASE/'latency.lock','a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -204,7 +228,7 @@ def run():
             return row
         # Coordinator alone checks state and writes progress; workers own their children.
         pending={};remaining=iter(names)
-        with ThreadPoolExecutor(max_workers=runtime.CONCURRENCY,thread_name_prefix='chain-test') as pool:
+        with ThreadPoolExecutor(max_workers=concurrency,thread_name_prefix='chain-test') as pool:
             try:
                 while True:
                     if external_cancelled():reason='已停止，保留已完成结果';break
@@ -213,12 +237,12 @@ def run():
                     # Only accept results after confirming the original network and chain.
                     for future in list(pending):
                         if future.done():results[pending.pop(future)]=future.result()
-                    while len(pending)<runtime.CONCURRENCY:
+                    while len(pending)<concurrency:
                         name=next(remaining,None)
                         if name is None:break
                         pending[pool.submit(measure,name)]=name
                     running=list(pending.values())
-                    publish(len(results),'、'.join(pending.values()),'最多 5 节点并行；每个节点顺序采样 3 次')
+                    publish(len(results),'、'.join(pending.values()),'正在隔离测速')
                     if not pending:break
                     wait(pending,timeout=.3,return_when=FIRST_COMPLETED)
             finally:
@@ -234,4 +258,4 @@ def run():
         message=(reason+'。' if reason else '')+f'全链路测速完成：{good}/{len(results)} 条获得有效延迟；'+('当前链路未改变。' if unchanged else '检测到外部链路变化。')+'已清理临时测试进程。'
         running=[]
         publish(len(results),'',message)
-        return message
+        return message,record
