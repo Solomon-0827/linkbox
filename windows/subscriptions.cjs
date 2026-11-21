@@ -77,6 +77,37 @@ function inventoryFor(sources) {
   {id: source.name, nodes: document.proxies.map(n => n.name)} : {id: source.name, nodes: [], unreadable: true});
 }
 
+function nameFilter(definition) {
+ function patterns(value) {
+  return (value || '').split('`').filter(Boolean).map(pattern => {
+   const flags = pattern.match(/^\(\?([ims]+)\)/);
+   return flags ? new RegExp(pattern.slice(flags[0].length), flags[1]) : new RegExp(pattern);
+  });
+ }
+ const include = patterns(definition.filter), exclude = patterns(definition['exclude-filter']);
+ return name => (!include.length || include.some(re => re.test(name))) && !exclude.some(re => re.test(name));
+}
+
+function entrySeedOwners(config, sources) {
+ const available = sources.filter(({document}) => document);
+ const byID = new Map(available.map(entry => [entry.source.name, entry]));
+ const byURL = new Map(available.map(entry => [sourceKey(entry.source.url), entry]));
+ const group = config['proxy-groups']?.find(g => g.name === ENTRY);
+ const providers = config['proxy-providers'] || {};
+ const owners = new Map();
+ for (const name of group?.use || []) {
+  const definition = Object.hasOwn(providers, name) ? providers[name] : {};
+  const match = definition.url ? byURL.get(sourceKey(definition.url)) : byID.get(name);
+  if (!match) continue;
+  const accepts = nameFilter(definition);
+  const offered = definition.payload && new Set(definition.payload.map(node => node.name));
+  for (const {name: relay} of match.document.proxies) {
+   if ((!offered || offered.has(relay)) && accepts(relay) && !owners.has(relay)) owners.set(relay, match.source.name);
+  }
+ }
+ return owners;
+}
+
 async function catalog(b) {
  const {sources, fingerprint} = await discover(b);
  const state = await b.state();
@@ -123,7 +154,8 @@ function validateSelection(discovered, request, saved) {
  return selected;
 }
 
-const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Mihomo separates filter expressions at literal backticks.
+const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('`', '\\x60');
 const equal = (a, b) => a === null ? b === null : b !== null && a.equals(b);
 const EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新';
 const POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash';
@@ -203,7 +235,8 @@ function legacyPin(original, config, savedName) {
  let pin;
  try { pin = JSON.parse(embedded?.[1]).pin; } catch { return []; }
  if (pin?.name !== savedName || !config.proxies.some(node => isDeepStrictEqual(node, pin))) return [];
- if (config['proxy-groups']?.some(g => g.name !== ENTRY && g.proxies?.includes(savedName)) ||
+ if (config['proxy-groups']?.some(g => g.name !== ENTRY && (g.proxies?.includes(savedName) ||
+     ((g['include-all-proxies'] || g['include-all']) && nameFilter(g)(savedName)))) ||
      config.proxies.some(node => node['dialer-proxy'] === savedName)) return [];
  return [savedName];
 }
@@ -228,8 +261,8 @@ async function waitForReload(b, members) {
  throw Error(RELOAD_UNCERTAIN);
 }
 
-async function selectAfterReload(b, before, after, members, selection, inventory) {
- const owners = selectionOwners(selection);
+async function selectAfterReload(b, before, after, members, selected, desired) {
+ const acceptable = entry => selected.has(entry) && (selected.has(before.entry) || entry === desired);
 
  function checkedState(observed, error) {
   if (!observed || CHAIN_KEYS.some(key => observed[key] !== before[key])) {
@@ -239,13 +272,10 @@ async function selectAfterReload(b, before, after, members, selection, inventory
  }
 
  after = checkedState(after, POST_RELOAD_CHANGE);
- if (owners.has(after.entry)) return after.entry;
- const plan = reconcile({sources:await inventory(), selection, live:after.live, current:null,
-  metric:b.settings.metric, results:benchmarkResults(b)});
- const desired = plan.entry ?? owners.keys().next().value;
+ if (acceptable(after.entry)) return after.entry;
  after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
  for (let attempt = 0; attempt < 2; attempt++) {
-  if (owners.has(after.entry)) return after.entry;
+  if (acceptable(after.entry)) return after.entry;
   try { await b.api('PUT', ENTRY_ROUTE, {name: desired}); }
   catch { /* Check whether the switch applied before retrying. */ }
   after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
@@ -256,26 +286,16 @@ async function selectAfterReload(b, before, after, members, selection, inventory
    return desired;
   }
  }
- if (owners.has(after.entry)) return after.entry;
+ if (acceptable(after.entry)) return after.entry;
  throw Error(SWITCH_FAILED);
 }
 
-function recordedFile(file, data) {
- return [file, data === null ? null : Buffer.from(data).toString('base64')];
-}
-
-async function replayFiles(files) {
- for (const [file, data] of files) {
+async function rollback(written, originals) {
+ for (const file of written.reverse()) {
+  const data = originals.get(file);
   if (data === null) await fs.rm(file, {force:true});
-  else await atomic(file, Buffer.from(data, 'base64'));
+  else await atomic(file, data);
  }
-}
-
-async function rollback(policyFile, saved, written, originals) {
- const files = [...written.reverse(), policyFile].map(file => recordedFile(file, originals.get(file)));
- saved.pending_update = {root: saved.pending_update.root, rollback: files};
- await atomic(policyFile, JSON.stringify(saved, null, 2));
- await replayFiles(files);
 }
 
 function benchmarkResults(b) {
@@ -291,25 +311,33 @@ function managedCache(root, owner, definition) {
  return definition.path && path.resolve(root, definition.path) === path.join(root, 'providers', 'linkbox', owner + '.yaml');
 }
 
-async function reloadPayload(config, root, selection, updates) {
+async function reloadPayload(config, root, updates, baselines) {
  // The service cannot read LinkBox's user-owned provider cache files.
  const live = structuredClone(config);
- const {use} = live['proxy-groups'].find(group => group.name === ENTRY);
+ const entry = live['proxy-groups'].find(group => group.name === ENTRY);
+ const use = new Set(entry.use || []), members = new Set(entry.proxies || []);
  for (const [owner, definition] of Object.entries(live['proxy-providers'])) {
-  if (!managedCache(root, owner, definition)) continue;
-  const file = path.resolve(root, definition.path);
-  const raw = updates.has(file) ? updates.get(file) : (await read(file))?.toString();
-  let payload = raw ? YAML.parse(raw)?.proxies : null;
-  if (!Array.isArray(payload)) throw Error('代理缓存不完整，未修改');
-  if (use.includes(owner)) {
-   const keep = new Set(selection[owner]);
-   payload = payload.filter(node => keep.has(node.name));
+  const managed = managedCache(root, owner, definition);
+  if (!managed && !use.has(owner)) continue;
+  let {payload} = definition;
+  if (definition.path) {
+   const file = path.resolve(root, definition.path);
+   if (!updates.has(file) && !baselines.has(file)) baselines.set(file, await read(file));
+   payload = parseProfile(updates.get(file) ?? baselines.get(file))?.proxies;
   }
-  Object.assign(definition, {type: 'inline', payload});
-  delete definition.url;
-  delete definition.path;
+  if (!Array.isArray(payload)) throw Error('代理缓存不完整，未修改');
+  if (use.has(owner)) {
+   const accepts = nameFilter(definition);
+   payload = payload.filter(node => accepts(node.name));
+   for (const node of payload) members.add(node.name);
+  }
+  if (managed) {
+   Object.assign(definition, {type: 'inline', payload});
+   delete definition.url;
+   delete definition.path;
+  }
  }
- return YAML.stringify(live);
+ return {payload: YAML.stringify(live), members};
 }
 
 async function sendReload(b, payload) {
@@ -322,77 +350,6 @@ async function sendReload(b, payload) {
  }
 }
 
-async function confirmReload(b, policyFile, saved, members, acknowledged) {
- const pending = saved.pending_update;
- delete pending.files;
- if (acknowledged) delete pending.require_response;
- await atomic(policyFile, JSON.stringify(saved, null, 2));
- if (pending.require_response) throw Error(RELOAD_UNCERTAIN);
- return waitForReload(b, members);
-}
-
-async function finishUpdate(b, policyFile, saved, members, before, after, profiles, inventory) {
- if (saved.reload_unconfirmed) {
-  delete saved.reload_unconfirmed;
-  await atomic(policyFile, JSON.stringify(saved, null, 2));
- }
- const desired = await selectAfterReload(b, before, after, members, saved.selected_nodes, inventory);
- const original = await read(profiles);
- const index = YAML.parse(original.toString());
- if (updateSelector(index, desired)) {
-  if (!equal(original, await read(profiles))) throw Error(EXTERNAL_CHANGE);
-  await atomic(profiles, YAML.stringify(index));
- }
- delete saved.initialization_pending;
- delete saved.pending_update;
- await atomic(policyFile, JSON.stringify(saved, null, 2));
-}
-
-async function resumeUpdate(b, policyFile, saved) {
- const selection = saved.selected_nodes;
- const pending = saved.pending_update ??= {};
- await b.config();
- if (pending.root !== undefined && pending.root !== b.root) throw Error('请先恢复原 Clash 配置目录以完成订阅更新');
- if (pending.rollback) {
-  await replayFiles(pending.rollback);
-  return true;
- }
- // Older pending records can recover the planned names from the saved selection.
- const members = pending.members ??= [...selectionOwners(selection).keys()];
- const before = await observeReload(b);
- if (!before) throw Error(RELOAD_PENDING);
- b.assertChain(before);
- let after = confirmedState(before, members);
- if (pending.files || pending.require_response || !after) {
-  if (pending.files) await replayFiles(pending.files);
-  const config = await b.config();
-  if (config.proxies?.find(node => node.name === EXIT)?.['dialer-proxy'] !== ENTRY) {
-   throw Error('固定出口的链式上游已变化，未修改');
-  }
-  const use = Object.entries(selection).filter(([, names]) => names.length).map(([owner]) => owner);
-  if (use.some(owner => !Object.hasOwn(config['proxy-providers'] || {}, owner))) {
-   throw Error('代理缓存不完整，未修改');
-  }
-  configureEntry(config['proxy-groups'] || [], use);
-  const payload = await reloadPayload(config, b.root, selection, new Map());
-  if (!saved.reload_unconfirmed) {
-   saved.reload_unconfirmed = true;
-   await atomic(policyFile, JSON.stringify(saved, null, 2));
-  }
-  let acknowledged;
-  try { acknowledged = await sendReload(b, payload); }
-  catch (error) {
-   const message = requestNotSent(error) ? RELOAD_NOT_SENT : 'Clash 拒绝重载配置';
-   throw Error(message + '；请刷新状态后重试');
-  }
-  after = await confirmReload(b, policyFile, saved, members, acknowledged);
- }
- const profiles = path.join(b.root, 'profiles.yaml');
- await finishUpdate(b, policyFile, saved, members, before, after, profiles,
-  async () => inventoryFor((await discover(b)).sources));
- return true;
-}
-
 async function run(b, request = null, {removal = null, initialize = false} = {}) {
  if (b.busy) throw Error('已有操作正在运行');
  b.busy = true;
@@ -403,17 +360,20 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const legacy = ['pinned_entry', 'node_providers', 'verge_sync', 'blocked_providers', 'excluded_nodes']
    .some(key => Object.hasOwn(saved, key));
   const needsInitialization = selection == null || legacy || saved.initialization_pending === true;
-  if (initialize && (saved.pending_update || saved.reload_unconfirmed)) {
-   return await resumeUpdate(b, policyFile, saved);
-  }
-  if (saved.reload_unconfirmed) throw Error(RELOAD_PENDING);
-  if (initialize && !needsInitialization) return false;
+  const pending = saved.pending_update;
+  const recovering = pending != null || saved.reload_unconfirmed;
+  if (recovering && !initialize) throw Error(RELOAD_PENDING);
+  if (initialize && !needsInitialization && !recovering) return false;
   const before = await b.state();
   b.assertChain(before);
   await b.config();
-  const syncing = request === null && removal === null;
+  if (recovering) {
+   if (pending?.root !== undefined && pending.root !== b.root) throw Error('请先恢复原 Clash 配置目录以完成订阅更新');
+   selection = pending?.selection ?? selection;
+  }
+  const syncing = !recovering && request === null && removal === null;
   const previewFile = path.join(b.dataDir, PREVIEW), initializationPolicy = hash([b.root, saved]);
-  if (initialize && parseProfile(await read(previewFile))?.initialization_policy === initializationPolicy) throw Error(NO_SELECTION);
+  if (initialize && !recovering && parseProfile(await read(previewFile))?.initialization_policy === initializationPolicy) throw Error(NO_SELECTION);
   const configFile = b.configFile, script = path.join(b.root, 'profiles', 'Script.js');
   const profiles = path.join(b.root, 'profiles.yaml');
   const baselines = new Map();
@@ -458,9 +418,10 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
     updates.set(path.join(b.root, 'profiles', source.profile_file), YAML.stringify(document));
    }
   }
+  const config = YAML.parse(baselines.get(configFile).toString());
   const inventory = inventoryFor(sources);
-  const plan = reconcile({sources:inventory, selection, live:before.live, current:before.entry,
-   metric:b.settings.metric, results:benchmarkResults(b)});
+  const seedOwners = selection == null ? entrySeedOwners(config, sources) : undefined;
+  const plan = reconcile({sources:inventory, selection, live:before.live, current:before.entry, seedOwners});
   if (!plan.candidates.length) {
    if (syncing) await atomic(previewFile, YAML.stringify({
     revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
@@ -469,7 +430,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    throw Error(NO_SELECTION);
   }
 
-  const config = YAML.parse(baselines.get(configFile).toString());
   if (config.proxies?.find(node => node.name === EXIT)?.['dialer-proxy'] !== ENTRY) {
    throw Error('固定出口的链式上游已变化，未修改');
   }
@@ -501,27 +461,35 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    !definitions.has(name) && managedCache(b.root, name, definition)));
   const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
   const updated = transform(config, managed, replace);
-  updates.set(script, scriptText(baselines.get(script), managed));
+  // Keep the old pin definition until the config containing it is replaced.
   updates.set(configFile, YAML.stringify(updated));
+  updates.set(script, scriptText(baselines.get(script), managed));
+  const {payload, members} = await reloadPayload(updated, b.root, updates, baselines);
+  const selected = Object.fromEntries(Object.entries(plan.selection).map(([owner, names]) =>
+   [owner, names.filter(name => members.has(name))]));
+  const {entry: desired} = reconcile({sources:inventory, selection:selected, live:[], current:null,
+   metric:b.settings.metric, results:benchmarkResults(b)});
+  if (desired === null) throw Error(NO_SELECTION);
+  const selectedNames = selectionOwners(selected);
   const index = YAML.parse(baselines.get(profiles).toString());
-  if (updateSelector(index, plan.entry)) updates.set(profiles, YAML.stringify(index));
+  if (updateSelector(index, selectedNames.has(before.entry) ? before.entry : desired)) {
+   updates.set(profiles, YAML.stringify(index));
+  }
+  const pin = saved.pinned_entry;
+  if (pin && !members.has(pin)) {
+   plan.selection = Object.fromEntries(Object.entries(plan.selection)
+    .map(([owner, names]) => [owner, names.filter(name => name !== pin)]).filter(([,names]) => names.length));
+  }
   const nextPolicy = {
    selected_nodes: plan.selection,
    provider_labels: Object.fromEntries(sources.map(({source}) => [source.name, source.display_name])),
   };
-  if (needsInitialization) nextPolicy.initialization_pending = true;
-  const members = plan.candidates.map(({name}) => name);
   const oldOwners = selectionOwners(saved.selected_nodes), newOwners = selectionOwners(plan.selection);
-  const ownerChanged = [...newOwners].some(([name, owner]) => oldOwners.has(name) && oldOwners.get(name) !== owner);
-  const pending = {members, root: b.root};
-  if (ownerChanged && sameEntryMembers(before.live, members)) pending.require_response = true;
-  nextPolicy.pending_update = pending;
-  nextPolicy.reload_unconfirmed = true;
+  const requireResponse = recovering || [...newOwners].some(([name, owner]) => oldOwners.get(name) !== owner);
   updates.set(registryFile, JSON.stringify({sources: sources.map(({source}) => source)}, null, 2));
   const originals = new Map([[policyFile, baselines.get(policyFile)]]);
   for (const file of updates.keys()) originals.set(file, baselines.has(file) ? baselines.get(file) : await read(file));
 
-  const payload = await reloadPayload(updated, b.root, plan.selection, updates);
   const temp = await fs.mkdtemp(path.join(b.root, 'linkbox-validate-'));
   try {
    const file = path.join(temp, 'config.yaml');
@@ -546,29 +514,43 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   for (const [file, raw] of originals) {
    if (raw !== null && file !== policyFile) await fs.writeFile(path.join(backup, (i++) + '-' + path.basename(file)), raw, {mode: 0o600});
   }
-  // Keep the complete plan until every write and the first reload attempt are recorded.
-  pending.files = [...updates].map(([file, data]) => recordedFile(file, data));
-  await atomic(policyFile, JSON.stringify(nextPolicy, null, 2));
-  const written = [];
+  const lastSaved = {...saved};
+  for (const key of ['pending_update', 'reload_unconfirmed', 'initialization_pending']) delete lastSaved[key];
+  const journal = {root: b.root, selection: plan.selection};
+  await atomic(policyFile, JSON.stringify({...lastSaved, pending_update: journal}, null, 2));
+  const written = recovering ? [] : [policyFile];
   try {
    for (const [file, data] of updates) {
     await atomic(file, data);
     written.push(file);
    }
   } catch (error) {
-   await rollback(policyFile, nextPolicy, written, originals);
+   await rollback(written, originals);
    throw error;
   }
   let acknowledged;
   try {
    acknowledged = await sendReload(b, payload);
   } catch (error) {
-   await rollback(policyFile, nextPolicy, written, originals);
-   const message = requestNotSent(error) ? RELOAD_NOT_SENT : 'Clash 未更新';
+   const unsent = requestNotSent(error);
+   if (recovering && !unsent) {
+    originals.set(policyFile, JSON.stringify(lastSaved, null, 2));
+    written.unshift(policyFile);
+   }
+   await rollback(written, originals);
+   const message = unsent ? RELOAD_NOT_SENT : 'Clash 未更新';
    throw Error(message + '，文件已回退；请刷新状态后重试');
   }
-  const after = await confirmReload(b, policyFile, nextPolicy, members, acknowledged);
-  await finishUpdate(b, policyFile, nextPolicy, members, before, after, profiles, () => inventory);
+  if (requireResponse && !acknowledged) throw Error(RELOAD_UNCERTAIN);
+  const after = await waitForReload(b, members);
+  const selectedEntry = await selectAfterReload(b, before, after, members, selectedNames, desired);
+  const currentProfile = await read(profiles);
+  const currentIndex = YAML.parse(currentProfile.toString());
+  if (updateSelector(currentIndex, selectedEntry)) {
+   if (!equal(currentProfile, await read(profiles))) throw Error(EXTERNAL_CHANGE);
+   await atomic(profiles, YAML.stringify(currentIndex));
+  }
+  await atomic(policyFile, JSON.stringify(nextPolicy, null, 2));
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
  })();

@@ -72,7 +72,8 @@ def relay_state(**request_options):
 
 def require_confirmed_reload():
     import runtime
-    if runtime.read_json('node-policy.json').get('reload_unconfirmed'):
+    policy = runtime.read_json('node-policy.json')
+    if policy.get('pending_update') is not None or policy.get('reload_unconfirmed'):
         raise RuntimeError(RELOAD_PENDING)
 
 

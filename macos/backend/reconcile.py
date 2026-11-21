@@ -1,12 +1,13 @@
 """Plan changes to the selection from a picker-ordered subscription inventory."""
 
 
-def reconcile(sources, selection, live, current, metric='chain', results=None):
+def reconcile(sources, selection, live, current, metric='chain', results=None, *, seed_owners=None):
     """Return the surviving selection, ordered candidates, and desired entry."""
     seed = selection is None
     live = set(live) if seed else set()
     selection = selection or {}
     results = results or {}
+    seed_owners = seed_owners or {}
     selected = {}
     candidates = []
     owners = {}
@@ -15,7 +16,8 @@ def reconcile(sources, selection, live, current, metric='chain', results=None):
                 for name in selection.get(source['id'], [])}
     for source in sources:
         owner = source['id']
-        requested = live if seed else set(selection.get(owner, []))
+        requested = ({name for name in live if seed_owners.get(name, owner) == owner}
+                     if seed else set(selection.get(owner, [])))
         unreadable = source.get('unreadable')
         if unreadable and owner in selection:
             selected[owner] = selection[owner]

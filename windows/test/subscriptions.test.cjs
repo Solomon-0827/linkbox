@@ -69,7 +69,11 @@ async function fixture(t) {
    providers = Object.fromEntries(Object.entries(payload['proxy-providers']).map(([owner, p]) => [
     owner, {proxies: p.payload ?? [], vehicleType: 'Inline'},
    ]));
-   state.live = group.use.flatMap(id => payload['proxy-providers'][id].payload.map(n => n.name));
+   state.live = group.proxies.concat(group.use.flatMap(id => {
+    const provider = payload['proxy-providers'][id];
+    return provider.payload.map(n => n.name).filter(name =>
+     new RegExp(provider.filter || '.').test(name) && !new RegExp(provider['exclude-filter'] || '(?!)').test(name));
+   }));
    if (!keepStaleEntry && !state.live.includes(state.entry)) state.entry = state.live[0];
   } else {
    assert.equal(route, ENTRY_ROUTE);
@@ -170,7 +174,8 @@ test('same-name owner move requires a reload response on Refresh', async t => {
   return result;
  };
  await assert.rejects(apply({a:[], b:['current','fast']}), /尚未确认/);
- assert.equal((await saved()).reload_unconfirmed, true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+ assert.deepEqual((await saved()).pending_update.selection, {b:['current','fast']});
  assert.deepEqual(state.live, ['current','fast']);
  assert.deepEqual(YAML.parse(requests.at(-1).body.payload)['proxy-groups'][0].use, ['b']);
  b.request = controller;
@@ -180,14 +185,8 @@ test('same-name owner move requires a reload response on Refresh', async t => {
  assert.equal((await saved()).pending_update, undefined);
 });
 
-test('restart recovers a process exit after the config write before the profile write', async t => {
- const {b, root, data, state, apply, request, saved, requests} = await fixture(t);
- await apply({a:['current','fast'], b:[]});
- requests.length = 0;
+async function crashAfterConfig({root, data, state, request}) {
  const profile = path.join(root,'profiles.yaml'), registry = path.join(data,'subscriptions.json');
- const renamed = YAML.parse(await fs.readFile(profile,'utf8'));
- renamed.items[0].name = 'Renamed subscription';
- await fs.writeFile(profile,YAML.stringify(renamed));
  const originalProfile = await fs.readFile(profile), originalRegistry = await fs.readFile(registry);
  const selection = await request({a:['fast'], b:[]});
  const child = `
@@ -210,17 +209,66 @@ test('restart recovers a process exit after the config write before the profile 
   require.resolve('../subscriptions.cjs'),root,data,JSON.stringify(state),JSON.stringify(selection)]), {status:42});
  assert.deepEqual(await fs.readFile(profile),originalProfile);
  assert.deepEqual(await fs.readFile(registry),originalRegistry);
+}
+
+test('restart recomputes from newer Verge files after a crash', async t => {
+ const fx = await fixture(t);
+ const {b, root, data, state, apply, saved, requests, write} = fx;
+ await apply({a:['current','fast'], b:[]});
+ requests.length = 0;
+ await crashAfterConfig(fx);
+ const profile = path.join(root,'profiles.yaml');
+ const renamed = YAML.parse(await fs.readFile(profile,'utf8'));
+ renamed.items[0].name = 'Renamed in Verge after the crash';
+ await write('profiles.yaml', renamed);
+ const config = await b.config();
+ config['log-level'] = 'warning';
+ await write('clash-verge.yaml', config);
+ const script = path.join(root,'profiles/Script.js');
+ await fs.writeFile(script, 'function main(c) { c["log-level"] = "warning"; return c; }\n');
+ await write('profiles/a.yaml', {proxies:[node('fast', 'new.example.invalid')]});
  const restarted = await new Backend(data).init();
  restarted.settings.configDir = root;
  restarted.endpoint = {};
  restarted.request = b.request;
+ restarted.validateConfig = t.mock.fn(b.validateConfig);
  assert.equal(await sub.initialize(restarted), true);
  assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
  assert.deepEqual(state.live, ['fast']);
  assert.deepEqual(YAML.parse(await fs.readFile(profile,'utf8')).items[0].selected, [{name:ENTRY, now:'fast'}]);
  assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
- assert.equal(JSON.parse(await fs.readFile(registry,'utf8')).sources[0].display_name,'Renamed subscription');
+ assert.equal(YAML.parse(await fs.readFile(profile,'utf8')).items[0].name, 'Renamed in Verge after the crash');
+ assert.equal((await b.config())['log-level'], 'warning');
+ assert.match(await fs.readFile(script,'utf8'), /c\["log-level"\] = "warning"/);
+ const reload = YAML.parse(requests[0].body.payload);
+ assert.equal(reload['proxy-providers'].a.payload[0].server, 'new.example.invalid');
+ assert.equal(restarted.validateConfig.mock.callCount(), 1);
  assert.equal((await saved()).pending_update, undefined);
+});
+
+test('restart rolls back its own writes if reload is rejected', async t => {
+ const fx = await fixture(t);
+ const {b, root, data, state, apply, saved, requests, write} = fx;
+ await apply({a:['current','fast'], b:[]});
+ requests.length = 0;
+ await crashAfterConfig(fx);
+ const profile = path.join(root,'profiles.yaml');
+ const renamed = YAML.parse(await fs.readFile(profile,'utf8'));
+ renamed.items[0].name = 'Renamed in Verge after the crash';
+ await write('profiles.yaml', renamed);
+ const files = [profile, path.join(root,'clash-verge.yaml'), path.join(root,'profiles/Script.js'),
+  path.join(root,'providers/linkbox/a.yaml'), path.join(data,'subscriptions.json')];
+ const previous = await Promise.all(files.map(file => fs.readFile(file)));
+ const controller = b.request;
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') throw new ClashHTTPError(400, true);
+  return controller(...args);
+ };
+ await assert.rejects(sub.initialize(b), /文件已回退/);
+ assert.deepEqual(await Promise.all(files.map(file => fs.readFile(file))), previous);
+ assert.deepEqual(await saved(), {selected_nodes:{a:['current','fast']}, provider_labels:{a:'A',b:'B'}});
+ assert.deepEqual(state.live, ['current','fast']);
+ assert.equal(await sub.initialize(b), false);
 });
 
 test('Refresh confirms after equivalent config reserialization', async t => {
@@ -256,7 +304,7 @@ async function checkLateReloadAfterSave(t, names, {rewrite, vergeEntry}) {
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, vergeEntry || names[0]);
- assert.deepEqual(requests, []);
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
  assert.equal((await saved()).pending_update, undefined);
  assert.equal((await saved()).reload_unconfirmed, undefined);
 }
@@ -320,6 +368,39 @@ test('first run downloads before seeding even with truncated Verge YAML and drop
  assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
 });
 
+test('first run seeds in live provider order with picker fallback', async t => {
+ const {b, config, state, write, refreshWith, saved} = await fixture(t);
+ Object.assign(config['proxy-groups'][0], {use:['b','a'], proxies:['quick']});
+ config['proxy-providers'] = {
+  a:{type:'inline', payload:['current','fast'].map(n => node(n))},
+  b:{type:'inline', payload:['current','fast'].map(n => node(n)), 'exclude-filter':'^fast$'},
+ };
+ await write('clash-verge.yaml', config);
+ state.live.push('quick');
+ refreshWith({a:['current','fast','quick'], b:['current','fast','quick']});
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick'], b:['current']});
+});
+
+test('first run does not confirm owner assignment without a success response', async t => {
+ const {b, state, refreshWith, saved, requests} = await fixture(t);
+ refreshWith({a:['current','fast','quick'], b:['other']});
+ const controller = b.request, lost = [];
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') { lost.push(args); throw Error('timeout'); }
+  return controller(...args);
+ };
+ await assert.rejects(sub.initialize(b), /尚未确认/);
+ assert.equal((await saved()).selected_nodes, undefined);
+ await assert.rejects(sub.initialize(b), /尚未确认/);
+ assert.equal(lost.length, 2);
+ assert.deepEqual(state.live, ['current','fast']);
+ b.request = controller;
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+});
+
 test('upgrade with saved selection cleans the old pin and switches once', async t => {
  const {b, root, state, legacy, downloads, requests, saved, refreshWith} = await fixture(t);
  await legacy({selected_nodes:{a:['fast'],b:['other']}});
@@ -334,6 +415,56 @@ test('upgrade with saved selection cleans the old pin and switches once', async 
  assert.equal(downloads.length, 2);
  assert.deepEqual((await saved()).selected_nodes, {a:['fast'],b:['other']});
 });
+
+test('upgrade saving B switches off a pin excluded by unreadable A', async t => {
+ const {b, root, config, state, legacy, requests, saved, refreshWith, write, apply} = await fixture(t);
+ await legacy({selected_nodes:{a:['current','fast']}});
+ const cache = path.join(root,'providers/linkbox/a.yaml');
+ await fs.mkdir(path.dirname(cache), {recursive:true});
+ await write('providers/linkbox/a.yaml', {proxies:['current','fast'].map(n => node(n))});
+ config['proxy-providers'] = {a:{
+  type:'http', url:'https://example.invalid/a', path:cache,
+  filter:'^current$|^fast$', 'exclude-filter':'^current$',
+ }};
+ Object.assign(config['proxy-groups'][0], {proxies:['current'], use:['a']});
+ await write('clash-verge.yaml', config);
+ await fs.writeFile(path.join(root, 'profiles/a.yaml'), 'proxies: [');
+ refreshWith({b:['other']});
+ await assert.rejects(sub.initialize(b), /下载或解析失败/);
+ b.history = {latestResults:{other:{owner:'b', chainDelay:10}}};
+ if (process.env.LINKBOX_TEST_CORE) b.validateConfig = file => {
+  execFileSync(process.env.LINKBOX_TEST_CORE, ['-t', '-d', root, '-f', file]);
+ };
+ await apply({a:[], b:['other']});
+ assert.deepEqual(state.live, ['fast','other']);
+ assert.equal(state.entry, 'other');
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
+ const index = YAML.parse(await fs.readFile(path.join(root,'profiles.yaml'),'utf8'));
+ assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'other'}]);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast'], b:['other']});
+ assert.equal((await saved()).pending_update, undefined);
+});
+
+for (const flag of ['include-all-proxies', 'include-all']) {
+ test(`legacy pin respects filtered ${flag} references`, async t => {
+  for (const acceptsPin of [true, false]) {
+   await t.test(acceptsPin ? 'includes the pin' : 'excludes the pin', async subtest => {
+    const {config, write, apply, legacy, requests, state} = await fixture(subtest);
+    await legacy({selected_nodes:{a:['current','fast']}});
+    const secondary = {name:'secondary', type:'select', [flag]:true, filter:'(?i)^CURRENT$',
+     'exclude-filter': acceptsPin ? '^other$' : '^current$'};
+    config['proxy-groups'].push(secondary);
+    await write('clash-verge.yaml', config);
+    await apply({a:['fast'], b:[]});
+    const reload = YAML.parse(requests[0].body.payload);
+    assert.deepEqual(reload['proxy-groups'][1], secondary);
+    assert.equal(reload.proxies.some(n => n.name === 'current'), acceptsPin);
+    assert.deepEqual(state.live, ['fast']);
+   });
+  }
+ });
+}
 
 test('sync keeps saved nodes outside the live group and removes vanished nodes and sources', async t => {
  const {b, write, state, requests, items, apply, saved, refreshWith, root} = await fixture(t);
@@ -452,13 +583,13 @@ test('partial deselection filters a provider shared with another group', async t
  const secondary = {name:'secondary', type:'select', use:['a'], filter:'^slow$'};
  config['proxy-groups'].push(secondary);
  await write('clash-verge.yaml', config);
- await write('profiles/a.yaml', {proxies:['fast','slow'].map(name => node(name))});
- await apply({a:['fast','slow'], b:[]});
- await apply({a:['fast'], b:[]});
+ await write('profiles/a.yaml', {proxies:['fast`relay','fast extra','slow'].map(name => node(name))});
+ await apply({a:['fast`relay','slow'], b:[]});
+ await apply({a:['fast`relay'], b:[]});
  const payload = YAML.parse(requests.at(-1).body.payload);
  assert.deepEqual(payload['proxy-groups'][1], secondary);
- assert.equal(payload['proxy-providers'].a.filter, '^fast$');
- assert.deepEqual(payload['proxy-providers'].a.payload.map(row => row.name), ['fast']);
+ assert.equal(payload['proxy-providers'].a.filter, '^fast\\x60relay$');
+ assert.deepEqual(payload['proxy-providers'].a.payload.map(row => row.name), ['fast`relay']);
 });
 
 test('validation failure and external state change cancel before any reload', async t => {
@@ -501,7 +632,7 @@ test('empty HTTP error response cannot trigger rollback', async t => {
  };
  await assert.rejects(apply({a:['quick'],b:[]}), /尚未确认/);
  assert.equal(writes.length, 1);
- assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
+ assert.deepEqual((await saved()).pending_update.selection, {a:['quick']});
 });
 
 test('remove applies the same selection and refuses the current, stale or unknown entries', async t => {
@@ -574,7 +705,8 @@ test('unobservable reload keeps new files and requests refresh', async t => {
  };
  await assert.rejects(apply({a:['quick'],b:[]}), /已写入新配置，Clash 尚未确认，请刷新状态核对/);
  assert.equal(state.entry, 'quick');
- assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
+ assert.equal((await saved()).selected_nodes, undefined);
+ assert.deepEqual((await saved()).pending_update.selection, {a:['quick']});
 });
 
 for(const recover of [true, false]) test('switch retries after reading state, then ' + (recover ? 'recovers' : 'reports failure'), async t => {
@@ -598,11 +730,19 @@ for(const recover of [true, false]) test('switch retries after reading state, th
  assert.equal(calls[first + 1], '/configs');
  assert.equal(calls[first + 2], '/proxies');
  assert.equal(state.entry, recover ? 'quick' : 'current');
- assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick']});
+ const policy = await saved();
+ if (recover) {
+  assert.deepEqual(policy.selected_nodes, {a:['fast','quick']});
+  assert.equal(policy.pending_update, undefined);
+ } else {
+  assert.equal(policy.selected_nodes, undefined);
+  assert.deepEqual(policy.pending_update.selection, {a:['fast','quick']});
+ }
 });
 
 test('a delayed reload is read back without resending it', async t => {
  const {b, root, state, apply, saved} = await fixture(t);
+ await apply({a:['current','fast','quick'],b:[]});
  const controller = b.request, writes = [];
  let reads = 0;
  b.request = async (...args) => {
@@ -645,14 +785,14 @@ test('initialization retries after files are written but reload is unconfirmed',
   return controller(...args);
  };
  await assert.rejects(sub.initialize(b), /尚未确认/);
- assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+ assert.deepEqual((await saved()).pending_update.selection, {a:['current','fast']});
  await assert.rejects(sub.initialize(b), /尚未确认/);
  assert.equal(reloads.length, 2);
  await controller(...reloads[0]);
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(await sub.initialize(b), false);
- assert.equal(requests.length, 1);
+ assert.equal(requests.length, 2);
 });
 
 for (const late of [false, true]) test(`Refresh finishes an existing user's pending update (${late ? 'late reload' : 'lost request'})`, async t => {
@@ -676,7 +816,7 @@ for (const late of [false, true]) test(`Refresh finishes an existing user's pend
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'quick');
- assert.deepEqual(requests.map(({route}) => route), [...(late ? [] : ['/configs?force=false']), ENTRY_ROUTE]);
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
  const index = YAML.parse(await fs.readFile(path.join(root, 'profiles.yaml'), 'utf8'));
  assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'quick'}]);
  assert.equal((await saved()).pending_update, undefined);
@@ -711,13 +851,14 @@ test('unconfirmed reload blocks switching and reconcile until Refresh confirms i
  await controller(...reloads[0]);
  delete b.state;
  await assert.rejects(b.switchNode('fast','current'), guard);
+ b.request = controller;
  await sub.initialize(b);
  await b.switchNode('fast','current');
  assert.equal(state.entry, 'fast');
 });
 
 test('initialization replans from the latest results after a failed switch', async t => {
- const {b, legacy, refreshWith, state, saved, requests, keepStaleEntryOnReload} = await fixture(t);
+ const {b, root, legacy, refreshWith, state, saved, requests, keepStaleEntryOnReload} = await fixture(t);
  keepStaleEntryOnReload();
  await legacy({selected_nodes:{a:['current','fast','quick'], b:['other']}});
  refreshWith({a:['fast','quick'], b:['other']});
@@ -730,16 +871,13 @@ test('initialization replans from the latest results after a failed switch', asy
  await assert.rejects(sub.initialize(b), /无法切换/);
  assert.equal(state.entry, 'current');
  const policy = await saved();
- assert.equal(policy.initialization_pending, true);
- assert.deepEqual(policy.pending_update.members, ['fast','quick','other']);
- assert.equal(policy.pending_update.files, undefined);
- assert.equal(policy.reload_unconfirmed, undefined);
+ assert.deepEqual(policy.pending_update, {root, selection:{a:['fast','quick'], b:['other']}});
  b.history = {kind:'chain', latestResults:{other:{owner:'b', chainDelay:5}}};
  b.request = controller;
  requests.length = 0;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'other');
- assert.deepEqual(requests.map(({route}) => route), [ENTRY_ROUTE]);
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
  assert.equal(await sub.initialize(b), false);
 });
 
@@ -842,5 +980,5 @@ test('post-switch verification rejects an added ENTRY member', async t => {
  b.history = {latestResults:{other:{chainDelay:20,owner:'b'}}};
  await assert.rejects(apply({a:['quick'],b:['other']}), /配置已更新，但无法切换/);
  assert.deepEqual(requests.map(r=>r.route), ['/configs?force=false', ENTRY_ROUTE]);
- assert.deepEqual((await saved()).selected_nodes, {a:['quick'],b:['other']});
+ assert.deepEqual((await saved()).pending_update.selection, {a:['quick'],b:['other']});
 });

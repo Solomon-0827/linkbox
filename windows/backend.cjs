@@ -132,7 +132,8 @@ class Backend{
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
  async requireConfirmedReload(){
-  if((await jsonRead(path.join(this.dataDir,'node-policy.json'))).reload_unconfirmed)throw Error(RELOAD_PENDING);
+  const policy=await jsonRead(path.join(this.dataDir,'node-policy.json'));
+  if(policy.pending_update!=null||policy.reload_unconfirmed)throw Error(RELOAD_PENDING);
  }
  async switchNode(name,previous){
   if(this.busy)throw Error('请先停止本轮测速或等待当前操作完成');

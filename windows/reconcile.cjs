@@ -1,6 +1,6 @@
 'use strict';
 
-function reconcile({sources, selection, live, current, metric = 'chain', results = {}}) {
+function reconcile({sources, selection, live, current, metric = 'chain', results = {}, seedOwners = new Map()}) {
  const seed = selection == null;
  const liveNames = new Set(seed ? live : []);
  const selected = new Map(), candidates = [], owners = new Map(), occurrences = new Map();
@@ -12,7 +12,8 @@ function reconcile({sources, selection, live, current, metric = 'chain', results
   if (unreadable && selection && Object.hasOwn(selection, owner)) selected.set(owner, saved(owner));
   for (const name of unreadable ? saved(owner) : nodes) {
    occurrences.set(name, (occurrences.get(name) || 0) + 1);
-   if (requested.has(name) && !owners.has(name) && (reserved.get(name) ?? owner) === owner) {
+   if (requested.has(name) && !owners.has(name) && (reserved.get(name) ?? owner) === owner &&
+       (!seed || (seedOwners.get(name) ?? owner) === owner)) {
     if (!unreadable) {
      if (!selected.has(owner)) selected.set(owner, []);
      selected.get(owner).push(name);
