@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 from pathlib import Path
@@ -91,7 +92,7 @@ class SubscriptionFixture:
             names = [n['name'] for owner in group['use']
                      for n in self.reload['proxy-providers'][owner]['payload']]
             self.assertEqual(group['proxies'], [])
-            self.providers = {owner: {'proxies': p['payload'], 'vehicleType': 'Inline'}
+            self.providers = {owner: {'proxies': p.get('payload', []), 'vehicleType': 'Inline'}
                               for owner, p in self.reload['proxy-providers'].items()}
             self.active.update(live=names)
             if not self.keep_stale_entry and self.active['entry'] not in names:
@@ -317,20 +318,99 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
         self.assertEqual(self.requests, ['/configs?force=false', ENTRY_ROUTE])
 
-    def test_manual_refresh_reapplies_saved_owners_after_same_name_edit(self):
+    def test_routine_refresh_sends_no_reload(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.requests.clear()
+        with patch.object(gui, 'snapshot', return_value=self.active), \
+                patch.object(gui.sys, 'argv', ['gui_backend.py', 'startup', 'chain', '--refresh']), \
+                patch('builtins.print'):
+            gui.main()
+        self.assertEqual(self.requests, [])
+
+    def test_reload_preserves_unrelated_http_provider_in_include_all(self):
         config = yaml.safe_load(self.config.read_bytes())
-        config['proxy-providers'] = {'b': {'type': 'inline', 'payload': [node('current'), node('fast')]}}
+        definition = {'type': 'http', 'url': 'https://example.invalid/native', 'path': 'native.yaml',
+                      'interval': 3600, 'health-check': {'enable': False}}
+        config['proxy-providers'] = {'native': definition}
+        config['proxy-groups'].append({'name': 'secondary', 'type': 'select', 'include-all': True})
+        (self.root / 'native.yaml').write_bytes(update.dump({'proxies': [node('native-relay')]}))
         self.config.write_bytes(update.dump(config))
         self.apply({'a': ['current', 'fast'], 'b': []})
-        external = yaml.safe_load(self.config.read_bytes())
-        external['proxy-groups'][0]['use'] = ['b']
-        self.config.write_bytes(update.dump(external))
-        self.active.update(entry='fast', live=['fast', 'current'])
-        self.requests.clear()
-        self.assertTrue(picker.initialize(refresh=True))
+        self.assertEqual(self.reload['proxy-providers']['native'], definition)
+        self.assertEqual(self.reload['proxy-providers']['a']['type'], 'inline')
+
+    def test_same_name_owner_move_with_connection_refused_rolls_back(self):
+        self.write_profile('b', ['current', 'fast'])
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        before = {k: v for k, v in self.files().items() if not k.startswith('backups/')}
+        active = self.active.copy()
+        with (patch.object(t, 'api', self.real_api),
+              patch.object(t.socket, 'socket') as socket_factory):
+            connect = socket_factory.return_value.connect
+            for error in (ConnectionRefusedError(errno.ECONNREFUSED, 'refused'),
+                          FileNotFoundError(errno.ENOENT, 'socket missing'), TimeoutError('connect timed out')):
+                with self.subTest(error=error):
+                    connect.side_effect = error
+                    with self.assertRaisesRegex(RuntimeError, '未发送重载请求.*文件已回退'):
+                        self.apply({'a': [], 'b': ['current', 'fast']})
+                    self.assertEqual({k: v for k, v in self.files().items() if not k.startswith('backups/')}, before)
+            self.assertEqual(connect.call_count, 3)
+        self.assertEqual(self.active, active)
         self.assertEqual(self.reload['proxy-groups'][0]['use'], ['a'])
-        self.assertEqual(self.active['entry'], 'fast')
+
+    def test_same_name_owner_move_requires_reload_response_on_refresh(self):
+        self.write_profile('b', ['current', 'fast'])
+        self.apply({'a': ['current', 'fast'], 'b': []})
+
+        def lose_response(method, route, body=None, **kwargs):
+            result = self.controller(method, route, body, **kwargs)
+            if route == '/configs?force=false':
+                raise ConnectionResetError(errno.ECONNRESET, 'response lost')
+            return result
+
+        self.api.side_effect = lose_response
+        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
+            self.apply({'a': [], 'b': ['current', 'fast']})
+        self.assertTrue(json.loads(self.policy.read_bytes())['reload_unconfirmed'])
+        self.assertEqual(self.reload['proxy-groups'][0]['use'], ['b'])
+        self.api.side_effect = self.controller
+        self.requests.clear()
+        self.assertTrue(picker.initialize())
         self.assertEqual(self.requests, ['/configs?force=false'])
+        self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
+
+    def test_restart_recovers_crash_after_config_before_profile_write(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.requests.clear()
+        renamed = yaml.safe_load(self.index.read_bytes())
+        renamed['items'][0]['name'] = 'Renamed subscription'
+        self.index.write_bytes(update.dump(renamed))
+        original_index = self.index.read_bytes()
+        registry = self.base / 'subscriptions.json'
+        original_registry = registry.read_bytes()
+        atomic = update.atomic
+
+        class Crash(BaseException):
+            pass
+
+        def crash_after_config(path, data):
+            atomic(path, data)
+            if path == self.config:
+                raise Crash()
+
+        with patch.object(update, 'atomic', side_effect=crash_after_config), self.assertRaises(Crash):
+            self.apply({'a': ['fast'], 'b': []})
+        self.assertEqual(self.index.read_bytes(), original_index)
+        self.assertEqual(registry.read_bytes(), original_registry)
+        self.assertEqual(self.requests, [])
+        self.assertTrue(picker.initialize())
+        self.assertEqual(self.requests, ['/configs?force=false'])
+        self.assertEqual(self.active['live'], ['fast'])
+        self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
+                         [{'name': t.ENTRY, 'now': 'fast'}])
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
+        self.assertEqual(json.loads(registry.read_bytes())['sources'][0]['display_name'], 'Renamed subscription')
+        self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
 
     def test_refresh_confirms_after_equivalent_config_reserialization(self):
         self.check_late_reload_after_save(['fast', 'quick'], rewrite=True)
@@ -514,7 +594,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.active['entry'], 'current')
         policy = json.loads(self.policy.read_bytes())
         self.assertTrue(policy['initialization_pending'])
-        self.assertEqual(policy['pending_update'], {'members': ['fast', 'quick', 'other']})
+        self.assertEqual(policy['pending_update']['members'], ['fast', 'quick', 'other'])
+        self.assertNotIn('files', policy['pending_update'])
         self.assertNotIn('reload_unconfirmed', policy)
         results.write_text(json.dumps({'results': {'other': {'chain_delay': 5, 'owner': 'b'}}}))
         self.api.side_effect = self.controller

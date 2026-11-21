@@ -3,7 +3,7 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
 const {reconcile, sameEntryMembers, selectionOwners}=require('./reconcile.cjs');
 const {isDeepStrictEqual}=require('node:util');
 const timers=require('node:timers/promises');
-const {signature: sig, ClashHTTPError, RELOAD_PENDING}=require('./backend.cjs');
+const {signature: sig, ClashHTTPError, requestNotSent, RELOAD_PENDING}=require('./backend.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -128,6 +128,7 @@ const equal = (a, b) => a === null ? b === null : b !== null && a.equals(b);
 const EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新';
 const POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash';
 const RELOAD_UNCERTAIN = '已写入新配置，Clash 尚未确认，请刷新状态核对';
+const RELOAD_NOT_SENT = '无法连接 Clash 控制接口，未发送重载请求';
 const SWITCH_FAILED = '配置已更新，但无法切换中转入口，请刷新并核对 Clash';
 const ENTRY_ROUTE = '/proxies/' + encodeURIComponent(ENTRY);
 const CHAIN_KEYS = ['mode', 'tun', 'exit', 'dialer'];
@@ -259,12 +260,22 @@ async function selectAfterReload(b, before, after, members, selection, inventory
  throw Error(SWITCH_FAILED);
 }
 
-async function rollback(written, originals) {
- for (const file of written.reverse()) {
-  const raw = originals.get(file);
-  if (raw === null) await fs.rm(file, {force: true});
-  else await atomic(file, raw);
+function recordedFile(file, data) {
+ return [file, data === null ? null : Buffer.from(data).toString('base64')];
+}
+
+async function replayFiles(files) {
+ for (const [file, data] of files) {
+  if (data === null) await fs.rm(file, {force:true});
+  else await atomic(file, Buffer.from(data, 'base64'));
  }
+}
+
+async function rollback(policyFile, saved, written, originals) {
+ const files = [...written.reverse(), policyFile].map(file => recordedFile(file, originals.get(file)));
+ saved.pending_update = {root: saved.pending_update.root, rollback: files};
+ await atomic(policyFile, JSON.stringify(saved, null, 2));
+ await replayFiles(files);
 }
 
 function benchmarkResults(b) {
@@ -276,12 +287,16 @@ function benchmarkResults(b) {
   }]));
 }
 
+function managedCache(root, owner, definition) {
+ return definition.path && path.resolve(root, definition.path) === path.join(root, 'providers', 'linkbox', owner + '.yaml');
+}
+
 async function reloadPayload(config, root, selection, updates) {
- // The service cannot read user-owned provider paths.
+ // The service cannot read LinkBox's user-owned provider cache files.
  const live = structuredClone(config);
  const {use} = live['proxy-groups'].find(group => group.name === ENTRY);
  for (const [owner, definition] of Object.entries(live['proxy-providers'])) {
-  if (!definition.path) continue;
+  if (!managedCache(root, owner, definition)) continue;
   const file = path.resolve(root, definition.path);
   const raw = updates.has(file) ? updates.get(file) : (await read(file))?.toString();
   let payload = raw ? YAML.parse(raw)?.proxies : null;
@@ -295,6 +310,25 @@ async function reloadPayload(config, root, selection, updates) {
   delete definition.path;
  }
  return YAML.stringify(live);
+}
+
+async function sendReload(b, payload) {
+ try {
+  await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
+  return true;
+ } catch (error) {
+  if (requestNotSent(error) || (error instanceof ClashHTTPError && error.rejected)) throw error;
+  return false;
+ }
+}
+
+async function confirmReload(b, policyFile, saved, members, acknowledged) {
+ const pending = saved.pending_update;
+ delete pending.files;
+ if (acknowledged) delete pending.require_response;
+ await atomic(policyFile, JSON.stringify(saved, null, 2));
+ if (pending.require_response) throw Error(RELOAD_UNCERTAIN);
+ return waitForReload(b, members);
 }
 
 async function finishUpdate(b, policyFile, saved, members, before, after, profiles, inventory) {
@@ -314,16 +348,23 @@ async function finishUpdate(b, policyFile, saved, members, before, after, profil
  await atomic(policyFile, JSON.stringify(saved, null, 2));
 }
 
-async function resumeUpdate(b, policyFile, saved, reapply = false) {
+async function resumeUpdate(b, policyFile, saved) {
  const selection = saved.selected_nodes;
+ const pending = saved.pending_update ??= {};
+ await b.config();
+ if (pending.root !== undefined && pending.root !== b.root) throw Error('请先恢复原 Clash 配置目录以完成订阅更新');
+ if (pending.rollback) {
+  await replayFiles(pending.rollback);
+  return true;
+ }
  // Older pending records can recover the planned names from the saved selection.
- const members = saved.pending_update?.members ?? [...selectionOwners(selection).keys()];
+ const members = pending.members ??= [...selectionOwners(selection).keys()];
  const before = await observeReload(b);
  if (!before) throw Error(RELOAD_PENDING);
  b.assertChain(before);
- if (!b.root) await b.config();
  let after = confirmedState(before, members);
- if (reapply || !after) {
+ if (pending.files || pending.require_response || !after) {
+  if (pending.files) await replayFiles(pending.files);
   const config = await b.config();
   if (config.proxies?.find(node => node.name === EXIT)?.['dialer-proxy'] !== ENTRY) {
    throw Error('固定出口的链式上游已变化，未修改');
@@ -334,19 +375,17 @@ async function resumeUpdate(b, policyFile, saved, reapply = false) {
   }
   configureEntry(config['proxy-groups'] || [], use);
   const payload = await reloadPayload(config, b.root, selection, new Map());
-  saved.pending_update = {members};
-  saved.reload_unconfirmed = true;
-  await atomic(policyFile, JSON.stringify(saved, null, 2));
-  try { await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000); }
-  catch (error) {
-   if (reapply && error instanceof ClashHTTPError && error.rejected) {
-    delete saved.pending_update;
-    delete saved.reload_unconfirmed;
-    await atomic(policyFile, JSON.stringify(saved, null, 2));
-    throw Error('Clash 未更新，请刷新状态后重试');
-   }
+  if (!saved.reload_unconfirmed) {
+   saved.reload_unconfirmed = true;
+   await atomic(policyFile, JSON.stringify(saved, null, 2));
   }
-  after = await waitForReload(b, members);
+  let acknowledged;
+  try { acknowledged = await sendReload(b, payload); }
+  catch (error) {
+   const message = requestNotSent(error) ? RELOAD_NOT_SENT : 'Clash 拒绝重载配置';
+   throw Error(message + '；请刷新状态后重试');
+  }
+  after = await confirmReload(b, policyFile, saved, members, acknowledged);
  }
  const profiles = path.join(b.root, 'profiles.yaml');
  await finishUpdate(b, policyFile, saved, members, before, after, profiles,
@@ -354,10 +393,10 @@ async function resumeUpdate(b, policyFile, saved, reapply = false) {
  return true;
 }
 
-async function run(b, request = null, {removal = null, initialize = false, refresh = false} = {}) {
+async function run(b, request = null, {removal = null, initialize = false} = {}) {
  if (b.busy) throw Error('已有操作正在运行');
  b.busy = true;
- try {
+ const update = (async () => {
   const saved = await policy(b);
   const policyFile = path.join(b.dataDir, 'node-policy.json');
   let selection = saved.selected_nodes;
@@ -368,10 +407,7 @@ async function run(b, request = null, {removal = null, initialize = false, refre
    return await resumeUpdate(b, policyFile, saved);
   }
   if (saved.reload_unconfirmed) throw Error(RELOAD_PENDING);
-  if (initialize && !needsInitialization) {
-   if (refresh && selectionOwners(selection).size) return await resumeUpdate(b, policyFile, saved, true);
-   return false;
-  }
+  if (initialize && !needsInitialization) return false;
   const before = await b.state();
   b.assertChain(before);
   await b.config();
@@ -462,8 +498,7 @@ async function run(b, request = null, {removal = null, initialize = false, refre
   }
   const use = [...definitions.keys()].filter(owner => Object.hasOwn(plan.selection, owner) && plan.selection[owner].length);
   const retired = Object.fromEntries(Object.entries(existing).filter(([name, definition]) =>
-   !definitions.has(name) && definition.path &&
-   path.resolve(b.root, definition.path) === path.join(b.root, 'providers', 'linkbox', name + '.yaml')));
+   !definitions.has(name) && managedCache(b.root, name, definition)));
   const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
   const updated = transform(config, managed, replace);
   updates.set(script, scriptText(baselines.get(script), managed));
@@ -476,11 +511,14 @@ async function run(b, request = null, {removal = null, initialize = false, refre
   };
   if (needsInitialization) nextPolicy.initialization_pending = true;
   const members = plan.candidates.map(({name}) => name);
-  nextPolicy.pending_update = {members};
+  const oldOwners = selectionOwners(saved.selected_nodes), newOwners = selectionOwners(plan.selection);
+  const ownerChanged = [...newOwners].some(([name, owner]) => oldOwners.has(name) && oldOwners.get(name) !== owner);
+  const pending = {members, root: b.root};
+  if (ownerChanged && sameEntryMembers(before.live, members)) pending.require_response = true;
+  nextPolicy.pending_update = pending;
   nextPolicy.reload_unconfirmed = true;
-  updates.set(policyFile, JSON.stringify(nextPolicy, null, 2));
   updates.set(registryFile, JSON.stringify({sources: sources.map(({source}) => source)}, null, 2));
-  const originals = new Map();
+  const originals = new Map([[policyFile, baselines.get(policyFile)]]);
   for (const file of updates.keys()) originals.set(file, baselines.has(file) ? baselines.get(file) : await read(file));
 
   const payload = await reloadPayload(updated, b.root, plan.selection, updates);
@@ -508,6 +546,9 @@ async function run(b, request = null, {removal = null, initialize = false, refre
   for (const [file, raw] of originals) {
    if (raw !== null && file !== policyFile) await fs.writeFile(path.join(backup, (i++) + '-' + path.basename(file)), raw, {mode: 0o600});
   }
+  // Keep the complete plan until every write and the first reload attempt are recorded.
+  pending.files = [...updates].map(([file, data]) => recordedFile(file, data));
+  await atomic(policyFile, JSON.stringify(nextPolicy, null, 2));
   const written = [];
   try {
    for (const [file, data] of updates) {
@@ -515,28 +556,33 @@ async function run(b, request = null, {removal = null, initialize = false, refre
     written.push(file);
    }
   } catch (error) {
-   await rollback(written, originals);
+   await rollback(policyFile, nextPolicy, written, originals);
    throw error;
   }
+  let acknowledged;
   try {
-   await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
+   acknowledged = await sendReload(b, payload);
   } catch (error) {
-   if (error instanceof ClashHTTPError && error.rejected) {
-    await rollback(written, originals);
-    throw Error('Clash 未更新，文件已回退；请刷新状态后重试');
-   }
+   await rollback(policyFile, nextPolicy, written, originals);
+   const message = requestNotSent(error) ? RELOAD_NOT_SENT : 'Clash 未更新';
+   throw Error(message + '，文件已回退；请刷新状态后重试');
   }
-  const after = await waitForReload(b, members);
+  const after = await confirmReload(b, policyFile, nextPolicy, members, acknowledged);
   await finishUpdate(b, policyFile, nextPolicy, members, before, after, profiles, () => inventory);
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
+ })();
+ b.subscriptionUpdate = update;
+ try {
+  return await update;
  } finally {
+  b.subscriptionUpdate = null;
   b.busy = false;
  }
 }
 
-async function initialize(b, {refresh = false} = {}) {
- return run(b, null, {initialize: true, refresh});
+async function initialize(b) {
+ return run(b, null, {initialize: true});
 }
 
 async function remove(b, request) {

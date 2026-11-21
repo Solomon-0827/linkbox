@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+import yaml
 import chain_test as c
 import gui_backend as g
 
@@ -44,6 +45,34 @@ class ParallelTests(unittest.TestCase):
     def test_parallel_limit(self):self.exercise('normal',3)
     def test_cancel_cleanup(self):self.exercise('cancel')
     def test_change_discards_pending(self):self.exercise('change')
+
+    def test_benchmark_handles_malformed_provider_cache_per_relay(self):
+        state = {'mode': 'global', 'exit': c.t.EXIT, 'dialer': c.t.ENTRY, 'entry': 'healthy'}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / 'clash-verge.yaml').write_text(yaml.safe_dump({
+                'proxies': [{'name': c.t.EXIT, 'server': '203.0.113.10', 'dialer-proxy': c.t.ENTRY}],
+                'proxy-providers': {'a': {'path': 'a.yaml'}, 'b': {'path': 'b.yaml'}},
+                'proxy-groups': [{'name': c.t.ENTRY, 'use': ['a']}, {'name': 'secondary', 'use': ['b']}],
+            }))
+            (base / 'a.yaml').write_text('proxies: [{name: healthy, server: example.invalid}]')
+            (base / 'b.yaml').write_text('proxies: [')
+            with (patch.object(c.t, 'BASE', base), patch.object(c.runtime, 'BASE', base),
+                  patch.object(c, 'CONFIG_DIR', base), patch.object(c.t, 'relay_state', return_value=state),
+                  patch.object(c, 'physical_network', return_value={'interface': 'en0'}),
+                  patch.object(c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe):
+                for selection in ({'a': ['healthy']}, {'a': ['healthy'], 'b': ['broken']}):
+                    (base / 'node-policy.json').write_text(json.dumps({'selected_nodes': selection}))
+                    c.run(1)
+                    record = json.loads((base / 'chain-results.json').read_text())['results']
+                    self.assertEqual(record['healthy']['chain_delay'], 100)
+                    if 'b' in selection:
+                        self.assertIsNone(record['broken']['chain_delay'])
+                        self.assertIn('本地缓存缺少', record['broken']['chain_error'])
+                    else:
+                        self.assertEqual(list(record), ['healthy'])
+            self.assertEqual([call.args[0]['name'] for call in probe.call_args_list], ['healthy', 'healthy'])
+
     def test_automatic_candidate_uses_metric_and_requires_verified_exit(self):
         record={'before':{'entry':'current'},'reason':'','selection_unchanged':True,'results':{
             'current':{'delay':200,'chain_delay':400},'entrance':{'delay':80,'chain_delay':260},

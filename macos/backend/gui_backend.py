@@ -164,7 +164,7 @@ def main():
         result = {'startup_checked': ready}
         if ready:
             try:
-                result['initialized'] = subscription_picker.initialize(sys.argv[2], refresh='--refresh' in sys.argv[3:])
+                result['initialized'] = subscription_picker.initialize(sys.argv[2])
                 if result['initialized'] and '--refresh' in sys.argv[3:]:
                     result['message'] = '已刷新 Clash 状态。'
             except RuntimeError as error:

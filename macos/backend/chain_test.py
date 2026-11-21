@@ -64,19 +64,24 @@ def load_nodes():
     DNS_POLICY = {k: v for k, v in conf.get('dns', {}).get('proxy-server-nameserver-policy', {}).items()
                   if not k.startswith(('geosite:', 'rule-set:'))}
     owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
-    nodes = {n['name']: n for n in conf.get('proxies', []) if n['name'] not in owners}
-    for owner, provider in conf.get('proxy-providers', {}).items():
+    nodes = {}
+    providers = conf.get('proxy-providers', {})
+    for owner in dict.fromkeys(owners.values()):
+        provider = providers.get(owner, {})
+        if not isinstance(provider, dict):
+            continue
         if provider.get('path'):
-            file = CONFIG_DIR / provider['path']
-            if not file.exists():
+            try:
+                data = yaml.safe_load((CONFIG_DIR / provider['path']).read_text())
+            except (OSError, ValueError, yaml.YAMLError):
                 continue
-            data = yaml.safe_load(file.read_text()) or {}
+            proxies = data.get('proxies') if isinstance(data, dict) else None
         else:
-            data = {'proxies': provider.get('payload', [])}
-        for node in data.get('proxies', []):
-            name = node['name']
-            if name not in owners or owners[name] == owner:
-                nodes.setdefault(name, node)
+            proxies = provider.get('payload')
+        if isinstance(proxies, list):
+            for node in proxies:
+                if isinstance(node, dict) and isinstance(node.get('name'), str) and owners.get(node['name']) == owner:
+                    nodes.setdefault(node['name'], node)
     exit_node = next((n for n in conf.get('proxies', []) if n['name'] == t.EXIT), None)
     expected = runtime.expected_ip(conf)
     if not exit_node or not expected:

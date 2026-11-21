@@ -49,6 +49,11 @@ class ClashHTTPError extends Error {
   this.rejected = status >= 400 && status < 600 && hasBody;
  }
 }
+class ClashRequestNotSent extends Error {}
+function requestNotSent(error){
+ return error instanceof ClashRequestNotSent ||
+  ['ECONNREFUSED','ENOENT','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'].includes(error?.code);
+}
 class Backend{
  constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
  async init(){await fs.mkdir(this.dataDir,{recursive:true});this.settings=await jsonRead(path.join(this.dataDir,'settings.json'),{hourly:true});this.history=await jsonRead(path.join(this.dataDir,'results.json'),{});return this;}
@@ -82,7 +87,15 @@ class Backend{
  request(endpoint,method,route,body,timeout=6000){return new Promise((resolve,reject)=>{
   const {secret,...opts}=endpoint;const payload=body===undefined?null:JSON.stringify(body);
   const req=http.request({...opts,method,path:route,headers:{...(secret?{Authorization:'Bearer '+secret}:{}),...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{})}},r=>{let chunks=[],size=0;r.on('data',x=>{size+=x.length;if(size>12e6){req.destroy(Error('响应过大'));return;}chunks.push(x)});r.on('error',reject);r.on('end',()=>{const body=Buffer.concat(chunks).toString();if(r.statusCode>=300)return reject(new ClashHTTPError(r.statusCode, size > 0));try{resolve(body?JSON.parse(body):{});}catch{reject(Error('Clash 返回无效数据'));}})});
-  const timer=setTimeout(()=>req.destroy(Error('Clash 控制接口超时')),timeout);req.on('close',()=>clearTimeout(timer));req.on('error',reject);if(payload)req.write(payload);req.end();});}
+  let connected=false;
+  req.on('socket',socket=>{
+   if(socket.connecting)socket.once('connect',()=>{connected=true;});
+   else connected=true;
+  });
+  const timer=setTimeout(()=>req.destroy(Error('Clash 控制接口超时')),timeout);
+  req.on('close',()=>clearTimeout(timer));
+  req.on('error',error=>reject(connected?error:new ClashRequestNotSent('无法连接 Clash 控制接口',{cause:error})));
+  if(payload)req.write(payload);req.end();});}
  async api(method,route,body,timeout){
   if(method!=='GET'&&!(method==='PUT'&&(route==='/proxies/'+encodeURIComponent(ENTRY)||/^\/providers\/proxies\/[^/?]+$/.test(route))))throw Error('不允许该控制操作');
   if(!this.endpoint)await this.discover();return this.request(this.endpoint,method,route,body,timeout);}
@@ -148,15 +161,18 @@ class Backend{
  async loadNodes(){
   const config=await this.config();
   const owners=selectionOwners((await jsonRead(path.join(this.dataDir,'node-policy.json'))).selected_nodes);
-  const nodes=new Map((config.proxies||[]).filter(n=>!owners.has(n.name)).map(n=>[n.name,n]));
-  for(const [owner,provider] of Object.entries(config['proxy-providers']||{})){
-   let list=provider.payload||[];
+  const nodes=new Map();
+  const providers=config['proxy-providers']||{};
+  for(const owner of new Set(owners.values())){
+   const provider=Object.hasOwn(providers,owner)?providers[owner]??{}:{};
+   let list=provider.payload;
    if(provider.path){
-    try{list=YAML.parse(await fs.readFile(path.resolve(this.root,provider.path),'utf8'))?.proxies||[];}
-    catch(error){if(error.code!=='ENOENT')throw error;}
+    try{list=YAML.parse(await fs.readFile(path.resolve(this.root,provider.path),'utf8'))?.proxies;}
+    catch{continue;}
    }
+   if(!Array.isArray(list))continue;
    for(const node of list){
-    if((!owners.has(node.name)||owners.get(node.name)===owner)&&!nodes.has(node.name))nodes.set(node.name,node);
+    if(owners.get(node?.name)===owner&&!nodes.has(node.name))nodes.set(node.name,node);
    }
   }
   const exit=config.proxies?.find(n=>n.name===EXIT);
@@ -288,4 +304,4 @@ class Backend{
  const result={time:new Date().toISOString(),expected:this.expectedIP,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,ClashHTTPError,autoCandidate,benchmarkSettings,isolatedConfig,signature,RELOAD_PENDING,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,ClashHTTPError,requestNotSent,autoCandidate,benchmarkSettings,isolatedConfig,signature,RELOAD_PENDING,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};

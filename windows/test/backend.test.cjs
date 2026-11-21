@@ -152,6 +152,37 @@ test('benchmark loads duplicate credentials only from the selected owner and inc
  }
 });
 
+test('benchmark handles a malformed provider cache per relay', async t => {
+ const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-malformed-cache-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const {ENTRY, EXIT} = require('../backend.cjs');
+ const b = await new Backend(folder).init();
+ b.settings.configDir = folder;
+ await fs.writeFile(path.join(folder,'clash-verge.yaml'),JSON.stringify({
+  proxies:[{name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY}],
+  'proxy-providers':{a:{path:'a.yaml'},b:{path:'b.yaml'}},
+  'proxy-groups':[{name:ENTRY,use:['a']},{name:'secondary',use:['b']}],
+ }));
+ await fs.writeFile(path.join(folder,'a.yaml'),'proxies: [{name: healthy, server: example.invalid}]');
+ await fs.writeFile(path.join(folder,'b.yaml'),'proxies: [');
+ b.relayState = async () => ({mode:'global',exit:EXIT,dialer:ENTRY,entry:'healthy',live:['healthy']});
+ b.api = async () => ({});
+ b.network = async () => ({name:'fixture'});
+ b.corePath = async () => 'fixture';
+ const probes = [];
+ b.testNode = async node => {probes.push(node.name);return {delay:100,status:'done'};};
+ for (const selection of [{a:['healthy']},{a:['healthy'],b:['broken']}]) {
+  await fs.writeFile(path.join(folder,'node-policy.json'),JSON.stringify({selected_nodes:selection}));
+  const {results} = await b.benchmark();
+  assert.equal(results.healthy.delay,100);
+  if (selection.b) {
+   assert.equal(results.broken.status,'failed');
+   assert.match(results.broken.error,/订阅缓存缺少该节点/);
+  } else assert.deepEqual(Object.keys(results),['healthy']);
+ }
+ assert.deepEqual(probes,['healthy','healthy']);
+});
+
 for (const automatic of [false, true]) for (const changedAfterPut of [false, true]) {
  test(`${automatic ? 'automatic' : 'manual'} switch rejects changed ENTRY membership ${changedAfterPut ? 'after' : 'before'} PUT`, async t => {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-switch-owner-'));

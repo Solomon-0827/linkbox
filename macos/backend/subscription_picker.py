@@ -163,5 +163,5 @@ def synchronize(metric='chain'):
     return update.run(metric)
 
 
-def initialize(metric='chain', *, refresh=False):
-    return update.run(metric, initialize=True, refresh=refresh)
+def initialize(metric='chain'):
+    return update.run(metric, initialize=True)

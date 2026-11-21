@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from contextlib import contextmanager
 import datetime
+import errno
 import fcntl
 import http.client
 import json
@@ -27,12 +28,24 @@ class ClashHTTPError(RuntimeError):
         self.rejected = 400 <= status < 600 and bool(body)
 
 
+class ClashRequestNotSent(OSError):
+    pass
+
+
+def request_not_sent(error):
+    return isinstance(error, (ClashRequestNotSent, socket.gaierror)) or getattr(error, 'errno', None) in (
+        errno.ECONNREFUSED, errno.ENOENT, errno.ENETUNREACH, errno.EHOSTUNREACH)
+
+
 def api(method, path, payload=None, *, timeout=6):
     class Connection(http.client.HTTPConnection):
         def connect(self):
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(timeout)
-            self.sock.connect(SOCKET)
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(timeout)
+                self.sock.connect(SOCKET)
+            except OSError as error:
+                raise ClashRequestNotSent('无法连接 Clash 控制接口') from error
     conn = Connection('localhost')
     try:
         conn.request(method, path, json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None, {'Content-Type': 'application/json'})

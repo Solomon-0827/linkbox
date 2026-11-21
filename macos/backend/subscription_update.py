@@ -1,4 +1,5 @@
 """Validate and apply a subscription reconciliation plan."""
+import base64
 import copy,datetime,fcntl,json,os,re,subprocess,tempfile,urllib.request,urllib.parse
 from pathlib import Path
 from time import monotonic, sleep
@@ -43,6 +44,7 @@ NO_SELECTION = '订阅里已没有你勾选的节点，请先在管理节点里�
 EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新'
 POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash'
 RELOAD_UNCERTAIN = '已写入新配置，Clash 尚未确认，请刷新状态核对'
+RELOAD_NOT_SENT = '无法连接 Clash 控制接口，未发送重载请求'
 SWITCH_FAILED = '配置已更新，但无法切换中转入口，请刷新并核对 Clash'
 ENTRY_ROUTE = '/proxies/' + urllib.parse.quote(t.ENTRY, safe='')
 CHAIN_KEYS = ('mode', 'tun', 'exit', 'dialer')
@@ -223,15 +225,19 @@ def benchmark_results():
             if recent is not chain or (type(row.get('chain_delay')) in (int, float) and row['chain_delay'] > 0)}
 
 
+def managed_cache(root, owner, definition):
+    source = definition.get('path')
+    return bool(source) and (root / source).resolve() == (root / 'providers/linkbox' / (owner + '.yaml')).resolve()
+
+
 def reload_payload(config, root, selection, updates):
-    # The service cannot read user-owned provider paths.
+    # The service cannot read LinkBox's user-owned provider cache files.
     live = copy.deepcopy(config)
     use = next(g for g in live['proxy-groups'] if g['name'] == t.ENTRY)['use']
     for owner, definition in live['proxy-providers'].items():
-        source_path = definition.pop('path', None)
-        if not source_path:
+        if not managed_cache(root, owner, definition):
             continue
-        path = root / source_path
+        path = root / definition.pop('path')
         data = yaml.safe_load(updates[path] if path in updates else path.read_bytes())
         payload = data.get('proxies') if isinstance(data, dict) else None
         if not isinstance(payload, list):
@@ -246,6 +252,47 @@ def reload_payload(config, root, selection, updates):
 
 def write_policy(path, policy):
     atomic(path, json.dumps(policy, ensure_ascii=False, indent=2).encode())
+
+
+def recorded_file(path, data):
+    return [str(path), base64.b64encode(data).decode() if data is not None else None]
+
+
+def replay_files(files):
+    for name, data in files:
+        path = Path(name)
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic(path, base64.b64decode(data))
+
+
+def rollback(policy_file, policy, written, originals):
+    files = [recorded_file(path, originals[path]) for path in [*reversed(written), policy_file]]
+    policy['pending_update'] = {'root': policy['pending_update']['root'], 'rollback': files}
+    write_policy(policy_file, policy)
+    replay_files(files)
+
+
+def send_reload(payload):
+    try:
+        t.api('PUT', '/configs?force=false', {'payload': payload.decode()})
+    except Exception as error:
+        if t.request_not_sent(error) or (isinstance(error, t.ClashHTTPError) and error.rejected):
+            raise
+        return False
+    return True
+
+
+def confirm_reload(policy_file, policy, members, acknowledged):
+    pending = policy['pending_update']
+    pending.pop('files', None)
+    if acknowledged:
+        pending.pop('require_response', None)
+    write_policy(policy_file, policy)
+    if pending.get('require_response'):
+        raise RuntimeError(RELOAD_UNCERTAIN)
+    return wait_for_reload(members)
 
 
 def finish_update(policy_file, policy, members, before, after, profiles, metric, inventory):
@@ -263,18 +310,26 @@ def finish_update(policy_file, policy, members, before, after, profiles, metric,
     write_policy(policy_file, policy)
 
 
-def resume_update(root, policy_file, policy, metric, *, reapply=False):
+def resume_update(root, policy_file, policy, metric):
     import subscription_picker as picker
     profiles = root / 'profiles.yaml'
     selection = policy['selected_nodes']
+    pending = policy.setdefault('pending_update', {})
+    if pending.get('root', str(root)) != str(root):
+        raise RuntimeError('请先恢复原 Clash 配置目录以完成订阅更新')
+    if 'rollback' in pending:
+        replay_files(pending['rollback'])
+        return True
     # Older pending records can recover the planned names from the saved selection.
-    members = policy.get('pending_update', {}).get('members', list(selection_owners(selection)))
+    members = pending.setdefault('members', list(selection_owners(selection)))
     before = observe_reload()
     if before is None:
         raise RuntimeError(t.RELOAD_PENDING)
     check_chain(before)
     after = confirmed_state(before, members)
-    if reapply or after is None:
+    if 'files' in pending or pending.get('require_response') or after is None:
+        if 'files' in pending:
+            replay_files(pending['files'])
         config = yaml.safe_load((root / 'clash-verge.yaml').read_bytes())
         exit_node = next((n for n in config.get('proxies', []) if n['name'] == t.EXIT), {})
         if exit_node.get('dialer-proxy') != t.ENTRY:
@@ -284,23 +339,21 @@ def resume_update(root, policy_file, policy, metric, *, reapply=False):
             raise RuntimeError('代理缓存不完整，未修改')
         configure_entry(config.get('proxy-groups', []), use)
         payload = reload_payload(config, root, selection, {})
-        policy['pending_update'] = {'members': members}
-        policy['reload_unconfirmed'] = True
-        write_policy(policy_file, policy)
+        if not policy.get('reload_unconfirmed'):
+            policy['reload_unconfirmed'] = True
+            write_policy(policy_file, policy)
         try:
-            t.api('PUT', '/configs?force=false', {'payload': payload.decode()})
+            acknowledged = send_reload(payload)
         except Exception as error:
-            if reapply and isinstance(error, t.ClashHTTPError) and error.rejected:
-                del policy['pending_update'], policy['reload_unconfirmed']
-                write_policy(policy_file, policy)
-                raise RuntimeError('Clash 未更新，请刷新状态后重试') from None
-        after = wait_for_reload(members)
+            message = RELOAD_NOT_SENT if t.request_not_sent(error) else 'Clash 拒绝重载配置'
+            raise RuntimeError(message + '；请刷新状态后重试') from None
+        after = confirm_reload(policy_file, policy, members, acknowledged)
     finish_update(policy_file, policy, members, before, after, profiles, metric,
                   lambda: picker.inventory(picker.discover()[0]))
     return True
 
 
-def run(metric='chain', *, request=None, removal=None, initialize=False, refresh=False):
+def run(metric='chain', *, request=None, removal=None, initialize=False):
     import subscription_picker as picker
     os.umask(0o077)
     with open(t.BASE / 'latency.lock', 'a') as lock:
@@ -320,8 +373,6 @@ def run(metric='chain', *, request=None, removal=None, initialize=False, refresh
         if policy.get('reload_unconfirmed'):
             raise RuntimeError(t.RELOAD_PENDING)
         if initialize and not needs_initialization:
-            if refresh and selection_owners(selection):
-                return resume_update(root, policy_file, policy, metric, reapply=True)
             return False
         before = t.relay_state()
         check_chain(before)
@@ -405,8 +456,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False, refresh
                         if not k.startswith(('geosite:', 'rule-set:'))})
         use = [owner for owner in definitions if plan['selection'].get(owner)]
         retired = {name: definition for name, definition in existing.items()
-                   if name not in definitions and definition.get('path')
-                   and (root / definition['path']).resolve() == (root / 'providers/linkbox' / (name + '.yaml')).resolve()}
+                   if name not in definitions and managed_cache(root, name, definition)}
         managed = {'providers': definitions, 'retired': retired, 'dns': dns, 'use': use}
         updated = transform(config, managed, replacement)
         updates[script] = script_text(baselines[script], managed)
@@ -420,14 +470,19 @@ def run(metric='chain', *, request=None, removal=None, initialize=False, refresh
         if needs_initialization:
             saved['initialization_pending'] = True
         members = [candidate['name'] for candidate in plan['candidates']]
-        saved['pending_update'] = {'members': members}
+        old_owners = selection_owners(policy.get('selected_nodes'))
+        new_owners = selection_owners(plan['selection'])
+        owner_changed = any(name in old_owners and old_owners[name] != owner for name, owner in new_owners.items())
+        pending = {'members': members, 'root': str(root)}
+        if owner_changed and same_entry_members(before['live'], members):
+            pending['require_response'] = True
+        saved['pending_update'] = pending
         saved['reload_unconfirmed'] = True
-        updates[policy_file] = json.dumps(saved, ensure_ascii=False, indent=2).encode()
         updates[runtime.BASE / 'subscriptions.json'] = json.dumps({'sources': registry}, ensure_ascii=False, indent=2).encode()
         originals = {path: baselines[path] if path in baselines else read(path) for path in updates}
+        originals[policy_file] = baselines[policy_file]
 
         payload = reload_payload(updated, root, plan['selection'], updates)
-        request_body = {'payload': payload.decode()}
         try:
             with tempfile.TemporaryDirectory(prefix='linkbox-update-', dir=root) as folder:
                 file = Path(folder) / 'config.yaml'
@@ -445,31 +500,26 @@ def run(metric='chain', *, request=None, removal=None, initialize=False, refresh
         for i, (path, raw) in enumerate(originals.items()):
             if raw is not None and path != policy_file:
                 (backup / (str(i) + '-' + path.name)).write_bytes(raw)
+        # Keep the complete plan until every write and the first reload attempt are recorded.
+        pending['files'] = [recorded_file(path, data) for path, data in updates.items()]
+        write_policy(policy_file, saved)
         written = []
         try:
             for path, data in updates.items():
                 atomic(path, data)
                 written.append(path)
         except Exception:
-            rollback(written, originals)
+            rollback(policy_file, saved, written, originals)
             raise
         try:
-            t.api('PUT', '/configs?force=false', request_body)
+            acknowledged = send_reload(payload)
         except Exception as error:
-            if isinstance(error, t.ClashHTTPError) and error.rejected:
-                rollback(written, originals)
-                raise RuntimeError('Clash 未更新，文件已回退；请刷新状态后重试') from None
-        after = wait_for_reload(members)
+            rollback(policy_file, saved, written, originals)
+            message = RELOAD_NOT_SENT if t.request_not_sent(error) else 'Clash 未更新'
+            raise RuntimeError(message + '，文件已回退；请刷新状态后重试') from None
+        after = confirm_reload(policy_file, saved, members, acknowledged)
         finish_update(policy_file, saved, members, before, after, profiles, metric, lambda: inventory)
         if initialize:
             return True
         message = '已同步 Clash Verge 订阅。' if syncing else '已保存节点选择。'
         return {'message': message}
-
-
-def rollback(written, originals):
-    for path in reversed(written):
-        if originals[path] is None:
-            path.unlink(missing_ok=True)
-        else:
-            atomic(path, originals[path])
