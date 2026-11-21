@@ -1,0 +1,54 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "first",
+          "quick"
+        ]
+      }
+    ],
+    "selection": {
+      "a": [
+        "gone",
+        "first",
+        "quick"
+      ]
+    },
+    "live": [
+      "gone"
+    ],
+    "current": "gone",
+    "metric": "chain",
+    "results": {
+      "first": {
+        "chain": 100,
+        "entrance": 10
+      },
+      "quick": {
+        "chain": 40,
+        "entrance": 20
+      }
+    }
+  },
+  "expected": {
+    "selection": {
+      "a": [
+        "first",
+        "quick"
+      ]
+    },
+    "candidates": [
+      {
+        "name": "first",
+        "owner": "a"
+      },
+      {
+        "name": "quick",
+        "owner": "a"
+      }
+    ],
+    "entry": "quick"
+  }
+}

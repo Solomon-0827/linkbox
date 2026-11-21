@@ -1,0 +1,24 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "current"
+        ]
+      }
+    ],
+    "selection": {},
+    "live": [
+      "current"
+    ],
+    "current": "current",
+    "metric": "chain",
+    "results": {}
+  },
+  "expected": {
+    "selection": {},
+    "candidates": [],
+    "entry": null
+  }
+}

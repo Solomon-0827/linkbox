@@ -1,94 +1,77 @@
 import json
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
-from contextlib import ExitStack
+
 import yaml
-import runtime
-import subscription_picker as p
 
-class PickerTests(unittest.TestCase):
-    def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
-        self.base=Path(self.temp.name);self.root=self.base/'clash';(self.root/'profiles').mkdir(parents=True)
-        self.stack=ExitStack();self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch.object(runtime,'BASE',self.base))
-        self.stack.enter_context(patch.object(runtime,'CONFIG_DIR',self.root))
-        self.stack.enter_context(patch.object(p.t,'state',return_value=({}, {p.t.ENTRY:{'all':['one'], 'now':'one'}})))
-        self.stack.enter_context(patch.object(p.t,'api',side_effect=AssertionError('Tests must not contact the live Clash controller')))
-        self.stack.enter_context(patch.object(p.t,'node_inventory',return_value={'one':({},'existing')}))
-        self.url='https://example.invalid/api/v1/client/'+'a'*24
-        self.node={'name':'one','type':'ss','server':'secret.example.invalid','port':443,'password':'private-test-value'}
-        (self.root/'profiles.yaml').write_text(yaml.safe_dump({'items':[{'uid':'abc','type':'remote','name':'我的订阅','file':'abc.yaml','url':self.url}]}))
-        (self.root/'profiles/abc.yaml').write_text(yaml.safe_dump({'proxies':[self.node,{**self.node,'name':'two'}]}))
-        (self.base/'subscriptions.json').write_text(json.dumps({'sources':[{'name':'existing','url':self.url.replace('example.invalid','rotated.invalid')}]}))
-    def test_catalog_no_credentials_and_existing_identity_survives_rotation(self):
-        c=p.catalog();s=c['sources'][0]
-        self.assertEqual(s['id'],'existing');self.assertEqual(s['name'],'我的订阅')
-        self.assertEqual([x['selected'] for x in s['nodes']],[True,False])
-        for secret in [self.url,'private-test-value','secret.example.invalid']:
-            self.assertNotIn(secret,json.dumps(c))
-    def test_selection_only_applies_on_explicit_save(self):
-        with patch.object(p.update,'run',return_value={}) as run:
-            c=p.catalog();run.assert_not_called()
-            p.apply({'fingerprint':c['fingerprint'],'selected':{'existing':['two']}})
-            self.assertEqual(run.call_args.kwargs['selection'],{'existing':['two']})
-            self.assertEqual(run.call_args.kwargs['sources_override'][0]['name'],'existing')
-    def test_stale_catalog_and_unknown_nodes_do_not_write(self):
-        with patch.object(p.update,'run') as run:
-            c=p.catalog()
-            for payload in [{'fingerprint':'stale','selected':{}},{'fingerprint':c['fingerprint'],'selected':{'existing':['unknown']}}]:
-                with self.assertRaises(RuntimeError):p.apply(payload)
-            run.assert_not_called()
-    def test_empty_selection_is_intentional(self):
-        with patch.object(p.update,'run',return_value={}) as run:
-            c=p.catalog();p.apply({'fingerprint':c['fingerprint'],'selected':{'existing':[]}})
-            self.assertEqual(run.call_args.kwargs['selection'],{})
-    def test_selection_policy_keeps_pin_and_replaces_old_exclusions(self):
-        (self.base/'node-policy.json').write_text(json.dumps({'selected_nodes':{'existing':['two']},'pinned_entry':'one','blocked_providers':['existing'],'excluded_nodes':{'existing':['two']}}))
-        self.assertTrue(runtime.allowed('one','existing'))
-        self.assertTrue(runtime.allowed('two','existing'))
-        self.assertFalse(runtime.allowed('three','existing'))
-    def test_duplicate_selected_names_rejected(self):
-        sources,_=p.discover()
-        second=({'name':'other','display_name':'另一个订阅','url':'https://other.invalid/sub'},sources[0][1])
-        with patch.object(p,'discover',return_value=(sources+[second],'fixed')),patch.object(p.update,'run') as run:
-            with self.assertRaises(RuntimeError):p.apply({'fingerprint':'fixed','selected':{'existing':['one'],'other':['one']}})
-            run.assert_not_called()
+import subscription_picker as picker
+import subscription_update as update
+import test_update
 
-    def test_sync_intersection_and_new_nodes_opt_in(self):
-        (self.base/'node-policy.json').write_text(json.dumps({'selected_nodes':{'existing':['one','gone']}}))
-        with patch.object(p.update,'fetch',return_value={'proxies':[self.node,{**self.node,'name':'new'}]}), patch.object(p.update,'run',return_value={}) as run:
-            p.synchronize()
-            self.assertEqual(run.call_args.kwargs['selection'],{'existing':['one']})
-            self.assertTrue(run.call_args.kwargs['verge_sync'])
-            self.assertIn(self.root/'profiles/abc.yaml',run.call_args.kwargs['additional_updates'])
-    def test_picker_hides_deleted_sources_before_first_successful_sync(self):
-        cache=self.root/'providers/linkbox/existing.yaml'
-        cache.parent.mkdir(parents=True)
-        cache.write_bytes((self.root/'profiles/abc.yaml').read_bytes())
-        (self.root/'profiles.yaml').write_text('items: []')
-        self.assertEqual(p.catalog()['sources'],[])
+
+class PickerTests(test_update.SubscriptionFixture, unittest.TestCase):
+    def test_saving_other_subscription_keeps_unreadable_cache_selection_and_provider(self):
+        self.write_profile('b', ['same', 'other'])
+        self.apply({'a': ['current', 'fast'], 'b': ['same', 'other']})
+        before = yaml.safe_load(self.config.read_bytes())['proxy-providers']['b']
+        self.write_profile('a', ['current', 'fast', 'same'])
+        (self.root / 'profiles/b.yaml').write_text('proxies: [')
+        catalog = picker.catalog()['sources'][1]
+        self.assertEqual(catalog['nodes'], [])
+        self.apply({'a': ['current', 'fast', 'same'], 'b': []})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'],
+                         {'a': ['current', 'fast'], 'b': ['same', 'other']})
+        update.run(removal={'names': ['fast'], 'entry': 'current'})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'],
+                         {'a': ['current'], 'b': ['same', 'other']})
+        self.assertEqual(yaml.safe_load(self.config.read_bytes())['proxy-providers']['b'], before)
+        self.assertIn('保留原勾选', catalog['warning'])
+        self.downloaded = {'a': ['fast']}
+        saved = self.files()
+        with self.assertRaisesRegex(RuntimeError, '下载'):
+            picker.synchronize()
+        self.assertEqual(self.files(), saved)
+
+    def test_catalog_keeps_both_copies_and_preselects_only_the_owner(self):
+        self.write_profile('b', ['current', 'other'])
+        catalog = picker.catalog()
+        self.assertNotIn('example.invalid', json.dumps(catalog))
+        self.assertEqual([(s['id'], [(n['name'], n['selected']) for n in s['nodes']]) for s in catalog['sources']],
+                         [('a', [('current', True), ('fast', True), ('quick', False)]),
+                          ('b', [('current', False), ('other', False)])])
+        self.apply({'a': ['fast'], 'b': ['current']})
+        fresh = picker.catalog()
+        self.assertTrue(fresh['sources'][1]['nodes'][0]['selected'])
+        self.assertTrue(fresh['sources'][1]['nodes'][0]['current'])
+        self.assertEqual(self.active['entry'], 'current')
+
+    def test_duplicate_submission_resolves_in_picker_order(self):
+        self.write_profile('b', ['current', 'other'])
+        self.apply({'a': ['current'], 'b': ['current']})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['current']})
+
+    def test_stale_catalog_and_unknown_nodes_do_not_reload(self):
+        catalog = picker.catalog()
+        request = {'fingerprint': catalog['fingerprint'], 'current': 'current', 'selected': {'a': ['unknown'], 'b': []}}
+        with self.assertRaisesRegex(RuntimeError, '格式无效'):
+            picker.apply(request)
+        self.write_profile('a', ['current', 'unknown'])
+        with self.assertRaisesRegex(RuntimeError, '变化'):
+            picker.apply(request)
+        self.api.assert_not_called()
+
+    def test_picker_hides_deleted_sources_and_rejects_missing_index(self):
+        self.index.write_text('items: []')
+        self.assertEqual(picker.catalog()['sources'], [])
+        self.index.unlink()
+        with self.assertRaisesRegex(RuntimeError, '完整读取'):
+            picker.synchronize()
+        self.api.assert_not_called()
+
     def test_unsupported_source_does_not_hide_usable_subscriptions(self):
-        index=self.root/'profiles.yaml'
-        doc=yaml.safe_load(index.read_text())
-        doc['items'].append({'type':'remote','url':'http://example.invalid/legacy','file':'legacy.yaml'})
-        index.write_text(yaml.safe_dump(doc))
-        self.assertEqual([s['id'] for s in p.catalog()['sources']],['existing'])
-        with patch.object(p.update,'run') as run:
-            with self.assertRaisesRegex(RuntimeError,'HTTPS'):p.synchronize()
-            run.assert_not_called()
-    def test_sync_ignores_deleted_registry_and_protects_missing_index(self):
-        (self.root/'profiles.yaml').write_text('items: []')
-        self.assertEqual(p.discover()[0],[])
-        (self.root/'profiles.yaml').unlink()
-        with patch.object(p.update,'run') as run:
-            with self.assertRaises(RuntimeError):p.synchronize()
-            run.assert_not_called()
-    def test_sync_download_failure_does_not_apply(self):
-        with patch.object(p.update,'fetch',side_effect=RuntimeError('offline')), patch.object(p.update,'run') as run:
-            with self.assertRaises(RuntimeError):p.synchronize()
-            run.assert_not_called()
-
-if __name__=='__main__':unittest.main()
+        doc = yaml.safe_load(self.index.read_text())
+        doc['items'].append({'type': 'remote', 'url': 'http://example.invalid/legacy', 'file': 'legacy.yaml'})
+        self.index.write_text(yaml.safe_dump(doc))
+        self.assertEqual([s['name'] for s in picker.catalog()['sources']], ['A', 'B'])
+        with self.assertRaisesRegex(RuntimeError, 'HTTPS'):
+            picker.synchronize()
+        self.api.assert_not_called()

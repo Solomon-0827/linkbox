@@ -1,0 +1,71 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "outside",
+          "first",
+          "second"
+        ]
+      },
+      {
+        "id": "b",
+        "nodes": [
+          "best"
+        ]
+      }
+    ],
+    "selection": {
+      "b": [
+        "best"
+      ],
+      "a": [
+        "second",
+        "first"
+      ]
+    },
+    "live": [
+      "outside"
+    ],
+    "current": "outside",
+    "metric": "chain",
+    "results": {
+      "first": {
+        "chain": null
+      },
+      "second": {
+        "chain": -1
+      },
+      "best": {
+        "chain": true
+      }
+    }
+  },
+  "expected": {
+    "selection": {
+      "a": [
+        "first",
+        "second"
+      ],
+      "b": [
+        "best"
+      ]
+    },
+    "candidates": [
+      {
+        "name": "first",
+        "owner": "a"
+      },
+      {
+        "name": "second",
+        "owner": "a"
+      },
+      {
+        "name": "best",
+        "owner": "b"
+      }
+    ],
+    "entry": "first"
+  }
+}

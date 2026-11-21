@@ -1,0 +1,40 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "current",
+          "brand-new"
+        ]
+      }
+    ],
+    "selection": {
+      "a": [
+        "vanished",
+        "current"
+      ]
+    },
+    "live": [
+      "vanished",
+      "current"
+    ],
+    "current": "current",
+    "metric": "chain",
+    "results": {}
+  },
+  "expected": {
+    "selection": {
+      "a": [
+        "current"
+      ]
+    },
+    "candidates": [
+      {
+        "name": "current",
+        "owner": "a"
+      }
+    ],
+    "entry": "current"
+  }
+}

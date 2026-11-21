@@ -18,3 +18,166 @@ test('dynamic scheduler replaces its previous timer and skips while the UI is bu
  vm.runInContext('uiActive=false',context);await intervals[1].fn();assert.deepEqual(calls,[['chain',true]]);assert.equal(notifications[0][0],'automatic');
  vm.runInContext('backend.settings.hourly=false;scheduleAuto()',context);assert.deepEqual(cleared,[1,2]);assert.equal(intervals.length,2);
 });
+
+function loadRenderer(call, setInterval=()=>{}) {
+ const elements = new Map();
+ const element = () => ({value:'',classList:{add(){},remove(){},toggle(){}},replaceChildren(){},
+  setAttribute(){},addEventListener(){},append(){}});
+ const select = id => {
+  if (!elements.has(id)) elements.set(id,element());
+  return elements.get(id);
+ };
+ const context = vm.createContext({
+  document:{querySelector:select,querySelectorAll:()=>[],addEventListener(){},
+   createElement:element,createDocumentFragment:element},
+  window:{linkbox:{call,onProgress(){},onAutomatic(){}}},setInterval,
+ });
+ vm.runInContext(fs.readFileSync(require.resolve('../renderer.js'),'utf8'),context);
+ return {select, context};
+}
+
+test('only startup and manual Refresh retry transient initialization failures', async () => {
+ let calls = 0, handler;
+ const webContents = {mainFrame:{}}, event = {sender:webContents,senderFrame:webContents.mainFrame};
+ const electron = {app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
+  ipcMain:{handle(_channel,fn){handler=fn;}}};
+ const subscriptions = {async startup(){
+  if (++calls === 1) throw Error('offline');
+  if (calls === 2) throw Error('订阅下载失败');
+  return {changed:true};
+ }};
+ const fake = {root:'fixture',state:async()=>({
+  mode:'global',exit:'美国静态家宽',dialer:'中转入口',entry:'current',nodes:[],settings:{},expectedIP:'203.0.113.10',
+ })};
+ const context = vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?subscriptions:
+  name==='./backend.cjs'?{safeError:e=>e.message}:require(name),process:{argv:[],platform:'darwin'},__dirname,fake,webContents});
+ vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),context);
+ vm.runInContext('backend=fake;win={webContents}',context);
+ const reads = [];
+ let poll;
+ const {select} = loadRenderer(async (action,data)=>{
+  if (action !== 'state') return {ok:true,data:{ip:'203.0.113.10'}};
+  reads.push(data?.initialize === true);
+  return handler(event,action,data);
+ },(fn,ms)=>{assert.equal(ms,30000);poll=fn;});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(select('#notice').textContent,'offline');
+ for (let i=0;i<5;i++) {
+  poll();
+  await new Promise(resolve=>setImmediate(resolve));
+ }
+ assert.equal(calls,1);
+ assert.equal(select('#notice').textContent,'offline');
+ await select('#refresh').onclick();
+ assert.equal(select('#notice').textContent,'订阅下载失败');
+ assert.equal(vm.runInContext('startupChecked',context),false);
+ assert.equal(calls,2);
+ await select('#refresh').onclick();
+ assert.equal(calls,3);
+ assert.equal(vm.runInContext('initializedSelection',context),true);
+ assert.deepEqual(reads,[true,false,false,false,false,false,true,true]);
+});
+
+test('choosing the Clash directory initializes and populates the first node list', async () => {
+ const webContents = {mainFrame:{}}, event = {sender:webContents,senderFrame:webContents.mainFrame};
+ let handler, selected = false, initializations = 0, canceled = true;
+ const electron = {app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
+  dialog:{showOpenDialog:async()=>({canceled,filePaths:['fixture-clash']})},
+  ipcMain:{handle(_channel,fn){handler=fn;}}};
+ const fake = {
+  async saveSettings({configDir}) {assert.equal(configDir,'fixture-clash');selected=true;},
+  async state() {
+   if(!selected)throw Error('configuration directory not found');
+   return {mode:'global',exit:'美国静态家宽',dialer:'中转入口',entry:'current',
+    nodes:initializations?[{name:'current'}]:[],settings:{},expectedIP:'203.0.113.10'};
+  },
+ };
+ const subscriptions = {async startup(){initializations++;return {changed:true};}};
+ const main = vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?subscriptions:
+  name==='./backend.cjs'?{safeError:e=>e.message}:require(name),process:{argv:[],platform:'darwin'},__dirname,fake,webContents});
+ vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),main);
+ vm.runInContext('backend=fake;win={webContents}',main);
+ const renderer = loadRenderer((action,data)=>handler(event,action,data));
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(initializations,0);
+ await renderer.select('#chooseConfig').onclick();
+ assert.equal(initializations,0);
+ canceled=false;
+ await renderer.select('#chooseConfig').onclick();
+ assert.equal(initializations,1);
+ assert.equal(vm.runInContext('state.nodes[0].name',renderer.context),'current');
+});
+
+test('Windows quit waits for the subscription update to settle', async t => {
+ const path = require('node:path');
+ const dataDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(),'linkbox-quit-'));
+ t.after(()=>fs.rmSync(dataDir,{recursive:true,force:true}));
+ let beforeQuit, settle, enter, prevented = 0, exited = 0, shutdowns = 0, message;
+ const quit = () => {
+  let blocked = false;
+  beforeQuit({preventDefault(){blocked=true;prevented++;}});
+  if(!blocked)exited++;
+ };
+ const app = {setName(){},setAppUserModelId(){},requestSingleInstanceLock:()=>true,quit,
+  on(event,fn){if(event==='before-quit')beforeQuit=fn;},whenReady:()=>new Promise(()=>{})};
+ const paused = new Promise(resolve=>{settle=resolve;});
+ const entered = new Promise(resolve=>{enter=resolve;});
+ const fake = {dataDir,async state(){enter();await paused;throw Error('fixture stop');},async shutdown(){shutdowns++;}};
+ const electron = {app,nativeTheme:{},ipcMain:{handle(){}}};
+ const context = vm.createContext({require:name=>name==='electron'?electron:
+  require(name.startsWith('./')?'../'+name.slice(2):name),process:{argv:[],platform:'win32'},__dirname,
+  clearInterval,fake,balloon:value=>{message=value.content;}});
+ vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),context);
+ vm.runInContext('backend=fake;tray={displayBalloon:balloon}',context);
+ const completed = assert.rejects(require('../subscriptions.cjs').run(fake),/fixture stop/);
+ await entered;
+ quit();
+ quit();
+ await new Promise(resolve=>setImmediate(resolve));
+ settle();
+ assert.equal(prevented,2);
+ assert.equal(exited,0);
+ assert.equal(shutdowns,0);
+ assert.match(message,/正在更新订阅/);
+ await completed;
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(shutdowns,1);
+ assert.equal(exited,1);
+});
+
+test('every renderer action crosses the real preload allowlist and has a main IPC handler', async () => {
+ const renderer=fs.readFileSync(require.resolve('../renderer.js'),'utf8')
+  .replace('function call(a,d)', 'function invokeAction(a,d)').replace('window.linkbox.call(a,d)', 'bridge(a,d)');
+ const calls=[...renderer.matchAll(/(?:window\.linkbox\.call|(?<![.\w])call)\(\s*([^,()]+)\s*(?=[,)])/g)].map(match=>match[1].trim());
+ assert.ok(calls.length>0);
+ assert.ok(calls.every(arg=>/^'\w+'$/.test(arg)), 'Renderer actions must be statically enumerable');
+ const actions=new Set(calls.map(arg=>arg.slice(1,-1)));
+ assert.ok(actions.has('benchmarkSettings'));
+ const webContents={mainFrame:{}};
+ let mainHandler, bridge;
+ const electron={
+  app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
+  ipcMain:{handle(_channel,callback){mainHandler=callback;}},
+  ipcRenderer:{invoke(channel,action,data){
+   assert.equal(channel,'linkbox');
+   return mainHandler({sender:webContents,senderFrame:webContents.mainFrame},action,data);
+  }},
+  contextBridge:{exposeInMainWorld(_name,value){bridge=value;}},
+  clipboard:{writeText(){}},dialog:{showSaveDialog:async()=>({canceled:true}),showOpenDialog:async()=>({canceled:true})},
+  shell:{openExternal:async()=>{},openPath:async()=>{}},
+ };
+ const stub=async()=>({});
+ const backend={settings:{hourly:false},state:stub,ipInfo:stub,switchNode:stub,benchmark:stub,cancel:stub,
+  updateSubscriptions:stub,networkCheck:stub,saveSettings:stub};
+ const context=vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?
+  {catalog:stub,run:stub,remove:stub}:name==='./backend.cjs'?{safeError:e=>e.message,benchmarkSettings:()=>({})}:require(name),
+  process:{argv:[],platform:'darwin'},__dirname,backendStub:backend,webContents,clearInterval});
+ vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),context);
+ vm.runInContext('backend=backendStub;win={webContents};coffee=async()=>({})',context);
+ vm.runInContext(fs.readFileSync(require.resolve('../preload.cjs'),'utf8'),context);
+ const payloads={copyIP:{ip:'203.0.113.10'},switch:{name:'selected',previous:'current'},settings:{hourly:false},downloadReport:{},saveSelection:{}};
+ for(const action of actions){
+  const response=await bridge.call(action,payloads[action]);
+  assert.equal(response.ok,true,`${action}: ${response.error||''}`);
+ }
+});

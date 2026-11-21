@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+from contextlib import contextmanager
 import datetime
+import errno
+import fcntl
 import http.client
 import json
 import os
@@ -11,47 +14,120 @@ import tempfile
 import urllib.parse
 
 from runtime import BASE, CONFIG_DIR
+from reconcile import selection_owners
 
 SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
 PROFILES = CONFIG_DIR / 'profiles.yaml'
 EXIT = '美国静态家宽'
 ENTRY = '中转入口'
 
-def api(method, path, payload=None):
+class ClashHTTPError(RuntimeError):
+    def __init__(self, status):
+        super().__init__(f'Clash API 返回 {status}')
+        self.rejected = 400 <= status < 600
+
+
+class ClashRequestNotSent(OSError):
+    pass
+
+
+def request_not_sent(error):
+    return isinstance(error, (ClashRequestNotSent, socket.gaierror)) or getattr(error, 'errno', None) in (
+        errno.ECONNREFUSED, errno.ENOENT, errno.ENETUNREACH, errno.EHOSTUNREACH)
+
+
+def api(method, path, payload=None, *, timeout=6):
     class Connection(http.client.HTTPConnection):
         def connect(self):
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(6)
-            self.sock.connect(SOCKET)
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(timeout)
+                self.sock.connect(SOCKET)
+            except OSError as error:
+                raise ClashRequestNotSent('无法连接 Clash 控制接口') from error
     conn = Connection('localhost')
     try:
         conn.request(method, path, json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None, {'Content-Type': 'application/json'})
         response = conn.getresponse()
-        body = response.read()
         if response.status >= 300:
-            raise RuntimeError(f'Clash API 返回 {response.status}: {body.decode(errors="replace")[:200]}')
+            raise ClashHTTPError(response.status)
+        body = response.read()
         return json.loads(body) if body else None
     finally:
         conn.close()
 
-def state():
-    conf = api('GET', '/configs')
-    p = api('GET', '/proxies')['proxies']
+def state(**request_options):
+    conf = api('GET', '/configs', **request_options)
+    p = api('GET', '/proxies', **request_options)['proxies']
     return conf, p
 
-def node_inventory(proxies):
-    result={name:(value,value.get('provider-name') or None) for name,value in proxies.items()}
-    providers=api('GET','/providers/proxies').get('providers',{})
-    for provider,data in providers.items():
-        for value in data.get('proxies',[]):
-            result[value['name']]=(result.get(value['name'],(value,None))[0],provider)
+def relay_state(**request_options):
+    config, proxies = state(**request_options)
+    group = proxies.get(ENTRY, {})
+    return {'mode': config.get('mode'), 'tun': bool(config.get('tun', {}).get('enable')),
+            'entry': group.get('now'), 'exit': proxies.get('GLOBAL', {}).get('now'),
+            'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': sorted(set(group.get('all', [])))}
+
+
+@contextmanager
+def switch_lock():
+    with open(BASE / 'latency.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('已有测速或订阅更新正在运行') from None
+        yield
+
+
+def relay_owners(selection, live):
+    if selection is not None:
+        return selection_owners(selection)
+
+    import yaml
+    import runtime
+    from subscription_update import entry_plan
+
+    root = runtime.CONFIG_DIR
+    try:
+        config = yaml.safe_load((root / 'clash-verge.yaml').read_bytes())
+    except (OSError, ValueError, yaml.YAMLError):
+        config = None
+    if not isinstance(config, dict):
+        config = {}
+    plan = entry_plan(config, root) or {}
+    return {name: plan.get(name, (None, None))[0] for name in live}
+
+
+def switch_owners(live):
+    import runtime
+    owners = relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), live)
+    return {name: owner for name, owner in owners.items() if name in live}
+
+
+def provider_nodes(response):
+    providers = response.get('providers') if isinstance(response, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    return {owner: [node for node in provider['proxies']
+                    if isinstance(node, dict) and isinstance(node.get('name'), str) and node['name']]
+            for owner, provider in providers.items()
+            if isinstance(provider, dict) and isinstance(provider.get('proxies'), list)}
+
+
+def node_inventory(proxies, owners):
+    result = {name: (value, value.get('provider-name')) for name, value in proxies.items()
+              if name not in owners or owners[name] is None}
+    try:
+        providers = provider_nodes(api('GET', '/providers/proxies'))
+    except RuntimeError:
+        providers = {}
+    for provider, data in providers.items():
+        for value in data:
+            name = value['name']
+            if name not in owners or owners[name] == provider:
+                result.setdefault(name, (value, provider))
     return result
 
-def candidate_names(proxies):
-    import runtime
-    inventory=node_inventory(proxies)
-    return [name for name in proxies.get(ENTRY,{}).get('all',[])
-            if runtime.allowed(name,inventory.get(name,({},None))[1])]
 
 def show():
     c, p = state()
@@ -98,13 +174,15 @@ def switch():
     if c.get('mode') != 'global' or p.get('GLOBAL', {}).get('now') != EXIT or p.get(EXIT, {}).get('dialer-proxy') != ENTRY:
         print('\n当前链式配置与预期不符。为避免改变出口，本工具不会切换。请先在 Clash 恢复全局 → 美国静态家宽。')
         return
-    nodes = p.get(ENTRY, {}).get('all', [])
+    live = p.get(ENTRY, {}).get('all', [])
+    owners = switch_owners(live)
+    nodes = list(owners)
     if not nodes:
         raise RuntimeError('中转入口没有可选节点')
     current = p[ENTRY].get('now')
     for i, name in enumerate(nodes, 1):
-        provider = 'NekoCat' if name.startswith('[') else 'mmti'
-        print(f'{i:2}. [{provider}] {name}' + ('  ← 当前' if name == current else ''))
+        provider = owners[name]
+        print(f'{i:2}. ' + (f'[{provider}] ' if provider else '') + name + ('  ← 当前' if name == current else ''))
     print(' 0. 返回（不切换）')
     raw = input('\n输入节点编号：').strip()
     if raw in ('', '0'):
@@ -121,13 +199,24 @@ def switch():
     if input('确认切换请输入 y；其他输入取消：').strip().lower() != 'y':
         print('已取消。')
         return
+    with switch_lock():
+        switch_entry(current, target)
+
+
+def switch_entry(current, target):
     # Recheck immediately before the one live mutation.
     fresh_c, fresh_p = state()
-    if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current or target not in fresh_p[ENTRY].get('all', []):
+    if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current:
+        raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
+    owners = switch_owners(fresh_p[ENTRY].get('all', []))
+    if target not in owners:
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
-    if after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT or after_c.get('mode') != 'global':
+    after_owners = switch_owners(after_p[ENTRY].get('all', []))
+    if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
+            or after_p[EXIT].get('dialer-proxy') != ENTRY or after_c.get('mode') != 'global'
+            or target not in after_owners or after_owners[target] != owners[target]):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:

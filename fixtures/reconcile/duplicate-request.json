@@ -1,0 +1,53 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "same"
+        ]
+      },
+      {
+        "id": "b",
+        "nodes": [
+          "same",
+          "first"
+        ]
+      }
+    ],
+    "selection": {
+      "a": [
+        "same"
+      ],
+      "b": [
+        "same",
+        "first"
+      ]
+    },
+    "live": [],
+    "current": "external",
+    "metric": "chain",
+    "results": {}
+  },
+  "expected": {
+    "selection": {
+      "a": [
+        "same"
+      ],
+      "b": [
+        "first"
+      ]
+    },
+    "candidates": [
+      {
+        "name": "same",
+        "owner": "a"
+      },
+      {
+        "name": "first",
+        "owner": "b"
+      }
+    ],
+    "entry": "same"
+  }
+}

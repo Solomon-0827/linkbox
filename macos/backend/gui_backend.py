@@ -1,67 +1,74 @@
 #!/usr/bin/env python3
 import json
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from pathlib import Path
 import subprocess
 import sys
 import urllib.parse
 import urllib.request
 import datetime
-import time
 import fcntl
 import os
 import toolbox as t
 import runtime
 
-def node_inventory(p):
-    return t.node_inventory(p)
+def node_rows(p, owners):
+    inventory = t.node_inventory(p, owners)
+    records = [runtime.read_json(file) for file in ('latency-results.json', 'chain-results.json')]
 
-def node_rows(p):
-    inventory=node_inventory(p)
-    cache={}
-    try:cache=json.loads((t.BASE/'latency-results.json').read_text()).get('results',{})
-    except (OSError,ValueError):pass
-    chains={}
-    try:chains=json.loads((t.BASE/'chain-results.json').read_text()).get('results',{})
-    except (OSError,ValueError):pass
+    def finished_at(record):
+        try:
+            return datetime.datetime.fromisoformat(record.get('finished_at', '')).timestamp()
+        except (TypeError, ValueError):
+            return 0
+
+    records.sort(key=finished_at)
     rows=[]
-    for name in p.get(t.ENTRY,{}).get('all',[]):
-        node,provider=inventory.get(name,({},None))
-        provider=runtime.provider_for(name,provider or '本地节点')
-        if not runtime.allowed(name,provider):continue
-        history=node.get('history',[])
-        last=history[-1] if history else {}
-        saved=cache.get(name)
+    for name, provider in owners.items():
+        node, _ = inventory.get(name, ({}, None))
+        history=node.get('history')
+        last=history[-1] if isinstance(history, list) and history and isinstance(history[-1], dict) else {}
+        delay=last.get('delay')
+        delay=delay if type(delay) in (int, float) and delay > 0 else None
         # Prefer this tool's explicitly measured baseline; label its timestamp in the UI.
-        row={'name':name,'provider':runtime.provider_label(provider),
-             'delay':last.get('delay') or None,'time':last.get('time',''),
-             'status':'历史可达' if last.get('delay',0)>0 else '未验证',
+        row={'name':name,'provider':runtime.provider_label(provider) or 'Clash',
+             'delay':delay,'time':last.get('time',''),
+             'status':'历史可达' if delay else '未验证',
              'source':'Clash 历史健康检查','error':''}
-        if saved:row.update(saved)
-        row.update(chains.get(name,{}))
+        for record in records:
+            saved = record.get('results', {}).get(name, {})
+            if saved.get('owner') in (None, provider):
+                row.update(saved)
         rows.append(row)
     return rows
 
 def snapshot(include_nodes=True):
     c,p=t.state()
-    data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':t.candidate_names(p),'expected_ip':runtime.expected_ip()}
+    selection = runtime.read_json('node-policy.json').get('selected_nodes')
+    live=p.get(t.ENTRY,{}).get('all',[])
+    owners=t.relay_owners(selection, live)
+    data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':list(owners),'live':live,'expected_ip':runtime.expected_ip()}
     if include_nodes:
-        try:data['node_rows']=node_rows(p)
+        try:data['node_rows']=node_rows(p, owners)
         except Exception as e:data['node_rows_error']=str(e)
     return data
 
 def latency():
+    from chain_test import clear_latest_results, save_benchmark
     lock=open(t.BASE/'latency.lock','a')
     try:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('已有一轮节点测速正在运行，请稍后再试')
-        before=snapshot(False);_,p=t.state();inventory=node_inventory(p);results={}
+        clear_latest_results()
+        before=snapshot(False);_,p=t.state();results={}
+        owners = t.relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), before.get('live', []))
+        inventory = t.node_inventory(p, owners)
         query=urllib.parse.urlencode({'url':'https://www.gstatic.com/generate_204','timeout':3000,'expected':'204'})
         def measure(name):
             _,provider=inventory.get(name,({},None))
+            provider=owners.get(name, provider)
             q=urllib.parse.quote
             route=('/providers/proxies/'+q(provider,safe='')+'/'+q(name,safe='')+'/healthcheck') if provider else '/proxies/'+q(name,safe='')+'/delay'
-            row={'time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'入口 HTTPS 204，单次 / 3 秒超时','error':''}
+            row={'owner':owners.get(name),'time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'入口 HTTPS 204，单次 / 3 秒超时','error':''}
             try:
                 d=t.api('GET',route+'?'+query).get('delay')
                 if not isinstance(d,(int,float)) or d<=0:raise RuntimeError('未返回有效延迟')
@@ -87,70 +94,53 @@ def latency():
                 publish()
                 if not pending:break
                 wait(pending,timeout=.2,return_when=FIRST_COMPLETED)
-        cache=t.BASE/'latency-results.json'
-        temp=cache.with_suffix('.tmp');temp.write_text(json.dumps({'finished_at':datetime.datetime.now().astimezone().isoformat(),'results':results},ensure_ascii=False,indent=2));temp.chmod(0o600);os.replace(temp,cache)
-        after=snapshot()
-        unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun'])
-        return {'state':after,'message':f'入口测速完成：{sum(x["delay"] is not None for x in results.values())}/{len(results)} 本次可达。'+('当前链路未改变。' if unchanged else '检测到外部代理状态变化，请核对。')+' 仅作入口参考，不代表美国完整链路或下载速度。'}
+        after=snapshot(False)
+        unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live'])
+        save_benchmark('latency', {
+            'finished_at': datetime.datetime.now().astimezone().isoformat(),
+            'results': results, 'selection_unchanged': unchanged,
+        })
+        return {'state':snapshot(),'message':f'入口测速完成：{sum(x["delay"] is not None for x in results.values())}/{len(results)} 本次可达。'+('当前链路未改变。' if unchanged else '检测到外部代理状态变化，请核对。')+' 仅作入口参考，不代表美国完整链路或下载速度。'}
     finally:lock.close()
 
+@t.switch_lock()
 def change(target,previous,guard=None):
     s=snapshot()
     if s['mode']!='global' or s['exit']!=t.EXIT or s['dialer']!=t.ENTRY:
         raise RuntimeError('当前全局链路与预期不符，已取消。请先在 Clash 恢复全局 → 美国静态家宽。')
-    if s['entry']!=previous or target not in s['nodes']:
+    owners = t.switch_owners(s['live'])
+    if s['entry']!=previous or target not in owners:
         raise RuntimeError('节点状态已变化，请刷新后重新选择。')
-    if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
+    owner = owners[target]
     if guard is not None:
         import chain_test
         if chain_test.physical_network()!=guard['network'] or chain_test.active_state()[0]!=guard['before']:
             raise RuntimeError('当前网络或节点已变化，未自动切换。')
-        nodes,exit_node=chain_test.load_nodes()
-        if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
+        nodes,exit_node,expected=chain_test.load_nodes()
+        if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,expected,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
                 (t.BASE/'chain-cancel').exists()):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
+        fresh_owners = t.switch_owners(s['live'])
+        if target not in fresh_owners or fresh_owners[target] != owner:
+            raise RuntimeError('节点归属已变化，请先更新订阅')
+    if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
-    if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global':
+    if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
+    after_owners = t.switch_owners(after['live'])
+    if target not in after_owners or after_owners[target] != owner:
+        raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)
     except Exception as e:warning='实时切换成功，但保存选择失败：'+str(e)
     return {'message':warning or '已切换中转入口，美国静态出口保持不变。建议运行网络检查。','state':after}
 
 
-def remove_list_nodes(request):
-    """Only edit the local candidate policy; never reload or switch Clash."""
-    names=request.get('names')
-    if not isinstance(names,list) or not names or not all(isinstance(n,str) for n in names):
-        raise RuntimeError('请选择要删除的节点')
-    with open(t.BASE/'latency.lock','a') as lock:
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:raise RuntimeError('正在测速，请稍后编辑节点')
-        before=snapshot(False)
-        if request.get('entry')!=before['entry'] or before['entry'] in names:
-            raise RuntimeError('当前入口已变化或被选中，请刷新列表；当前入口不能删除')
-        if not set(names)<=set(before['nodes']):
-            raise RuntimeError('节点列表已变化，请刷新后重试')
-        path=t.BASE/'node-policy.json'
-        original=path.read_bytes() if path.exists() else None
-        policy=json.loads(original) if original is not None else {}
-        removed=set(names)
-        if 'selected_nodes' in policy:
-            policy['selected_nodes']={key:[n for n in items if n not in removed] for key,items in policy['selected_nodes'].items()}
-        excluded=policy.setdefault('excluded_nodes',{})
-        excluded['*']=sorted(set(excluded.get('*',[]))|removed)
-        if policy.get('pinned_entry') in removed:policy.pop('pinned_entry')
-        _,proxies=t.state()
-        if proxies.get(t.ENTRY,{}).get('now')!=before['entry'] or (path.read_bytes() if path.exists() else None)!=original:
-            raise RuntimeError('状态已变化，请刷新后重试')
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w',dir=t.BASE,prefix='.node-policy-',delete=False) as temp:
-            json.dump(policy,temp,ensure_ascii=False,indent=2)
-            tmp=Path(temp.name)
-        try:os.replace(tmp,path)
-        finally:tmp.unlink(missing_ok=True)
-    return {'message':f'已从列表移除 {len(removed)} 个节点，可通过管理节点重新加入。','state':snapshot()}
+def remove_list_nodes(request, metric='chain'):
+    import subscription_update
+    result = subscription_update.run(metric, removal=request)
+    return {**result, 'state': snapshot()}
 
 
 def ip_info():
@@ -170,18 +160,31 @@ def main():
     action=sys.argv[1]
     if action=='self-test': result={'concurrency':runtime.CONCURRENCY,'bundled_backend':True}
     elif action=='status': result={'state':snapshot()}
+    elif action=='startup':
+        import subscription_picker
+        before = t.relay_state()
+        ready = before['mode'] == 'global' and before['exit'] == t.EXIT and before['dialer'] == t.ENTRY
+        result = {'startup_checked': ready}
+        if ready:
+            try:
+                result['initialized'] = subscription_picker.initialize(sys.argv[2])
+                if result['initialized'] and '--refresh' in sys.argv[3:]:
+                    result['message'] = '已刷新 Clash 状态。'
+            except RuntimeError as error:
+                result.update(startup_checked=False, message=str(error))
+        result['state'] = snapshot()
     elif action=='subscription-catalog':
         import subscription_picker
         result={'catalog':subscription_picker.catalog()}
     elif action=='save-node-selection':
         import subscription_picker
-        result=subscription_picker.apply(json.load(sys.stdin))
+        result=subscription_picker.apply(json.load(sys.stdin), sys.argv[2])
         result['state']=snapshot()
     elif action=='update-subscriptions':
         import subscription_picker
-        result=subscription_picker.synchronize()
+        result=subscription_picker.synchronize(sys.argv[2])
         result['state']=snapshot()
-    elif action=='remove-list-nodes':result=remove_list_nodes(json.load(sys.stdin))
+    elif action=='remove-list-nodes':result=remove_list_nodes(json.load(sys.stdin), sys.argv[2])
     elif action=='latency':result=latency()
     elif action=='chain':
         import chain_test

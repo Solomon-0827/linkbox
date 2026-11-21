@@ -10,7 +10,7 @@ const {downloadArtifact}=require('@electron/get');
  if(process.platform==='win32')execFileSync('tar.exe',['-xf',runtime,'-C',folder]);
  else execFileSync('/usr/bin/unzip',['-q',runtime,'-d',folder]);
  const stage=path.join(work,'stage');await fs.rm(stage,{recursive:true,force:true});await fs.mkdir(stage,{recursive:true});
- for(const f of ['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','icons.js'])await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
+ for(const f of ['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js'])await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
  const pkg=JSON.parse(await fs.readFile(path.join(__dirname,'package.json'),'utf8'));delete pkg.devDependencies;delete pkg.scripts;await fs.writeFile(path.join(stage,'package.json'),JSON.stringify(pkg));
  for(const dep of ['yaml','https-proxy-agent','agent-base','debug','ms'])await fs.cp(path.join(__dirname,'node_modules',dep),path.join(stage,'node_modules',dep),{recursive:true});
  const asar=await import('@electron/asar');await asar.createPackage(stage,path.join(folder,'resources','app.asar'));await fs.rm(path.join(folder,'resources','default_app.asar'),{force:true});
