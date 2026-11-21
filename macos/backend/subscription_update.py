@@ -1,5 +1,6 @@
 """Validate and apply a subscription reconciliation plan."""
 import copy,datetime,fcntl,json,os,re,subprocess,tempfile,urllib.request,urllib.parse
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from time import monotonic, sleep
 import yaml
@@ -40,6 +41,8 @@ def fetch(url):
 
 
 NO_SELECTION = '订阅里已没有你勾选的节点，请先在管理节点里勾选'
+INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改'
+VALIDATION_FAILED = '配置校验失败，未改动当前代理'
 EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新'
 POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash'
 RELOAD_UNCERTAIN = '已写入新配置，Clash 尚未确认，请刷新状态核对'
@@ -47,6 +50,10 @@ RELOAD_NOT_SENT = '无法连接 Clash 控制接口，未发送重载请求'
 SWITCH_FAILED = '配置已更新，但无法切换中转入口，请刷新并核对 Clash'
 ENTRY_ROUTE = '/proxies/' + urllib.parse.quote(t.ENTRY, safe='')
 CHAIN_KEYS = ('mode', 'tun', 'exit', 'dialer')
+
+
+class RecomputeError(RuntimeError):
+    pass
 
 
 def read(path):
@@ -63,26 +70,32 @@ def name_filter(definition):
         p.search(name) for p in exclude)
 
 
-def entry_seed_owners(config, sources):
-    from subscription_picker import source_key
+def entry_seed_owners(config, sources, root, baselines):
+    from subscription_picker import document, source_key
 
-    available = {source['name']: (source, doc) for source, doc in sources if doc is not None}
-    by_url = {source_key(source['url']): (source, doc) for source, doc in available.values()}
+    available = {source['name']: source for source, doc in sources if doc is not None}
+    by_url = {source_key(source['url']): source for source in available.values()}
     group = next((g for g in config.get('proxy-groups', []) if g['name'] == t.ENTRY), {})
     providers = config.get('proxy-providers') or {}
     owners = {}
     for name in group.get('use') or []:
         definition = providers.get(name, {})
         url = definition.get('url')
-        match = by_url.get(source_key(url)) if url else available.get(name)
-        if not match:
+        source = by_url.get(source_key(url)) if url else available.get(name)
+        if source is None:
             continue
-        source, doc = match
+        payload = definition.get('payload')
+        if provider_path := definition.get('path'):
+            cache = root / provider_path
+            if cache not in baselines:
+                baselines[cache] = read(cache)
+            payload = document(baselines[cache]).get('proxies')
+        if not isinstance(payload, list):
+            continue
         accepts = name_filter(definition)
-        offered = {node['name'] for node in definition['payload']} if 'payload' in definition else None
-        for node in doc['proxies']:
-            relay = node['name']
-            if (offered is None or relay in offered) and accepts(relay):
+        for node in payload:
+            relay = node.get('name') if isinstance(node, dict) else None
+            if isinstance(relay, str) and accepts(relay):
                 owners.setdefault(relay, source['name'])
     return owners
 
@@ -90,7 +103,7 @@ def entry_seed_owners(config, sources):
 def configure_entry(groups, use):
     group = next((g for g in groups if g['name'] == t.ENTRY), None)
     if group is None:
-        raise RuntimeError('缺少中转入口组')
+        raise RecomputeError('缺少中转入口组')
     group['proxies'] = []
     group['use'] = use
     for key in ('url', 'include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type'):
@@ -278,7 +291,7 @@ def reload_payload(config, root, updates, baselines):
             data = yaml.safe_load(raw) if raw is not None else None
             payload = data.get('proxies') if isinstance(data, dict) else None
         if not isinstance(payload, list):
-            raise RuntimeError('代理缓存不完整，未修改')
+            raise RecomputeError('代理缓存不完整，未修改')
         if owner in use:
             accepts = name_filter(definition)
             payload = [node for node in payload if accepts(node['name'])]
@@ -290,8 +303,21 @@ def reload_payload(config, root, updates, baselines):
     return dump(live), members
 
 
-def write_policy(path, policy):
-    atomic(path, json.dumps(policy, ensure_ascii=False, indent=2).encode())
+def policy_bytes(policy):
+    return json.dumps(policy, ensure_ascii=False, indent=2).encode()
+
+
+@contextmanager
+def discard_failed_recompute(path, policy):
+    try:
+        yield
+    except (RecomputeError, yaml.YAMLError, ValueError, TypeError, AttributeError, LookupError, re.error) as error:
+        if runtime.read_json(path.name) == policy:
+            atomic(path, policy_bytes({key: value for key, value in policy.items()
+                                       if key not in ('pending_update', 'reload_unconfirmed')}))
+        if isinstance(error, RecomputeError):
+            raise
+        raise RuntimeError(INVALID_CONFIG) from None
 
 
 def rollback(written, originals):
@@ -316,7 +342,7 @@ def send_reload(payload):
 def run(metric='chain', *, request=None, removal=None, initialize=False):
     import subscription_picker as picker
     os.umask(0o077)
-    with open(t.BASE / 'latency.lock', 'a') as lock:
+    with open(t.BASE / 'latency.lock', 'a') as lock, ExitStack() as preflight:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -334,13 +360,14 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             raise RuntimeError(t.RELOAD_PENDING)
         if initialize and not (needs_initialization or recovering):
             return False
-        if recovering:
-            pending = pending or {}
-            if pending.get('root', str(root)) != str(root):
-                raise RuntimeError('请先恢复原 Clash 配置目录以完成订阅更新')
-            selection = pending.get('selection', selection)
         before = t.relay_state()
         check_chain(before)
+        if recovering:
+            preflight.enter_context(discard_failed_recompute(policy_file, policy))
+            pending = pending or {}
+            if pending.get('root', str(root)) != str(root):
+                raise RecomputeError('Clash 配置目录已变化，请在管理节点里重新勾选')
+            selection = pending.get('selection', selection)
         syncing = not recovering and request is None and removal is None
         preview_file = runtime.BASE / picker.PREVIEW
         initialization_policy = picker.fingerprint([str(root), policy])
@@ -383,7 +410,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             updates.update({root / 'profiles' / source['profile_file']: dump(doc) for source, doc in sources})
         config = yaml.safe_load(baselines[config_file])
         inventory = picker.inventory(sources)
-        seed_owners = entry_seed_owners(config, sources) if selection is None else None
+        seed_owners = entry_seed_owners(config, sources, root, baselines) if selection is None else None
         plan = reconcile(inventory, selection, before['live'], before['entry'], seed_owners=seed_owners)
         if not plan['candidates']:
             if syncing:
@@ -391,11 +418,11 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 if needs_initialization:
                     preview_data['initialization_policy'] = initialization_policy
                 atomic(preview_file, dump(preview_data))
-            raise RuntimeError(NO_SELECTION)
+            raise RecomputeError(NO_SELECTION)
 
         exit_node = next((n for n in config.get('proxies', []) if n['name'] == t.EXIT), {})
         if exit_node.get('dialer-proxy') != t.ENTRY:
-            raise RuntimeError('固定出口的链式上游已变化，未修改')
+            raise RecomputeError('固定出口的链式上游已变化，未修改')
         replacement = legacy_pin(baselines[script], config, policy.get('pinned_entry'))
         definitions, dns = {}, {}
         existing = config.get('proxy-providers', {})
@@ -406,12 +433,12 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 if owner in existing:
                     definitions[owner] = existing[owner]
                 elif keep:
-                    raise RuntimeError('本地缓存暂不可读，保留原勾选')
+                    raise RecomputeError('本地缓存暂不可读，保留原勾选，请在管理节点里重新勾选')
                 continue
             if not keep:
                 continue
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}', owner):
-                raise RuntimeError('订阅标识需使用字母、数字或短横线')
+                raise RecomputeError('订阅标识需使用字母、数字或短横线')
             cache = root / 'providers/linkbox' / (owner + '.yaml')
             updates[cache] = dump(doc)
             # Mihomo separates filter expressions at literal backticks.
@@ -434,7 +461,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                     for owner, names in plan['selection'].items()}
         desired = reconcile(inventory, selected, [], None, metric, benchmark_results())['entry']
         if desired is None:
-            raise RuntimeError(NO_SELECTION)
+            raise RecomputeError(NO_SELECTION)
         selected_names = selection_owners(selected)
         index = yaml.safe_load(baselines[profiles])
         if update_selector(index, before['entry'] if before['entry'] in selected_names else desired):
@@ -460,24 +487,34 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 file.write_bytes(payload)
                 subprocess.run([c.CORE, '-t', '-d', str(root), '-f', str(file)],
                                capture_output=True, timeout=30, check=True)
+        except subprocess.CalledProcessError as error:
+            kind = RecomputeError if error.returncode > 0 else RuntimeError
+            raise kind(VALIDATION_FAILED) from None
         except (OSError, subprocess.SubprocessError):
-            raise RuntimeError('配置校验失败，未改动当前代理') from None
-        if (picker.discover(for_update=syncing)[1] != fingerprint or t.relay_state() != before
-                or any(read(p) != raw for p, raw in (originals | baselines).items())):
+            raise RuntimeError(VALIDATION_FAILED) from None
+        if picker.discover(for_update=syncing)[1] != fingerprint:
+            raise RuntimeError(EXTERNAL_CHANGE)
+        preflight.close()
+        if t.relay_state() != before or any(read(p) != raw for p, raw in (originals | baselines).items()):
             raise RuntimeError(EXTERNAL_CHANGE)
 
-        backup = runtime.BASE / 'backups' / ('update-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
-        backup.mkdir(parents=True)
-        for i, (path, raw) in enumerate(originals.items()):
-            if raw is not None and path != policy_file:
-                (backup / (str(i) + '-' + path.name)).write_bytes(raw)
+        changes = {path: data for path, data in updates.items() if data != originals[path]}
+        backup_files = [path for path in changes if originals[path] is not None]
+        if backup_files:
+            backup = runtime.BASE / 'backups' / ('update-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+            backup.mkdir(parents=True)
+            for i, path in enumerate(backup_files):
+                (backup / (str(i) + '-' + path.name)).write_bytes(originals[path])
         last_saved = {key: value for key, value in policy.items()
                       if key not in ('pending_update', 'reload_unconfirmed', 'initialization_pending')}
-        journal = {'root': str(root), 'selection': plan['selection']}
-        write_policy(policy_file, {**last_saved, 'pending_update': journal})
-        written = [] if recovering else [policy_file]
+        journal = policy_bytes({**last_saved, 'pending_update': {'root': str(root), 'selection': plan['selection']}})
+        written = []
+        if journal != originals[policy_file]:
+            atomic(policy_file, journal)
+            if not recovering:
+                written.append(policy_file)
         try:
-            for path, data in updates.items():
+            for path, data in changes.items():
                 atomic(path, data)
                 written.append(path)
         except Exception:
@@ -488,7 +525,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         except Exception as error:
             unsent = t.request_not_sent(error)
             if recovering and not unsent:
-                originals[policy_file] = json.dumps(last_saved, ensure_ascii=False, indent=2).encode()
+                originals[policy_file] = policy_bytes(last_saved)
                 written.insert(0, policy_file)
             rollback(written, originals)
             message = RELOAD_NOT_SENT if unsent else 'Clash 未更新'
@@ -503,7 +540,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             if read(profiles) != original:
                 raise RuntimeError(EXTERNAL_CHANGE)
             atomic(profiles, dump(index))
-        write_policy(policy_file, saved)
+        atomic(policy_file, policy_bytes(saved))
         if initialize:
             return True
         message = '已同步 Clash Verge 订阅。' if syncing else '已保存节点选择。'

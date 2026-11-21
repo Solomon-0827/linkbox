@@ -6,6 +6,9 @@ const timers=require('node:timers/promises');
 const {signature: sig, ClashHTTPError, requestNotSent, RELOAD_PENDING}=require('./backend.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
+const INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改';
+const VALIDATION_FAILED = '配置校验失败，未改动当前代理';
+class RecomputeError extends Error {}
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const digest=raw=>raw && crypto.createHash('sha256').update(raw).digest('hex');
 async function read(p){try{return await fs.readFile(p)}catch(e){if(e.code==='ENOENT')return null;throw e}}
@@ -31,9 +34,9 @@ function clean(document) {
 }
 async function discover(b, forUpdate = false) {
  await b.config(); // Resolve the local Verge configuration directory.
- const profiles = await doc(path.join(b.root, 'profiles.yaml'));
- if (!Array.isArray(profiles.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
-  throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
+ const profiles = parseProfile(await read(path.join(b.root, 'profiles.yaml')));
+ if (!Array.isArray(profiles?.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+  throw new RecomputeError('无法完整读取 Clash Verge 订阅，未删除节点');
  }
  // Keep saved IDs across updates without using old entries as sources.
  const registry = (await doc(path.join(b.dataDir, 'subscriptions.json'))).sources || [];
@@ -59,7 +62,7 @@ async function discover(b, forUpdate = false) {
   sources.push({source, raw});
  }
  if (new Set(sources.map(entry => entry.source.name)).size !== sources.length) {
-  throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
+  throw new RecomputeError('订阅标识冲突，请先整理 Clash Verge 订阅');
  }
  const revisions = sources.map(({source, raw}) => [source, digest(raw)]);
  const revision = hash([b.root, revisions, await policy(b)]);
@@ -88,21 +91,28 @@ function nameFilter(definition) {
  return name => (!include.length || include.some(re => re.test(name))) && !exclude.some(re => re.test(name));
 }
 
-function entrySeedOwners(config, sources) {
- const available = sources.filter(({document}) => document);
- const byID = new Map(available.map(entry => [entry.source.name, entry]));
- const byURL = new Map(available.map(entry => [sourceKey(entry.source.url), entry]));
+async function entrySeedOwners(config, sources, root, baselines) {
+ const available = sources.filter(({document}) => document).map(({source}) => source);
+ const byID = new Map(available.map(source => [source.name, source]));
+ const byURL = new Map(available.map(source => [sourceKey(source.url), source]));
  const group = config['proxy-groups']?.find(g => g.name === ENTRY);
  const providers = config['proxy-providers'] || {};
  const owners = new Map();
  for (const name of group?.use || []) {
   const definition = Object.hasOwn(providers, name) ? providers[name] : {};
-  const match = definition.url ? byURL.get(sourceKey(definition.url)) : byID.get(name);
-  if (!match) continue;
+  const source = definition.url ? byURL.get(sourceKey(definition.url)) : byID.get(name);
+  if (!source) continue;
+  let {payload} = definition;
+  if (definition.path) {
+   const cache = path.resolve(root, definition.path);
+   if (!baselines.has(cache)) baselines.set(cache, await read(cache));
+   payload = parseProfile(baselines.get(cache))?.proxies;
+  }
+  if (!Array.isArray(payload)) continue;
   const accepts = nameFilter(definition);
-  const offered = definition.payload && new Set(definition.payload.map(node => node.name));
-  for (const {name: relay} of match.document.proxies) {
-   if ((!offered || offered.has(relay)) && accepts(relay) && !owners.has(relay)) owners.set(relay, match.source.name);
+  for (const node of payload) {
+   const relay = node?.name;
+   if (typeof relay === 'string' && accepts(relay) && !owners.has(relay)) owners.set(relay, source.name);
   }
  }
  return owners;
@@ -167,7 +177,7 @@ const CHAIN_KEYS = ['mode', 'tun', 'exit', 'dialer'];
 
 function configureEntry(groups, use) {
  const group = groups.find(g => g.name === ENTRY);
- if (!group) throw Error('缺少中转入口组');
+ if (!group) throw new RecomputeError('缺少中转入口组');
  group.proxies = [];
  group.use = use;
  for (const key of ['url', 'include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type']) delete group[key];
@@ -325,7 +335,7 @@ async function reloadPayload(config, root, updates, baselines) {
    if (!updates.has(file) && !baselines.has(file)) baselines.set(file, await read(file));
    payload = parseProfile(updates.get(file) ?? baselines.get(file))?.proxies;
   }
-  if (!Array.isArray(payload)) throw Error('代理缓存不完整，未修改');
+  if (!Array.isArray(payload)) throw new RecomputeError('代理缓存不完整，未修改');
   if (use.has(owner)) {
    const accepts = nameFilter(definition);
    payload = payload.filter(node => accepts(node.name));
@@ -353,6 +363,7 @@ async function sendReload(b, payload) {
 async function run(b, request = null, {removal = null, initialize = false} = {}) {
  if (b.busy) throw Error('已有操作正在运行');
  b.busy = true;
+ let discardJournal;
  const update = (async () => {
   const saved = await policy(b);
   const policyFile = path.join(b.dataDir, 'node-policy.json');
@@ -368,7 +379,14 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   b.assertChain(before);
   await b.config();
   if (recovering) {
-   if (pending?.root !== undefined && pending.root !== b.root) throw Error('请先恢复原 Clash 配置目录以完成订阅更新');
+   discardJournal = async () => {
+    if (!isDeepStrictEqual(await policy(b), saved)) return;
+    const {pending_update, reload_unconfirmed, ...lastSaved} = saved;
+    await atomic(policyFile, JSON.stringify(lastSaved, null, 2));
+   };
+   if (pending?.root !== undefined && pending.root !== b.root) {
+    throw new RecomputeError('Clash 配置目录已变化，请在管理节点里重新勾选');
+   }
    selection = pending?.selection ?? selection;
   }
   const syncing = !recovering && request === null && removal === null;
@@ -420,18 +438,18 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const config = YAML.parse(baselines.get(configFile).toString());
   const inventory = inventoryFor(sources);
-  const seedOwners = selection == null ? entrySeedOwners(config, sources) : undefined;
+  const seedOwners = selection == null ? await entrySeedOwners(config, sources, b.root, baselines) : undefined;
   const plan = reconcile({sources:inventory, selection, live:before.live, current:before.entry, seedOwners});
   if (!plan.candidates.length) {
    if (syncing) await atomic(previewFile, YAML.stringify({
     revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
     ...(needsInitialization ? {initialization_policy: initializationPolicy} : {}),
    }));
-   throw Error(NO_SELECTION);
+   throw new RecomputeError(NO_SELECTION);
   }
 
   if (config.proxies?.find(node => node.name === EXIT)?.['dialer-proxy'] !== ENTRY) {
-   throw Error('固定出口的链式上游已变化，未修改');
+   throw new RecomputeError('固定出口的链式上游已变化，未修改');
   }
   const registryFile = path.join(b.dataDir, 'subscriptions.json');
   const replace = legacyPin(baselines.get(script), config, saved.pinned_entry);
@@ -441,11 +459,11 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    const keep = Object.hasOwn(plan.selection, owner) && plan.selection[owner];
    if (!document) {
     if (Object.hasOwn(existing, owner)) definitions.set(owner, existing[owner]);
-    else if (keep?.length) throw Error('本地缓存暂不可读，保留原勾选');
+    else if (keep?.length) throw new RecomputeError('本地缓存暂不可读，保留原勾选，请在管理节点里重新勾选');
     continue;
    }
    if (!keep?.length) continue;
-   if (!/^[A-Za-z0-9_-]{1,60}$/.test(owner)) throw Error('订阅标识需使用字母、数字或短横线');
+   if (!/^[A-Za-z0-9_-]{1,60}$/.test(owner)) throw new RecomputeError('订阅标识需使用字母、数字或短横线');
    const file = path.join(b.root, 'providers', 'linkbox', owner + '.yaml');
    updates.set(file, YAML.stringify(document));
    definitions.set(owner, {
@@ -469,7 +487,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    [owner, names.filter(name => members.has(name))]));
   const {entry: desired} = reconcile({sources:inventory, selection:selected, live:[], current:null,
    metric:b.settings.metric, results:benchmarkResults(b)});
-  if (desired === null) throw Error(NO_SELECTION);
+  if (desired === null) throw new RecomputeError(NO_SELECTION);
   const selectedNames = selectionOwners(selected);
   const index = YAML.parse(baselines.get(profiles).toString());
   if (updateSelector(index, selectedNames.has(before.entry) ? before.entry : desired)) {
@@ -496,31 +514,40 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    await fs.writeFile(file, payload, {mode: 0o600});
    if (b.validateConfig) await b.validateConfig(file);
    else await exec(await b.corePath(), ['-t', '-d', b.root, '-f', file], {windowsHide: true, timeout: 30000, maxBuffer: 2e6});
-  } catch {
-   throw Error('配置校验失败，未改动当前代理');
+  } catch (error) {
+   if (typeof error?.code === 'number' && error.code > 0) throw new RecomputeError(VALIDATION_FAILED);
+   throw Error(VALIDATION_FAILED);
   } finally {
    await fs.rm(temp, {recursive: true, force: true});
   }
-  if ((await discover(b, syncing)).fingerprint !== discovered.fingerprint || sig(await b.state()) !== sig(before)) {
+  if ((await discover(b, syncing)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
+  discardJournal = undefined;
+  if (sig(await b.state()) !== sig(before)) {
    throw Error(EXTERNAL_CHANGE);
   }
   for (const [file, raw] of new Map([...originals, ...baselines])) {
    if (!equal(raw, await read(file))) throw Error(EXTERNAL_CHANGE);
   }
 
-  const backup = path.join(b.dataDir, 'backups', 'update-' + crypto.randomUUID());
-  await fs.mkdir(backup, {recursive: true});
-  let i = 0;
-  for (const [file, raw] of originals) {
-   if (raw !== null && file !== policyFile) await fs.writeFile(path.join(backup, (i++) + '-' + path.basename(file)), raw, {mode: 0o600});
+  const changes = [...updates].filter(([file, data]) => !equal(Buffer.from(data), originals.get(file)));
+  const backupFiles = changes.map(([file]) => file).filter(file => originals.get(file) !== null);
+  if (backupFiles.length) {
+   const backup = path.join(b.dataDir, 'backups', 'update-' + crypto.randomUUID());
+   await fs.mkdir(backup, {recursive: true});
+   for (const [i, file] of backupFiles.entries()) {
+    await fs.writeFile(path.join(backup, i + '-' + path.basename(file)), originals.get(file), {mode: 0o600});
+   }
   }
   const lastSaved = {...saved};
   for (const key of ['pending_update', 'reload_unconfirmed', 'initialization_pending']) delete lastSaved[key];
-  const journal = {root: b.root, selection: plan.selection};
-  await atomic(policyFile, JSON.stringify({...lastSaved, pending_update: journal}, null, 2));
-  const written = recovering ? [] : [policyFile];
+  const journal = Buffer.from(JSON.stringify({...lastSaved, pending_update: {root: b.root, selection: plan.selection}}, null, 2));
+  const written = [];
+  if (!equal(journal, originals.get(policyFile))) {
+   await atomic(policyFile, journal);
+   if (!recovering) written.push(policyFile);
+  }
   try {
-   for (const [file, data] of updates) {
+   for (const [file, data] of changes) {
     await atomic(file, data);
     written.push(file);
    }
@@ -553,7 +580,14 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   await atomic(policyFile, JSON.stringify(nextPolicy, null, 2));
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
- })();
+ })().catch(async error => {
+  const invalidInput = error instanceof YAML.YAMLParseError || error instanceof SyntaxError || error instanceof TypeError;
+  if (discardJournal && (error instanceof RecomputeError || invalidInput)) {
+   await discardJournal();
+   if (invalidInput) throw Error(INVALID_CONFIG);
+  }
+  throw error;
+ });
  b.subscriptionUpdate = update;
  try {
   return await update;

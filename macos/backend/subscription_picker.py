@@ -38,7 +38,7 @@ def discover(for_update=False):
     profiles = document(update.read(root / 'profiles.yaml'))
     items = profiles.get('items')
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-        raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
+        raise update.RecomputeError('无法完整读取 Clash Verge 订阅，未删除节点')
     # The saved registry can preserve IDs, but only Verge can list sources.
     registry = runtime.read_json('subscriptions.json').get('sources', [])
     by_url = {source_key(s['url']): s for s in registry if s.get('url')}
@@ -72,7 +72,7 @@ def discover(for_update=False):
             raw = None
         sources.append((source, raw))
     if len({s['name'] for s, _ in sources}) != len(sources):
-        raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
+        raise update.RecomputeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, None if raw is None else hashlib.sha256(raw).hexdigest()] for source, raw in sources]
     revision = fingerprint([str(root), revisions, runtime.read_json('node-policy.json')])
     if for_update:

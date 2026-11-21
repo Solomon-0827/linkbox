@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
-from subprocess import run as run_process
+from subprocess import CalledProcessError, TimeoutExpired, run as run_process
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -191,6 +191,41 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['new']})
         self.assertEqual(yaml.safe_load((self.root / 'profiles/a.yaml').read_bytes())['proxies'], [node('new')])
 
+    def test_crashed_preview_save_clears_journal_and_reopens_picker(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        saved = self.policy.read_bytes()
+        self.downloaded = {'a': ['new'], 'b': ['other']}
+        with self.assertRaisesRegex(RuntimeError, '管理节点'):
+            picker.synchronize()
+
+        atomic = update.atomic
+
+        class Crash(BaseException):
+            pass
+
+        def crash_after_journal(path, data):
+            atomic(path, data)
+            if path == self.policy:
+                raise Crash()
+
+        with patch.object(update, 'atomic', side_effect=crash_after_journal), self.assertRaises(Crash):
+            self.apply({'a': ['new'], 'b': []})
+        self.assertEqual(json.loads(self.policy.read_bytes())['pending_update']['selection'], {'a': ['new']})
+        before = self.files()
+        before[self.policy.name] = saved
+        self.requests.clear()
+        with self.assertRaisesRegex(RuntimeError, '管理节点'):
+            picker.initialize()
+        self.assertEqual(self.files(), before)
+        self.assertEqual(self.requests, [])
+        self.assertFalse(picker.initialize())
+        with patch.object(gui, 'snapshot', side_effect=lambda: {**self.active, 'nodes': self.active['live']}):
+            self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
+        with self.assertRaisesRegex(RuntimeError, '管理节点'):
+            picker.synchronize()
+        self.apply({'a': ['new'], 'b': []})
+        self.assertEqual(self.active['entry'], 'new')
+
     def test_first_run_fetches_before_seeding_and_drops_legacy_data_without_backup(self):
         self.legacy({'blocked_providers': ['a'], 'excluded_nodes': {'*': ['fast']}})
         (self.root / 'profiles/a.yaml').write_text('proxies: [')
@@ -231,6 +266,24 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertTrue(picker.initialize())
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'],
                          {'a': ['fast', 'quick'], 'b': ['current']})
+
+    def test_first_run_prefers_current_provider_cache_to_new_duplicate(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxy-groups'][0].update(use=['a', 'b'], proxies=[])
+        config['proxy-providers'] = {
+            'a': {'type': 'http', 'url': self.sources[0]['url'], 'path': 'providers/a.yaml'},
+            'b': {'type': 'http', 'url': self.sources[1]['url'], 'path': str(self.root / 'providers/b.yaml')},
+        }
+        self.config.write_bytes(update.dump(config))
+        (self.root / 'providers').mkdir()
+        (self.root / 'providers/a.yaml').write_bytes(update.dump({'proxies': [node('fast')]}))
+        (self.root / 'providers/b.yaml').write_bytes(update.dump({'proxies': [node('current'), node('fast')]}))
+        self.downloaded = {'a': ['current', 'fast'], 'b': ['current', 'fast']}
+
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast'], 'b': ['current']})
+        self.assertEqual([n['name'] for n in self.reload['proxy-providers']['b']['payload']], ['current'])
+        self.assertEqual(self.active['entry'], 'current')
 
     def test_first_run_does_not_confirm_owner_assignment_without_success_response(self):
         self.downloaded = {'a': ['current', 'fast', 'quick'], 'b': ['other']}
@@ -468,6 +521,27 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.requests, ['/configs?force=false'])
         self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
 
+    def test_unacknowledged_refreshes_retry_without_rewrites_or_backups(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.api.side_effect = TimeoutError()
+        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
+            self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
+
+        def identities():
+            result = {}
+            for name in self.files():
+                stat = (self.base / name).stat()
+                result[name] = (stat.st_ino, stat.st_mtime_ns)
+            return result
+
+        before = identities()
+        self.api.reset_mock()
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
+                picker.initialize()
+            self.assertEqual(identities(), before)
+        self.assertEqual([call.args[1] for call in self.api.call_args_list], ['/configs?force=false'] * 2)
+
     def crash_after_config(self):
         original_index = self.index.read_bytes()
         registry = self.base / 'subscriptions.json'
@@ -635,6 +709,25 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
                          [{'name': t.ENTRY, 'now': 'quick'}])
         self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
+
+    def test_refresh_clears_journal_after_validation_rejection(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        saved = self.policy.read_bytes()
+        self.requests.clear()
+        self.crash_after_config()
+        before = self.files()
+        self.validate.side_effect = TimeoutExpired('mihomo', 30)
+        with self.assertRaisesRegex(RuntimeError, '配置校验失败'):
+            picker.initialize()
+        self.assertEqual(self.files(), before)
+
+        self.validate.side_effect = CalledProcessError(1, 'mihomo')
+        with self.assertRaisesRegex(RuntimeError, '配置校验失败'):
+            picker.initialize()
+        before[self.policy.name] = saved
+        self.assertEqual(self.policy.read_bytes(), saved)
+        self.assertEqual(self.files(), before)
+        self.assertEqual(self.requests, [])
         self.assertFalse(picker.initialize())
 
     def test_failed_benchmark_start_preserves_display_history_and_invalidates_ranking(self):

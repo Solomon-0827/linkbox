@@ -15,6 +15,14 @@ const node = (name, server = 'relay.example.invalid') => ({
  name, type: 'ss', server, port: 443, cipher: 'aes-128-gcm', password: 'fixture',
 });
 const ENTRY_ROUTE = '/proxies/' + encodeURIComponent(ENTRY);
+async function fixtureFiles(data) {
+ const files = (await fs.readdir(path.dirname(data), {recursive:true, withFileTypes:true})).filter(file => file.isFile());
+ return Object.fromEntries(await Promise.all(files.map(async file => {
+  const fullPath = path.join(file.parentPath, file.name);
+  return [fullPath, await fs.readFile(fullPath)];
+ })));
+}
+
 async function fixture(t) {
  t.mock.method(timers, 'setTimeout', async () => {});
  const dir = await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-selection-'));
@@ -185,13 +193,34 @@ test('same-name owner move requires a reload response on Refresh', async t => {
  assert.equal((await saved()).pending_update, undefined);
 });
 
-async function crashAfterConfig({root, data, state, request}) {
+test('unacknowledged Refreshes retry without rewrites or backups', async t => {
+ const {b, data, apply} = await fixture(t);
+ await apply({a:['current','fast'], b:[]});
+ const reloads = [];
+ b.request = async (_endpoint, _method, route) => { reloads.push(route); throw Error('timeout'); };
+ await assert.rejects(apply({a:['current','fast','quick'], b:[]}), /尚未确认/);
+
+ const identities = async () => Object.fromEntries(await Promise.all(Object.keys(await fixtureFiles(data)).map(async file => {
+  const {ino, mtimeNs} = await fs.stat(file, {bigint:true});
+  return [file, [ino, mtimeNs]];
+ })));
+ const before = await identities();
+ reloads.length = 0;
+ for (let i = 0; i < 2; i++) {
+  await assert.rejects(sub.initialize(b), /尚未确认/);
+  assert.deepEqual(await identities(), before);
+ }
+ assert.deepEqual(reloads, ['/configs?force=false', '/configs?force=false']);
+});
+
+async function crashDuringSave({root, data, state, request}, selected = {a:['fast'], b:[]},
+                               crashFile = path.join(root, 'clash-verge.yaml')) {
  const profile = path.join(root,'profiles.yaml'), registry = path.join(data,'subscriptions.json');
  const originalProfile = await fs.readFile(profile), originalRegistry = await fs.readFile(registry);
- const selection = await request({a:['fast'], b:[]});
+ const selection = await request(selected);
  const child = `
-  const fs = require('node:fs/promises'), path = require('node:path');
-  const [backendPath, subscriptionsPath, root, data, state, selection] = process.argv.slice(1);
+  const fs = require('node:fs/promises');
+  const [backendPath, subscriptionsPath, root, data, state, selection, crashFile] = process.argv.slice(1);
   const {Backend} = require(backendPath), sub = require(subscriptionsPath);
   (async () => {
    const b = await new Backend(data).init();
@@ -201,12 +230,12 @@ async function crashAfterConfig({root, data, state, request}) {
    const rename = fs.rename;
    fs.rename = async (from,to) => {
     await rename(from,to);
-    if (to === path.join(root,'clash-verge.yaml')) process.exit(42);
+    if (to === crashFile) process.exit(42);
    };
    await sub.run(b,JSON.parse(selection));
   })().catch(error => { console.error(error.message); process.exit(1); });`;
  assert.throws(()=>execFileSync(process.execPath,['-e',child,require.resolve('../backend.cjs'),
-  require.resolve('../subscriptions.cjs'),root,data,JSON.stringify(state),JSON.stringify(selection)]), {status:42});
+  require.resolve('../subscriptions.cjs'),root,data,JSON.stringify(state),JSON.stringify(selection),crashFile]), {status:42});
  assert.deepEqual(await fs.readFile(profile),originalProfile);
  assert.deepEqual(await fs.readFile(registry),originalRegistry);
 }
@@ -216,7 +245,7 @@ test('restart recomputes from newer Verge files after a crash', async t => {
  const {b, root, data, state, apply, saved, requests, write} = fx;
  await apply({a:['current','fast'], b:[]});
  requests.length = 0;
- await crashAfterConfig(fx);
+ await crashDuringSave(fx);
  const profile = path.join(root,'profiles.yaml');
  const renamed = YAML.parse(await fs.readFile(profile,'utf8'));
  renamed.items[0].name = 'Renamed in Verge after the crash';
@@ -251,7 +280,7 @@ test('restart rolls back its own writes if reload is rejected', async t => {
  const {b, root, data, state, apply, saved, requests, write} = fx;
  await apply({a:['current','fast'], b:[]});
  requests.length = 0;
- await crashAfterConfig(fx);
+ await crashDuringSave(fx);
  const profile = path.join(root,'profiles.yaml');
  const renamed = YAML.parse(await fs.readFile(profile,'utf8'));
  renamed.items[0].name = 'Renamed in Verge after the crash';
@@ -269,6 +298,26 @@ test('restart rolls back its own writes if reload is rejected', async t => {
  assert.deepEqual(await saved(), {selected_nodes:{a:['current','fast']}, provider_labels:{a:'A',b:'B'}});
  assert.deepEqual(state.live, ['current','fast']);
  assert.equal(await sub.initialize(b), false);
+});
+
+test('Refresh clears the journal after validation rejection', async t => {
+ const fx = await fixture(t);
+ const {b, data, policy, apply, requests} = fx;
+ await apply({a:['current','fast'], b:[]});
+ const saved = await fs.readFile(policy);
+ requests.length = 0;
+ await crashDuringSave(fx);
+ const before = await fixtureFiles(data);
+ b.validateConfig = async () => { throw Object.assign(Error('timeout'), {killed:true}); };
+ await assert.rejects(sub.initialize(b), /配置校验失败/);
+ assert.deepEqual(await fixtureFiles(data), before);
+
+ b.validateConfig = async () => { throw Object.assign(Error('invalid config'), {code:1}); };
+ await assert.rejects(sub.initialize(b), /配置校验失败/);
+ before[policy] = saved;
+ assert.deepEqual(await fs.readFile(policy), saved);
+ assert.deepEqual(await fixtureFiles(data), before);
+ assert.deepEqual(requests, []);
 });
 
 test('Refresh confirms after equivalent config reserialization', async t => {
@@ -380,6 +429,25 @@ test('first run seeds in live provider order with picker fallback', async t => {
  refreshWith({a:['current','fast','quick'], b:['current','fast','quick']});
  assert.equal(await sub.initialize(b), true);
  assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick'], b:['current']});
+});
+
+test('first run prefers the current provider cache to a new duplicate', async t => {
+ const {b, root, items, config, state, write, refreshWith, saved, requests} = await fixture(t);
+ Object.assign(config['proxy-groups'][0], {use:['a','b'], proxies:[]});
+ config['proxy-providers'] = {
+  a:{type:'http', url:items[0].url, path:'providers/a.yaml'},
+  b:{type:'http', url:items[1].url, path:path.join(root, 'providers/b.yaml')},
+ };
+ await write('clash-verge.yaml', config);
+ await fs.mkdir(path.join(root, 'providers'));
+ await write('providers/a.yaml', {proxies:[node('fast')]});
+ await write('providers/b.yaml', {proxies:[node('current'), node('fast')]});
+ refreshWith({a:['current','fast'], b:['current','fast']});
+
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast'], b:['current']});
+ assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-providers'].b.payload.map(n => n.name), ['current']);
+ assert.equal(state.entry, 'current');
 });
 
 test('first run does not confirm owner assignment without a success response', async t => {
@@ -538,6 +606,32 @@ test('empty selection refuses and all vanished can recover in the picker', async
  assert.equal(state.entry, 'new');
  assert.deepEqual((await saved()).selected_nodes, {a:['new']});
  assert.deepEqual(YAML.parse(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8')).proxies, [node('new')]);
+});
+
+test('a crashed preview Save clears the journal and reopens Manage Nodes', async t => {
+ const fx = await fixture(t);
+ const {b, data, policy, apply, requests, saved, refreshWith, state} = fx;
+ await apply({a:['current','fast'], b:[]});
+ const savedBefore = await saved();
+ refreshWith({a:['new'], b:['other']});
+ await assert.rejects(b.updateSubscriptions(), /管理节点/);
+ await crashDuringSave(fx, {a:['new'], b:[]}, policy);
+ assert.deepEqual((await saved()).pending_update.selection, {a:['new']});
+ const before = await fixtureFiles(data);
+ before[policy] = Buffer.from(JSON.stringify(savedBefore, null, 2));
+ requests.length = 0;
+ await assert.rejects(sub.initialize(b), /管理节点/);
+ assert.deepEqual(await saved(), savedBefore);
+ assert.deepEqual(await fixtureFiles(data), before);
+ assert.deepEqual(requests, []);
+ assert.equal(await sub.initialize(b), false);
+ const observe = b.state;
+ delete b.state;
+ assert.equal((await b.switchNode('fast','current')).entry, 'fast');
+ b.state = observe;
+ await assert.rejects(b.updateSubscriptions(), /管理节点/);
+ await apply({a:['new'], b:[]});
+ assert.equal(state.entry, 'new');
 });
 
 test('other group keeps its static reference and ENTRY uses the selected owner once', async t => {
