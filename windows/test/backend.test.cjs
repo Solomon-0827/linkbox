@@ -129,9 +129,17 @@ test('benchmark loads duplicate credentials only from the selected owner and inc
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-owner-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  const b = await new Backend(folder).init(), ENTRY = '中转入口', EXIT = '美国静态家宽';
+ b.root = folder;
  const node = server => ({name:'same',server});
+ const providers = {};
+ await fs.mkdir(path.join(folder,'providers/linkbox'), {recursive:true});
+ for (const owner of ['a','b']) {
+  const cache = `providers/linkbox/${owner}.yaml`;
+  providers[owner] = {path:cache};
+  await fs.writeFile(path.join(folder,cache), JSON.stringify({proxies:[node(owner+'.example.invalid')]}));
+ }
  const config = {proxies:[node('local.example.invalid'),{name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY}],
-  'proxy-providers':{a:{payload:[node('a.example.invalid')]},b:{payload:[node('b.example.invalid')]}},
+  'proxy-providers':providers,
   'proxy-groups':[{name:ENTRY,use:['a','b']}]};
  b.config = async () => config;
  b.api = async (method,route) => {
@@ -159,13 +167,14 @@ test('benchmark handles a malformed provider cache per relay', async t => {
  const {ENTRY, EXIT} = require('../backend.cjs');
  const b = await new Backend(folder).init();
  b.settings.configDir = folder;
+ await fs.mkdir(path.join(folder,'providers/linkbox'), {recursive:true});
  await fs.writeFile(path.join(folder,'clash-verge.yaml'),JSON.stringify({
   proxies:[{name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY}],
-  'proxy-providers':{a:{path:'a.yaml'},b:{path:'b.yaml'}},
+  'proxy-providers':{a:{path:'providers/linkbox/a.yaml'},b:{path:'providers/linkbox/b.yaml'}},
   'proxy-groups':[{name:ENTRY,use:['a']},{name:'secondary',use:['b']}],
  }));
- await fs.writeFile(path.join(folder,'a.yaml'),'proxies: [{name: healthy, server: example.invalid}]');
- await fs.writeFile(path.join(folder,'b.yaml'),'proxies: [');
+ await fs.writeFile(path.join(folder,'providers/linkbox/a.yaml'),'proxies: [{name: healthy, server: example.invalid}]');
+ await fs.writeFile(path.join(folder,'providers/linkbox/b.yaml'),'proxies: [');
  b.relayState = async () => ({mode:'global',exit:EXIT,dialer:ENTRY,entry:'healthy',live:['healthy']});
  b.api = async () => ({});
  b.network = async () => ({name:'fixture'});

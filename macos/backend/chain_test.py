@@ -59,16 +59,19 @@ def active_state():
 
 
 def load_nodes():
+    from subscription_update import entry_plan, unmanaged_entry
+
     global DNS_POLICY
     conf = yaml.safe_load((CONFIG_DIR / 'clash-verge.yaml').read_text())
     DNS_POLICY = {k: v for k, v in conf.get('dns', {}).get('proxy-server-nameserver-policy', {}).items()
                   if not k.startswith(('geosite:', 'rule-set:'))}
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
-    owners = selection_owners(selection)
-    nodes = {}
-    if selection is None:
-        from subscription_update import entry_plan
+    if selection is None or unmanaged_entry(conf, CONFIG_DIR):
+        owners = {}
         nodes = {name: node for name, (_, node) in (entry_plan(conf, CONFIG_DIR) or {}).items() if node is not None}
+    else:
+        owners = selection_owners(selection)
+        nodes = {}
     providers = conf.get('proxy-providers', {})
     for owner in dict.fromkeys(owners.values()):
         provider = providers.get(owner, {})

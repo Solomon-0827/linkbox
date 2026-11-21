@@ -79,24 +79,22 @@ def switch_lock():
         yield
 
 
-def unmanaged_entry_owners(live):
+def relay_owners(selection, live):
     import yaml
     import runtime
-    from subscription_update import entry_plan
+    from subscription_update import entry_plan, unmanaged_entry
 
     root = runtime.CONFIG_DIR
     try:
         config = yaml.safe_load((root / 'clash-verge.yaml').read_bytes())
     except (OSError, ValueError, yaml.YAMLError):
-        return {}
-    plan = entry_plan(config, root) or {}
-    return {name: owner for name, (owner, _) in plan.items() if name in live}
-
-
-def relay_owners(selection, live):
-    if selection is not None:
+        config = None
+    if not isinstance(config, dict):
+        config = {}
+    if selection is not None and not unmanaged_entry(config, root):
         return selection_owners(selection)
-    return unmanaged_entry_owners(live)
+    plan = entry_plan(config, root) or {}
+    return {name: plan.get(name, (None, None))[0] for name in live}
 
 
 def switch_owners(live):

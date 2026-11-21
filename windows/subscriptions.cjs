@@ -113,16 +113,17 @@ async function entrySeedOwners(b, config, sources) {
  const providers = config['proxy-providers'] || {};
  for (const name of use) {
   const url = Object.hasOwn(providers, name) ? providers[name]?.url : undefined;
-  if (url != null && typeof url !== 'string') continue;
   let source;
-  try { source = url ? byURL.get(sourceKey(url)) : byID.get(name); }
-  catch { continue; }
-  if (!source) continue;
+  try {
+   if (url == null || url === '') source = byID.get(name);
+   else if (typeof url === 'string') source = byURL.get(sourceKey(url));
+  } catch { /* Unmappable provider. */ }
+  // An unmappable first provider still reserves the name for picker fallback.
   for (const {name: relay} of liveProviders.get(name) || []) {
-   if (!owners.has(relay)) owners.set(relay, source.name);
+   if (!owners.has(relay)) owners.set(relay, source?.name);
   }
  }
- return owners;
+ return new Map([...owners].filter(([, owner]) => owner !== undefined));
 }
 
 async function catalog(b) {
@@ -223,6 +224,7 @@ main=function(config,profileName){
     if(groups.some(g=>g.name!=="中转入口"&&(g.use?.includes(name)||g["include-all"]||g["include-all-providers"])))providers[name]=definition;
     else delete providers[name];}
   r["proxy-providers"]={...providers,...m.providers};
+  if(m.pin)r.proxies=[...(r.proxies||[]).filter(p=>p.name!==m.pin.name),m.pin];
   const g=groups.find(g=>g.name==="中转入口");
   if(g){g.proxies=[];g.use=m.use;
     for(const k of ["url","include-all","include-all-proxies","include-all-providers","filter","exclude-filter","exclude-type"])delete g[k];}
@@ -246,16 +248,29 @@ function updateSelector(index, name) {
 
 function legacyPin(original, config, savedName) {
  const wrapper = original?.toString().split(MARK)[1];
- if (!savedName || !wrapper) return [];
- // The old wrapper embeds a JSON object before its first config assignment.
- const embedded = wrapper.match(/const m=(\{.*\});r\[(?:"proxy-providers"|'proxy-providers')\]/);
+ if (!wrapper) return null;
+ const embedded = wrapper.match(/const m=(\{.*?\});(?:r\[(?:"proxy-providers"|'proxy-providers')\]|$)/m);
  let pin;
- try { pin = JSON.parse(embedded?.[1]).pin; } catch { return []; }
- if (pin?.name !== savedName || !config.proxies.some(node => isDeepStrictEqual(node, pin))) return [];
- if (config['proxy-groups']?.some(g => g.name !== ENTRY && (g.proxies?.includes(savedName) ||
-     ((g['include-all-proxies'] || g['include-all']) && groupFilter(g)(savedName)))) ||
-     config.proxies.some(node => node['dialer-proxy'] === savedName)) return [];
- return [savedName];
+ try { pin = JSON.parse(embedded?.[1]).pin; } catch { return null; }
+ if (!pin?.name || (savedName && pin.name !== savedName) ||
+     !config.proxies?.some(node => isDeepStrictEqual(node, pin))) return null;
+ return pin;
+}
+
+function ruleTarget(rule) {
+ const fields = rule.split(',').map(field => field.trim());
+ if (['AND', 'OR', 'NOT'].includes(fields[0])) {
+  // Logical rule payloads contain nested, comma-separated rules.
+  return rule.match(/.*\)\s*,\s*([^,]+)/)?.[1].trim();
+ }
+ return fields[fields[0] === 'MATCH' ? 1 : 2];
+}
+
+function pinReferenced(config, name) {
+ return config['proxy-groups']?.some(g => g.name !== ENTRY && (g.proxies?.includes(name) ||
+     ((g['include-all-proxies'] || g['include-all']) && groupFilter(g)(name)))) ||
+     config.proxies.some(node => node['dialer-proxy'] === name) ||
+     config.rules?.some(rule => typeof rule === 'string' && ruleTarget(rule) === name);
 }
 
 async function selectAfterReload(b, before, selected, desired) {
@@ -306,6 +321,12 @@ function managedCache(root, owner, definition) {
  return definition.path && path.resolve(root, definition.path) === path.join(root, 'providers', 'linkbox', owner + '.yaml');
 }
 
+function unmanagedEntry(config, root) {
+ const entry = config['proxy-groups']?.find(group => group.name === ENTRY);
+ const providers = config['proxy-providers'] || {};
+ return !!entry && !(entry.use || []).some(owner => managedCache(root, owner, providers[owner] || {}));
+}
+
 async function providerPayload(definition, root, readCache, filtered) {
  let {payload} = definition;
  if (definition.path) payload = parseProfile(await readCache(path.resolve(root, definition.path)))?.proxies;
@@ -330,8 +351,10 @@ async function entryPlan(config, root) {
  const providers = config['proxy-providers'] || {};
  const use = includeAll || entry['include-all-providers'] ? Object.keys(providers).sort() : entry.use || [];
  for (const owner of use) {
-  if (!Object.hasOwn(providers, owner)) throw Error('代理缓存不完整，未修改');
-  for (const node of await providerPayload(providers[owner], root, read, true)) {
+  let payload;
+  try { payload = await providerPayload(providers[owner], root, read, true); }
+  catch { continue; }
+  for (const node of payload) {
    if (accepts(node.name) && !members.has(node.name)) members.set(node.name, {owner, node});
   }
  }
@@ -455,7 +478,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
 
   const registryFile = path.join(b.dataDir, 'subscriptions.json');
-  const replace = legacyPin(baselines.get(script), config, saved.pinned_entry);
+  const pin = legacyPin(baselines.get(script), config, saved.pinned_entry);
   const definitions = new Map(), dns = {}, existing = config['proxy-providers'] || {};
   for (const {source, document} of sources) {
    const owner = source.name;
@@ -481,6 +504,11 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const retired = Object.fromEntries(Object.entries(existing).filter(([name, definition]) =>
    !definitions.has(name) && managedCache(b.root, name, definition)));
   const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
+  const replace = [];
+  if (pin) {
+   if (pinReferenced(config, pin.name)) managed.pin = pin;
+   else replace.push(pin.name);
+  }
   const updated = transform(config, managed, replace);
   // Keep the old pin definition until the config containing it is replaced.
   updates.set(configFile, YAML.stringify(updated));
@@ -585,4 +613,4 @@ async function remove(b, request) {
  return run(b, null, {removal: request});
 }
 
-module.exports = {discover, catalog, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan};
+module.exports = {discover, catalog, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan, unmanagedEntry};

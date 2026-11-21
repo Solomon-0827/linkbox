@@ -50,14 +50,17 @@ class ParallelTests(unittest.TestCase):
         state = {'mode': 'global', 'exit': c.t.EXIT, 'dialer': c.t.ENTRY, 'entry': 'healthy', 'live': ['healthy']}
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
+            cache = base / 'providers/linkbox'
+            cache.mkdir(parents=True)
             (base / 'clash-verge.yaml').write_text(yaml.safe_dump({
                 'proxies': [{'name': c.t.EXIT, 'server': '203.0.113.10', 'dialer-proxy': c.t.ENTRY}],
-                'proxy-providers': {'a': {'path': 'a.yaml'}, 'b': {'path': 'b.yaml'}},
+                'proxy-providers': {'a': {'path': 'providers/linkbox/a.yaml'}, 'b': {'path': 'providers/linkbox/b.yaml'}},
                 'proxy-groups': [{'name': c.t.ENTRY, 'use': ['a']}, {'name': 'secondary', 'use': ['b']}],
             }))
-            (base / 'a.yaml').write_text('proxies: [{name: healthy, server: example.invalid}]')
-            (base / 'b.yaml').write_text('proxies: [')
+            (cache / 'a.yaml').write_text('proxies: [{name: healthy, server: example.invalid}]')
+            (cache / 'b.yaml').write_text('proxies: [')
             with (patch.object(c.t, 'BASE', base), patch.object(c.runtime, 'BASE', base),
+                  patch.object(c.runtime, 'CONFIG_DIR', base),
                   patch.object(c, 'CONFIG_DIR', base), patch.object(c.t, 'relay_state', return_value=state),
                   patch.object(c, 'physical_network', return_value={'interface': 'en0'}),
                   patch.object(c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe):

@@ -168,6 +168,32 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             self.assertEqual(gui.change('入口乙', '入口甲')['state']['entry'], '入口乙')
         self.assertEqual(self.requests, [ENTRY_ROUTE])
 
+    def test_unmanaged_entry_uses_live_relays_with_native_http_provider(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxy-groups'][0]['use'] = ['native']
+        config['proxy-providers'] = {'native': {'type': 'http', 'url': 'https://example.invalid/native'}}
+        self.config.write_bytes(update.dump(config))
+        self.providers = {'native': {'proxies': [node('native-relay')]}}
+        names = ['current', 'fast', 'native-relay']
+        for saved in (False, True):
+            with self.subTest(saved=saved):
+                if saved:
+                    self.policy.write_text(json.dumps({'selected_nodes': {'a': ['current']}}))
+                self.active.update(entry='current', live=names)
+                with self.subTest(operation='list'):
+                    self.assertEqual([row['name'] for row in gui.snapshot()['node_rows']], names)
+                with (self.subTest(operation='benchmark'),
+                    patch.object(update.c, 'CONFIG_DIR', self.root),
+                    patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
+                    patch.object(update.c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe,
+                ):
+                    _, report, _ = update.c.run(1)
+                    self.assertEqual([call.args[0]['name'] for call in probe.call_args_list], ['current', 'fast'])
+                    self.assertEqual(set(report['results']), set(names))
+                with self.subTest(operation='switch'), patch.object(t, 'persist_selection'):
+                    self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
+                    self.assertEqual(gui.change('native-relay', 'fast')['state']['entry'], 'native-relay')
+
     def test_sync_uses_saved_selection_and_deletes_vanished_nodes_and_sources(self):
         self.apply({'a': ['current', 'fast', 'quick'], 'b': ['other']})
         index = yaml.safe_load(self.index.read_bytes())
@@ -265,17 +291,22 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         provider = yaml.safe_load((self.root / 'providers/linkbox/a.yaml').read_bytes())
         self.assertEqual([n['name'] for n in provider['proxies']], ['current'])
         self.assertEqual([n['name'] for n in picker.catalog()['sources'][0]['nodes']], ['current'])
+        if os.environ.get('LINKBOX_TEST_CORE'):
+            self.regenerate(cached)
+
+    def regenerate(self, profile):
+        script = self.root / 'profiles/Script.js'
+        regenerated = run_process(['node', '-e',
+            'const fs = require("node:fs"), vm = require("node:vm");'
+            'const context = {profile: JSON.parse(fs.readFileSync(0, "utf8"))};'
+            'const script = fs.readFileSync(process.argv[1], "utf8");'
+            'console.log(JSON.stringify(vm.runInNewContext(script + "\\nmain(profile)", context)));',
+            str(script)], input=json.dumps(profile), text=True, capture_output=True, check=True)
         if core := os.environ.get('LINKBOX_TEST_CORE'):
-            script = self.root / 'profiles/Script.js'
-            regenerated = run_process(['node', '-e',
-                'const fs = require("node:fs"), vm = require("node:vm");'
-                'const context = {profile: JSON.parse(fs.readFileSync(0, "utf8"))};'
-                'const script = fs.readFileSync(process.argv[1], "utf8");'
-                'console.log(JSON.stringify(vm.runInNewContext(script + "\\nmain(profile)", context)));',
-                str(script)], input=json.dumps(cached), text=True, capture_output=True, check=True)
             config = self.root / 'regenerated.yaml'
             config.write_text(regenerated.stdout)
             run_process([core, '-t', '-d', str(self.root), '-f', str(config)], capture_output=True, check=True)
+        return json.loads(regenerated.stdout)
 
     def test_first_run_keeps_downloaded_verge_chain(self):
         self.assert_verge_profile_keeps_downloaded_chain(lambda: self.assertTrue(picker.initialize()))
@@ -338,17 +369,22 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual([n['name'] for n in self.reload['proxy-providers']['b']['payload']], ['current'])
         self.assertEqual(self.active['entry'], 'current')
 
-    def test_first_run_falls_back_for_named_file_provider(self):
+    def test_first_run_unmappable_provider_claims_names_before_mapped_provider(self):
         config = yaml.safe_load(self.config.read_bytes())
-        config['proxy-groups'][0].update(use=['Verge cache'], proxies=[])
-        config['proxy-providers'] = {'Verge cache': {'type': 'file', 'path': 'profiles/a.yaml'}}
+        config['proxy-groups'][0].update(use=['Verge cache', 'b'], proxies=[])
+        config['proxy-providers'] = {
+            'Verge cache': {'type': 'file', 'path': 'profiles/a.yaml'},
+            'b': {'type': 'http', 'url': self.sources[1]['url']},
+        }
         self.config.write_bytes(update.dump(config))
-        self.active['live'] = ['current']
-        self.providers = {'Verge cache': {'vehicleType': 'File', 'proxies': [node('current')]}}
-        self.downloaded = {'a': ['current'], 'b': ['current']}
+        self.providers = {'Verge cache': {'vehicleType': 'File', 'proxies': [node('current')]},
+                          'b': {'proxies': [node('current'), node('fast')]}}
+        self.fetch.side_effect = lambda url: {'proxies': [node(name, url.rsplit('/', 1)[-1] + '.example.invalid')
+                                                          for name in ('current', 'fast')]}
 
         self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current']})
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current'], 'b': ['fast']})
+        self.assertEqual(self.reload['proxy-providers']['a']['payload'][0]['server'], 'a.example.invalid')
 
     def test_first_run_falls_back_when_live_provider_endpoint_fails(self):
         config = yaml.safe_load(self.config.read_bytes())
@@ -477,6 +513,31 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                     self.apply({'a': ['fast'], 'b': []})
                     self.assertEqual(self.reload['proxy-groups'][1], secondary)
                     self.assertEqual('current' in [n['name'] for n in self.reload['proxies']], accepts_pin)
+                    self.assertEqual(self.active['live'], ['fast'])
+
+    def test_legacy_pin_survives_save_and_verge_regeneration(self):
+        original = yaml.safe_load(self.config.read_bytes())
+        for reference in ('selector', 'include-all-proxies', 'MATCH,current', 'DOMAIN,example.invalid,current',
+                          'IP-CIDR,203.0.113.0/24,current,no-resolve',
+                          'AND,((DOMAIN,example.invalid),(NETWORK,TCP)),current'):
+            with self.subTest(reference=reference):
+                self.legacy({'selected_nodes': {'a': ['current', 'fast']}})
+                profile = {**original, 'proxies': original['proxies'][1:],
+                           'proxy-groups': [dict(original['proxy-groups'][0])]}
+                if reference == 'selector':
+                    profile['proxy-groups'].append({'name': 'secondary', 'type': 'select', 'proxies': ['current']})
+                elif reference == 'include-all-proxies':
+                    profile['proxy-groups'].append({'name': 'secondary', 'type': 'select', reference: True})
+                else:
+                    profile['rules'] = [reference]
+                self.config.write_bytes(update.dump({**profile, 'proxies': original['proxies']}))
+                self.active.update(live=['current', 'fast'], entry='current')
+                if core := os.environ.get('LINKBOX_TEST_CORE'):
+                    self.validate.side_effect = lambda argv, **kwargs: run_process([core, *argv[1:]], **kwargs)
+                for _ in range(2):
+                    self.apply({'a': ['fast'], 'b': []})
+                    self.assertIn(node('current'), yaml.safe_load(self.config.read_bytes())['proxies'])
+                    self.assertIn(node('current'), self.regenerate(profile)['proxies'])
                     self.assertEqual(self.active['live'], ['fast'])
 
     def test_other_groups_keep_retired_provider_in_config_and_script(self):

@@ -91,17 +91,17 @@ def entry_seed_owners(config, sources):
     for name in use:
         definition = providers.get(name)
         url = definition.get('url') if isinstance(definition, dict) else None
-        if url is not None and not isinstance(url, str):
-            continue
         try:
-            source = by_url.get(source_key(url)) if url else available.get(name)
+            if url in (None, ''):
+                source = available.get(name)
+            else:
+                source = by_url.get(source_key(url)) if isinstance(url, str) else None
         except ValueError:
-            continue
-        if source is None:
-            continue
+            source = None
+        # An unmappable first provider still reserves the name for picker fallback.
         for node in live_providers.get(name, []):
-            owners.setdefault(node['name'], source['name'])
-    return owners
+            owners.setdefault(node['name'], source['name'] if source else None)
+    return {name: owner for name, owner in owners.items() if owner is not None}
 
 
 def configure_entry(groups, use):
@@ -145,6 +145,7 @@ def script_text(original, managed):
             '    if(groups.some(g=>g.name!=="中转入口"&&(g.use?.includes(name)||g["include-all"]||g["include-all-providers"])))providers[name]=definition;\n'
             '    else delete providers[name];}\n'
             '  r["proxy-providers"]={...providers,...m.providers};\n'
+            '  if(m.pin)r.proxies=[...(r.proxies||[]).filter(p=>p.name!==m.pin.name),m.pin];\n'
             '  const g=groups.find(g=>g.name==="中转入口");\n'
             '  if(g){g.proxies=[];g.use=m.use;\n'
             '    for(const k of ["url","include-all","include-all-proxies","include-all-providers","filter","exclude-filter","exclude-type"])delete g[k];}\n'
@@ -171,21 +172,35 @@ def update_selector(index, name):
 
 
 def legacy_pin(original, config, saved_name):
-    if not saved_name or not original or MARK.encode() not in original:
-        return []
+    if not original or MARK.encode() not in original:
+        return None
     try:
         wrapper = original.decode().split(MARK, 1)[1]
         pin = json.JSONDecoder().raw_decode(wrapper.split('const m=', 1)[1])[0]['pin']
     except (ValueError, IndexError, KeyError, TypeError):
-        return []
-    if not isinstance(pin, dict) or pin.get('name') != saved_name or pin not in config.get('proxies', []):
-        return []
-    if (any(g['name'] != t.ENTRY and (saved_name in (g.get('proxies') or [])
-            or ((g.get('include-all-proxies') or g.get('include-all')) and group_filter(g)(saved_name)))
-            for g in config.get('proxy-groups', []))
-            or any(n.get('dialer-proxy') == saved_name for n in config.get('proxies', []))):
-        return []
-    return [saved_name]
+        return None
+    if (not isinstance(pin, dict) or not pin.get('name') or (saved_name and pin['name'] != saved_name)
+            or pin not in config.get('proxies', [])):
+        return None
+    return pin
+
+
+def rule_target(rule):
+    fields = [field.strip() for field in rule.split(',')]
+    if fields[0] in ('AND', 'OR', 'NOT'):
+        # Logical rule payloads contain nested, comma-separated rules.
+        match = re.match(r'.*\)\s*,\s*([^,]+)', rule)
+        return match[1].strip() if match else None
+    index = 1 if fields[0] == 'MATCH' else 2
+    return fields[index] if len(fields) > index else None
+
+
+def pin_referenced(config, name):
+    return (any(g['name'] != t.ENTRY and (name in (g.get('proxies') or [])
+                or ((g.get('include-all-proxies') or g.get('include-all')) and group_filter(g)(name)))
+                for g in config.get('proxy-groups', []))
+            or any(n.get('dialer-proxy') == name for n in config.get('proxies', []))
+            or any(isinstance(rule, str) and rule_target(rule) == name for rule in config.get('rules') or []))
 
 
 def check_chain(state):
@@ -251,6 +266,13 @@ def managed_cache(root, owner, definition):
     return bool(source) and (root / source).resolve() == (root / 'providers/linkbox' / (owner + '.yaml')).resolve()
 
 
+def unmanaged_entry(config, root):
+    entry = next((g for g in config.get('proxy-groups', []) if g['name'] == t.ENTRY), None)
+    providers = config.get('proxy-providers') or {}
+    return entry is not None and not any(managed_cache(root, owner, providers.get(owner) or {})
+                                         for owner in entry.get('use') or [])
+
+
 def provider_payload(definition, root, read_cache, *, filtered):
     payload = definition.get('payload')
     if source := definition.get('path'):
@@ -278,7 +300,11 @@ def entry_plan(config, root):
         providers = config.get('proxy-providers') or {}
         use = sorted(providers) if include_all or entry.get('include-all-providers') else entry.get('use') or []
         for owner in use:
-            for node in provider_payload(providers[owner], root, read, filtered=True):
+            try:
+                payload = provider_payload(providers[owner], root, read, filtered=True)
+            except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError, re.error, yaml.YAMLError):
+                continue
+            for node in payload:
                 if accepts(node['name']):
                     members.setdefault(node['name'], (owner, node))
         return members
@@ -409,7 +435,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 atomic(preview_file, dump(preview_data))
             raise RuntimeError(NO_SELECTION)
 
-        replacement = legacy_pin(baselines[script], config, policy.get('pinned_entry'))
+        pin = legacy_pin(baselines[script], config, policy.get('pinned_entry'))
         definitions, dns = {}, {}
         existing = config.get('proxy-providers', {})
         for source, doc in sources:
@@ -438,6 +464,12 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         retired = {name: definition for name, definition in existing.items()
                    if name not in definitions and managed_cache(root, name, definition)}
         managed = {'providers': definitions, 'retired': retired, 'dns': dns, 'use': use}
+        replacement = []
+        if pin:
+            if pin_referenced(config, pin['name']):
+                managed['pin'] = pin
+            else:
+                replacement.append(pin['name'])
         updated = transform(config, managed, replacement)
         # Keep the old pin definition until the config containing it is replaced.
         updates[config_file] = dump(updated)
