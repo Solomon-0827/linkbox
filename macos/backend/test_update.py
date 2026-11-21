@@ -199,10 +199,18 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             picker.synchronize()
 
         self.crash_during_save({'a': ['new'], 'b': []}, self.policy)
-        self.assertEqual(json.loads(self.policy.read_bytes())['pending_update']['selection'], {'a': ['new']})
         before = self.files()
-        before[self.policy.name] = saved
         self.requests.clear()
+        with self.assertRaisesRegex(RuntimeError, '管理节点'):
+            picker.initialize()
+        self.assertEqual(self.files(), before)
+        journal = json.loads(self.policy.read_bytes())['pending_update']
+        self.assertEqual(journal['selection'], {'a': ['new']})
+        self.assertTrue(journal['preview_id'])
+
+        (self.base / picker.PREVIEW).unlink()
+        del before[picker.PREVIEW]
+        before[self.policy.name] = saved
         with self.assertRaisesRegex(RuntimeError, '管理节点'):
             picker.initialize()
         self.assertEqual(self.files(), before)
@@ -274,6 +282,31 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast'], 'b': ['current']})
         self.assertEqual([n['name'] for n in self.reload['proxy-providers']['b']['payload']], ['current'])
         self.assertEqual(self.active['entry'], 'current')
+
+    def test_first_run_falls_back_when_live_provider_endpoint_fails(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxy-groups'][0]['use'] = ['b', 'a']
+        self.config.write_bytes(update.dump(config))
+        self.downloaded = {'a': ['current', 'fast'], 'b': ['current', 'fast']}
+
+        def unavailable(method, route, body=None, **kwargs):
+            if (method, route) == ('GET', '/providers/proxies'):
+                raise t.ClashHTTPError(404, b'not found')
+            return self.controller(method, route, body, **kwargs)
+
+        self.api.side_effect = unavailable
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current', 'fast']})
+
+    def test_first_run_falls_back_for_null_proxies_without_losing_other_owners(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxy-groups'][0]['use'] = ['a', 'b']
+        self.config.write_bytes(update.dump(config))
+        self.downloaded = {'a': ['current', 'fast'], 'b': ['current', 'fast']}
+        self.providers = {'a': {'proxies': None}, 'b': {'proxies': [node('fast')]}}
+
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current'], 'b': ['fast']})
 
     def test_first_run_does_not_confirm_owner_assignment_without_success_response(self):
         self.downloaded = {'a': ['current', 'fast', 'quick'], 'b': ['other']}
@@ -721,6 +754,42 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.validate.side_effect = None
         self.assertTrue(picker.initialize())
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
+
+    def test_refresh_retries_save_when_present_subscription_temporarily_omits_relay(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.requests.clear()
+        self.crash_during_save({'a': ['fast'], 'b': []}, self.policy)
+        self.write_profile('a', ['current'])
+        before = self.files()
+
+        with self.assertRaisesRegex(RuntimeError, '管理节点'):
+            picker.initialize()
+        self.assertEqual(self.files(), before)
+        self.assertEqual(self.requests, [])
+
+        self.write_profile('a', ['current', 'fast'])
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
+        self.assertEqual(self.active['entry'], 'fast')
+
+    def test_refresh_keeps_journal_when_registry_cannot_be_read(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.requests.clear()
+        self.crash_during_save({'a': [], 'b': ['other']}, self.policy)
+        before = self.files()
+        read_text = Path.read_text
+
+        def unreadable_registry(path, *args, **kwargs):
+            if path == self.base / 'subscriptions.json':
+                raise PermissionError(errno.EACCES, 'fixture registry read failure')
+            return read_text(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', unreadable_registry), self.assertRaises(RuntimeError):
+            picker.initialize()
+        self.assertEqual(self.files(), before)
+        self.assertEqual(self.requests, [])
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'b': ['other']})
 
     def test_refresh_keeps_journal_when_target_profile_cannot_be_read(self):
         self.apply({'a': ['current', 'fast'], 'b': []})

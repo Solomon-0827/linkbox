@@ -74,14 +74,26 @@ def entry_seed_owners(config, sources):
     use = group.get('use') or []
     if not use:
         return {}
+    try:
+        response = t.api('GET', '/providers/proxies')
+    except Exception:
+        return {}
+    live_providers = response.get('providers') if isinstance(response, dict) else None
+    if not isinstance(live_providers, dict):
+        return {}
     providers = config.get('proxy-providers') or {}
-    live_providers = t.api('GET', '/providers/proxies')['providers']
     owners = {}
     for name in use:
+        provider = live_providers.get(name)
+        proxies = provider.get('proxies') if isinstance(provider, dict) else None
+        if not isinstance(proxies, list) or any(
+                not isinstance(node, dict) or not isinstance(node.get('name'), str) or not node['name']
+                for node in proxies):
+            continue
         definition = providers.get(name, {})
         url = definition.get('url')
         source = by_url.get(source_key(url)) if url else available.get(name)
-        for node in live_providers.get(name, {}).get('proxies', []):
+        for node in proxies:
             owners.setdefault(node['name'], source['name'] if source else None)
     return owners
 
@@ -347,7 +359,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             raise RuntimeError(NO_SELECTION)
         config_file, script, profiles = root / 'clash-verge.yaml', root / 'profiles/Script.js', root / 'profiles.yaml'
         baselines = {path: read(path) for path in (config_file, script, profiles, policy_file)}
-        sources, fingerprint, preview = picker.discover(for_update=syncing, recovering=recovering)
+        sources, fingerprint, preview_id = picker.discover(for_update=syncing, recovering=recovering)
         if request is not None:
             selection = picker.validate_selection(sources, fingerprint, request, selection)
             if request['current'] != before['entry']:
@@ -378,7 +390,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             sources = refreshed
             if t.relay_state() != before or picker.discover(for_update=True)[1] != fingerprint:
                 raise RuntimeError(EXTERNAL_CHANGE)
-        if syncing or (request is not None and preview):
+        if syncing or (request is not None and preview_id):
             updates.update({root / 'profiles' / source['profile_file']: dump(doc) for source, doc in sources})
         try:
             config = yaml.safe_load(baselines[config_file] or b'')
@@ -400,15 +412,15 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 if needs_initialization:
                     preview_data['initialization_policy'] = initialization_policy
                 atomic(preview_file, dump(preview_data))
-            elif recovering and pending.get('selection') and selection_owners(selection):
-                # The target vanished from readable sources, as with an expired picker preview.
+            elif recovering and pending.get('preview_id'):
                 if not any(group['name'] == t.ENTRY for group in config.get('proxy-groups', [])):
                     raise RuntimeError('缺少中转入口组')
                 if (picker.discover(recovering=True)[1] != fingerprint or runtime.read_json(policy_file.name) != policy
                         or any(read(path) != raw for path, raw in baselines.items())):
                     raise RuntimeError(EXTERNAL_CHANGE)
-                atomic(policy_file, policy_bytes({key: value for key, value in policy.items()
-                                                  if key not in ('pending_update', 'reload_unconfirmed')}))
+                if picker.digest(read(preview_file)) != pending['preview_id']:
+                    atomic(policy_file, policy_bytes({key: value for key, value in policy.items()
+                                                      if key not in ('pending_update', 'reload_unconfirmed')}))
             raise RuntimeError(NO_SELECTION)
 
         replacement = legacy_pin(baselines[script], config, policy.get('pinned_entry'))
@@ -494,6 +506,8 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             last_saved = {key: value for key, value in policy.items()
                           if key not in ('pending_update', 'reload_unconfirmed', 'initialization_pending')}
             journal = {'root': str(root), 'selection': plan['selection']}
+            if request is not None and preview_id:
+                journal['preview_id'] = preview_id
             atomic(policy_file, policy_bytes({**last_saved, 'pending_update': journal}))
             written.append(policy_file)
         try:

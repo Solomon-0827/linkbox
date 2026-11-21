@@ -17,6 +17,10 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def digest(raw):
+    return None if raw is None else hashlib.sha256(raw).hexdigest()
+
+
 def document(raw):
     try:
         value = yaml.safe_load(raw) if raw is not None else None
@@ -40,8 +44,16 @@ def discover(for_update=False, *, recovering=False):
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
     # The saved registry can preserve IDs, but only Verge can list sources.
-    registry = runtime.read_json('subscriptions.json').get('sources', [])
-    by_url = {source_key(s['url']): s for s in registry if s.get('url')}
+    if recovering:
+        try:
+            registry = json.loads((runtime.BASE / 'subscriptions.json').read_text())
+        except FileNotFoundError:
+            registry = {}
+        except (OSError, ValueError):
+            raise RuntimeError('暂时无法读取订阅记录，请刷新后重试') from None
+    else:
+        registry = runtime.read_json('subscriptions.json')
+    by_url = {source_key(s['url']): s for s in registry.get('sources', []) if s.get('url')}
     sources = []
     seen = set()
     for item in items:
@@ -73,16 +85,16 @@ def discover(for_update=False, *, recovering=False):
         sources.append((source, raw))
     if len({s['name'] for s, _ in sources}) != len(sources):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
-    revisions = [[source, None if raw is None else hashlib.sha256(raw).hexdigest()] for source, raw in sources]
+    revisions = [[source, digest(raw)] for source, raw in sources]
     revision = fingerprint([str(root), revisions, runtime.read_json('node-policy.json')])
     if for_update:
-        return [(source, None) for source, _ in sources], revision, False
+        return [(source, None) for source, _ in sources], revision, None
     raw_preview = update.read(runtime.BASE / PREVIEW)
     preview = document(raw_preview)
-    use_preview = preview.get('revision') == revision
-    inventory = [(source, preview['documents'][source['name']] if use_preview
+    preview_id = digest(raw_preview) if preview.get('revision') == revision else None
+    inventory = [(source, preview['documents'][source['name']] if preview_id
                   else clean(document(raw))) for source, raw in sources]
-    return inventory, fingerprint([revision, hashlib.sha256(raw_preview).hexdigest() if use_preview else None]), use_preview
+    return inventory, fingerprint([revision, preview_id]), preview_id
 
 
 def clean(doc):

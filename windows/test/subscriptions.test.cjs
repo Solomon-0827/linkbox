@@ -322,6 +322,25 @@ test('Refresh keeps the journal after a GeoIP validation failure', async t => {
  assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
 });
 
+test('Refresh retries Save when a present subscription temporarily omits the relay', async t => {
+ const fx = await fixture(t);
+ const {b, data, apply, requests, saved, state, write} = fx;
+ await apply({a:['current','fast'], b:[]});
+ requests.length = 0;
+ await crashDuringSave(fx, {a:['fast'], b:[]}, fx.policy);
+ await write('profiles/a.yaml', {proxies:[node('current')]});
+ const before = await fixtureFiles(data);
+
+ await assert.rejects(sub.initialize(b), /管理节点/);
+ assert.deepEqual(await fixtureFiles(data), before);
+ assert.deepEqual(requests, []);
+
+ await write('profiles/a.yaml', {proxies:[node('current'), node('fast')]});
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
+ assert.equal(state.entry, 'fast');
+});
+
 test('Refresh keeps the journal when the target profile cannot be read', async t => {
  const fx = await fixture(t);
  const {b, data, root, policy, apply, requests, saved, state} = fx;
@@ -470,6 +489,32 @@ test('first run keeps the live owner for HTTP providers without paths', async t 
  assert.deepEqual((await saved()).selected_nodes, {a:['fast'], b:['current']});
  assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-providers'].b.payload.map(n => n.name), ['current']);
  assert.equal(state.entry, 'current');
+});
+
+test('first run falls back when the live provider endpoint fails', async t => {
+ const {b, config, write, refreshWith, saved} = await fixture(t);
+ config['proxy-groups'][0].use = ['b','a'];
+ await write('clash-verge.yaml', config);
+ refreshWith({a:['current','fast'], b:['current','fast']});
+ const controller = b.request;
+ b.request = async (...args) => {
+  if (args[1] === 'GET' && args[2] === '/providers/proxies') throw new ClashHTTPError(404, true);
+  return controller(...args);
+ };
+
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+});
+
+test('first run falls back for null proxies without losing other owners', async t => {
+ const {b, config, write, refreshWith, saved, setProviders} = await fixture(t);
+ config['proxy-groups'][0].use = ['a','b'];
+ await write('clash-verge.yaml', config);
+ refreshWith({a:['current','fast'], b:['current','fast']});
+ setProviders({a:{proxies:null}, b:{proxies:[node('fast')]}});
+
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['fast']});
 });
 
 test('first run does not confirm owner assignment without a success response', async t => {
@@ -638,10 +683,18 @@ test('a crashed preview Save clears the journal and reopens Manage Nodes', async
  refreshWith({a:['new'], b:['other']});
  await assert.rejects(b.updateSubscriptions(), /管理节点/);
  await crashDuringSave(fx, {a:['new'], b:[]}, policy);
- assert.deepEqual((await saved()).pending_update.selection, {a:['new']});
  const before = await fixtureFiles(data);
- before[policy] = Buffer.from(JSON.stringify(savedBefore, null, 2));
  requests.length = 0;
+ await assert.rejects(sub.initialize(b), /管理节点/);
+ assert.deepEqual(await fixtureFiles(data), before);
+ const journal = (await saved()).pending_update;
+ assert.deepEqual(journal.selection, {a:['new']});
+ assert.ok(journal.preview_id);
+
+ const preview = path.join(data, 'subscription-preview.yaml');
+ await fs.unlink(preview);
+ delete before[preview];
+ before[policy] = Buffer.from(JSON.stringify(savedBefore, null, 2));
  await assert.rejects(sub.initialize(b), /管理节点/);
  assert.deepEqual(await saved(), savedBefore);
  assert.deepEqual(await fixtureFiles(data), before);

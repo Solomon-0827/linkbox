@@ -68,11 +68,11 @@ async function discover(b, forUpdate = false, recovering = false) {
  if (forUpdate) return {sources: sources.map(({source}) => ({source})), fingerprint: revision};
  const rawPreview = await read(path.join(b.dataDir, PREVIEW));
  const preview = parseProfile(rawPreview);
- const usePreview = preview?.revision === revision;
+ const previewId = preview?.revision === revision ? digest(rawPreview) : null;
  const inventory = sources.map(({source, raw}) => ({
-  source, document: usePreview ? preview.documents[source.name] : clean(parseProfile(raw)),
+  source, document: previewId ? preview.documents[source.name] : clean(parseProfile(raw)),
  }));
- return {sources: inventory, fingerprint: hash([revision, usePreview ? digest(rawPreview) : null]), usePreview};
+ return {sources: inventory, fingerprint: hash([revision, previewId]), previewId};
 }
 function inventoryFor(sources) {
  return sources.map(({source, document}) => document ?
@@ -97,13 +97,17 @@ async function entrySeedOwners(b, config, sources) {
  const use = config['proxy-groups']?.find(g => g.name === ENTRY)?.use || [];
  const owners = new Map();
  if (!use.length) return owners;
+ let liveProviders;
+ try { liveProviders = (await b.api('GET', '/providers/proxies'))?.providers; }
+ catch { return owners; }
+ if (!liveProviders || typeof liveProviders !== 'object' || Array.isArray(liveProviders)) return owners;
  const providers = config['proxy-providers'] || {};
- const {providers: liveProviders} = await b.api('GET', '/providers/proxies');
  for (const name of use) {
+  const proxies = Object.hasOwn(liveProviders, name) ? liveProviders[name]?.proxies : undefined;
+  if (!Array.isArray(proxies) || proxies.some(node => typeof node?.name !== 'string' || !node.name)) continue;
   const definition = Object.hasOwn(providers, name) ? providers[name] : {};
   const source = definition.url ? byURL.get(sourceKey(definition.url)) : byID.get(name);
-  const provider = Object.hasOwn(liveProviders, name) ? liveProviders[name] : undefined;
-  for (const {name: relay} of provider?.proxies || []) {
+  for (const {name: relay} of proxies) {
    if (!owners.has(relay)) owners.set(relay, source?.name ?? null);
   }
  }
@@ -417,7 +421,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    if (sig(await b.state()) !== sig(before) ||
        (await discover(b, true)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   }
-  if (syncing || (request !== null && discovered.usePreview)) {
+  if (syncing || (request !== null && discovered.previewId)) {
    for (const {source, document} of sources) {
     updates.set(path.join(b.root, 'profiles', source.profile_file), YAML.stringify(document));
    }
@@ -440,16 +444,17 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
      revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
      ...(needsInitialization ? {initialization_policy: initializationPolicy} : {}),
     }));
-   } else if (recovering && pending?.selection && selectionOwners(selection).size) {
-    // The target vanished from readable sources, as with an expired picker preview.
+   } else if (recovering && pending?.preview_id) {
     if (!config['proxy-groups']?.some(group => group.name === ENTRY)) throw Error('缺少中转入口组');
     if ((await discover(b, false, true)).fingerprint !== discovered.fingerprint ||
         !isDeepStrictEqual(await policy(b), saved)) throw Error(EXTERNAL_CHANGE);
     for (const [file, raw] of baselines) {
      if (!equal(raw, await read(file))) throw Error(EXTERNAL_CHANGE);
     }
-    const {pending_update, reload_unconfirmed, ...lastSaved} = saved;
-    await atomic(policyFile, JSON.stringify(lastSaved, null, 2));
+    if (digest(await read(previewFile)) !== pending.preview_id) {
+     const {pending_update, reload_unconfirmed, ...lastSaved} = saved;
+     await atomic(policyFile, JSON.stringify(lastSaved, null, 2));
+    }
    }
    throw Error(NO_SELECTION);
   }
@@ -543,6 +548,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   if (!recovering) {
    const {pending_update, reload_unconfirmed, initialization_pending, ...lastSaved} = saved;
    const journal = {root: b.root, selection: plan.selection};
+   if (request !== null && discovered.previewId) journal.preview_id = discovered.previewId;
    await atomic(policyFile, JSON.stringify({...lastSaved, pending_update: journal}, null, 2));
    written.push(policyFile);
   }
