@@ -11,13 +11,19 @@ def reconcile(sources, selection, live, current, metric='chain', results=None):
     candidates = []
     owners = {}
     occurrences = {}
+    reserved = {name: source['id'] for source in sources if source.get('unreadable')
+                for name in selection.get(source['id'], [])}
     for source in sources:
         owner = source['id']
         requested = live if seed else set(selection.get(owner, []))
-        for name in source['nodes']:
+        unreadable = source.get('unreadable')
+        if unreadable and owner in selection:
+            selected[owner] = selection[owner]
+        for name in selection.get(owner, []) if unreadable else source['nodes']:
             occurrences[name] = occurrences.get(name, 0) + 1
-            if name in requested and name not in owners:
-                selected.setdefault(owner, []).append(name)
+            if name in requested and name not in owners and reserved.get(name, owner) == owner:
+                if not unreadable:
+                    selected.setdefault(owner, []).append(name)
                 candidates.append({'name': name, 'owner': owner})
                 owners[name] = owner
 
@@ -29,7 +35,7 @@ def reconcile(sources, selection, live, current, metric='chain', results=None):
         for name, owner in owners.items():
             row = results.get(name, {})
             measured_owner = row.get('owner')
-            if measured_owner != owner and not (measured_owner is None and occurrences[name] == 1):
+            if measured_owner != owner and not (measured_owner is None and occurrences[name] == 1 and name not in reserved):
                 continue
             delay = row.get('entrance' if metric == 'entrance' else 'chain')
             if type(delay) in (int, float) and 0 < delay < best:

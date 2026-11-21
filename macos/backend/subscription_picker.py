@@ -66,7 +66,11 @@ def discover(for_update=False):
         if key in seen:
             continue
         seen.add(key)
-        sources.append((source, update.read(profile)))
+        try:
+            raw = update.read(profile)
+        except OSError:
+            raw = None
+        sources.append((source, raw))
     if len({s['name'] for s, _ in sources}) != len(sources):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, None if raw is None else hashlib.sha256(raw).hexdigest()] for source, raw in sources]
@@ -77,45 +81,51 @@ def discover(for_update=False):
     preview = document(raw_preview)
     use_preview = preview.get('revision') == revision
     inventory = [(source, preview['documents'][source['name']] if use_preview
-                  else clean(document(raw), source['display_name'])) for source, raw in sources]
+                  else clean(document(raw))) for source, raw in sources]
     return inventory, fingerprint([revision, hashlib.sha256(raw_preview).hexdigest() if use_preview else None]), use_preview
 
 
-def clean(doc, label):
+def clean(doc):
     nodes = []
     names = set()
     entries = doc.get('proxies')
-    for n in entries if isinstance(entries, list) else []:
+    if not isinstance(entries, list):
+        return None
+    for n in entries:
         if (not isinstance(n, dict) or not isinstance(n.get('name'), str)
                 or not all(n.get(k) for k in ('name', 'type', 'server', 'port'))):
-            continue
+            return None
         if n['name'] in (t.ENTRY, t.EXIT, 'DIRECT', 'REJECT') or update.NOTICE.search(n['name']):
             continue
         if n['name'] in names:
-            raise RuntimeError('订阅含重名节点，请先在 Clash Verge 修复：' + label)
+            return None
         names.add(n['name'])
         nodes.append(n)
     return {**doc, 'proxies': nodes}
 
 
-def plan(sources, selection, state, metric='chain', results=None):
-    inventory = [{'id': source['name'], 'nodes': [n['name'] for n in doc['proxies']]}
-                 for source, doc in sources]
-    return reconcile(inventory, selection, state['live'], state['entry'], metric, results)
+def inventory(sources):
+    return [{'id': source['name'], 'nodes': [n['name'] for n in doc['proxies']]} if doc is not None
+            else {'id': source['name'], 'nodes': [], 'unreadable': True} for source, doc in sources]
 
 
 def catalog():
     sources, fingerprint, _ = discover()
     state = t.relay_state()
     saved = runtime.read_json('node-policy.json').get('selected_nodes')
-    owners = selection_owners(plan(sources, saved, state)['selection'])
+    owners = selection_owners(reconcile(inventory(sources), saved, state['live'], state['entry'])['selection'])
     current = state['entry']
     current_source = owners.get(current)
     if current_source is None:
-        current_source = next((s['name'] for s, doc in sources if any(n['name'] == current for n in doc['proxies'])), None)
+        current_source = next((s['name'] for s, doc in sources if doc is not None
+                               and any(n['name'] == current for n in doc['proxies'])), None)
     result = []
     for source, doc in sources:
         owner = source['name']
+        if doc is None:
+            result.append({'id': owner, 'name': source['display_name'], 'nodes': [],
+                           'warning': '本地缓存暂不可读，保留原勾选'})
+            continue
         nodes = [{'name': n['name'], 'type': n['type'], 'selected': owners.get(n['name']) == owner,
                   'current': n['name'] == current and owner == current_source} for n in doc['proxies']]
         result.append({'id': owner, 'name': source['display_name'], 'nodes': nodes,
@@ -123,14 +133,22 @@ def catalog():
     return {'sources': result, 'fingerprint': fingerprint, 'current': current}
 
 
-def validate_selection(sources, fingerprint, request):
+def validate_selection(sources, fingerprint, request, saved):
     if request.get('fingerprint') != fingerprint or 'current' not in request:
         raise RuntimeError('订阅或筛选已变化，请重新打开管理节点')
     selection = request.get('selected')
     if not isinstance(selection, dict) or set(selection) != {s['name'] for s, _ in sources}:
         raise RuntimeError('节点选择无效，请重新打开管理节点')
+    selection = selection.copy()
     for source, doc in sources:
-        values = selection[source['name']]
+        owner = source['name']
+        if doc is None:
+            if owner in (saved or {}):
+                selection[owner] = saved[owner]
+            else:
+                del selection[owner]
+            continue
+        values = selection[owner]
         available = {n['name'] for n in doc['proxies']}
         if not isinstance(values, list) or any(not isinstance(n, str) or n not in available for n in values):
             raise RuntimeError('订阅节点已变化或格式无效')

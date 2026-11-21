@@ -4,10 +4,33 @@ import unittest
 import yaml
 
 import subscription_picker as picker
+import subscription_update as update
 import test_update
 
 
 class PickerTests(test_update.SubscriptionFixture, unittest.TestCase):
+    def test_saving_other_subscription_keeps_unreadable_cache_selection_and_provider(self):
+        self.write_profile('b', ['same', 'other'])
+        self.apply({'a': ['current', 'fast'], 'b': ['same', 'other']})
+        before = yaml.safe_load(self.config.read_bytes())['proxy-providers']['b']
+        self.write_profile('a', ['current', 'fast', 'same'])
+        (self.root / 'profiles/b.yaml').write_text('proxies: [')
+        catalog = picker.catalog()['sources'][1]
+        self.assertEqual(catalog['nodes'], [])
+        self.apply({'a': ['current', 'fast', 'same'], 'b': []})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'],
+                         {'a': ['current', 'fast'], 'b': ['same', 'other']})
+        update.run(removal={'names': ['fast'], 'entry': 'current'})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'],
+                         {'a': ['current'], 'b': ['same', 'other']})
+        self.assertEqual(yaml.safe_load(self.config.read_bytes())['proxy-providers']['b'], before)
+        self.assertIn('保留原勾选', catalog['warning'])
+        self.downloaded = {'a': ['fast']}
+        saved = self.files()
+        with self.assertRaisesRegex(RuntimeError, '下载'):
+            picker.synchronize()
+        self.assertEqual(self.files(), saved)
+
     def test_catalog_keeps_both_copies_and_preselects_only_the_owner(self):
         self.write_profile('b', ['current', 'other'])
         catalog = picker.catalog()

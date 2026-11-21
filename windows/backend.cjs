@@ -28,11 +28,33 @@ function autoCandidate(results,current,metric){
  return !valid(currentRow.chainDelay)||(valid(baseline)&&baseline-best[1][key]>=Math.max(20,baseline*.10))?best[0]:null;
 }
 function signature(s){return JSON.stringify([s.mode,s.tun,s.entry,s.exit,s.dialer,s.live,s.entryRevision]);}
-function liveEntryProviders(revision, group){
- // Mihomo exposes the selector's testUrl and member names, but omits its provider list.
- if(!revision||revision!==group?.url||!revision.startsWith(ENTRY_REVISION_PREFIX))return [];
- const use=revision.slice(ENTRY_REVISION_PREFIX.length).split(':')[1]?.split(',')||[];
- return isDeepStrictEqual(use,group.use)?use:[];
+function liveEntryProviders(revision, group, live, providers){
+ const use = group?.use || [];
+ if (!use.length || !revision || revision !== group.url || !revision.startsWith(ENTRY_REVISION_PREFIX) ||
+     providers[ENTRY]?.proxies?.length) return [];
+ const names = new Map(Object.entries(providers).filter(([, provider]) => provider.vehicleType !== 'Compatible')
+  .map(([owner, provider]) => [owner, (provider.proxies || []).map(node => node.name)]));
+ if (!use.every(owner => names.get(owner)?.length) ||
+     !isDeepStrictEqual(live, use.flatMap(owner => names.get(owner)))) return [];
+ // Mihomo exposes ordered member names. Reject if another provider sequence explains them too.
+ const byFirst = new Map();
+ for (const members of names.values()) {
+  if (!members.length) continue;
+  if (!byFirst.has(members[0])) byFirst.set(members[0], []);
+  byFirst.get(members[0]).push(members);
+ }
+ const paths = Array(live.length + 1).fill(0);
+ paths[0] = 1;
+ for (const [i, name] of live.entries()) {
+  if (!paths[i]) continue;
+  for (const members of byFirst.get(name) || []) {
+   const end = i + members.length;
+   if (members.every((member, offset) => live[i + offset] === member)) {
+    paths[end] = Math.min(2, paths[end] + paths[i]);
+   }
+  }
+ }
+ return paths.at(-1) === 1 ? use : [];
 }
 function entryOwners(live, providers, use){
  const names = new Set(), ambiguous = new Set();
@@ -119,7 +141,7 @@ class Backend{
   const [c,p,providers]=await Promise.all([read('/configs'),read('/proxies'),read('/providers/proxies')]);
   const all=p.proxies||{},g=all[ENTRY]||{},live=g.all||[];
   const owners=selectionOwners(this.nodePolicy.selected_nodes);
-  const use=liveEntryProviders(g.testUrl,cfg['proxy-groups']?.find(group=>group.name===ENTRY));
+  const use=liveEntryProviders(g.testUrl,cfg['proxy-groups']?.find(group=>group.name===ENTRY),live,providers.providers||{});
   const liveOwners=entryOwners(live,providers.providers||{},use);
   const liveRows=new Map();
   for(const [owner,provider] of Object.entries(providers.providers||{})){

@@ -70,7 +70,7 @@ class ParallelTests(unittest.TestCase):
                 api.assert_not_called()
 
     def test_manual_and_auto_switch_verify_owners_before_and_after_put(self):
-        revision = g.t.ENTRY_REVISION_PREFIX + '0123456789abcdef0123456789abcdef:a,b'
+        revision = g.t.ENTRY_REVISION_PREFIX + '0123456789abcdef0123456789abcdef'
         state = {'mode': 'global', 'exit': g.t.EXIT, 'dialer': g.t.ENTRY, 'entry': 'current',
                  'nodes': ['current', 'same'], 'live': ['current', 'same'], 'entry_revision': revision}
         nodes = {'current': {'server': 'current.invalid'}, 'same': {'server': 'a.invalid'}}
@@ -83,8 +83,8 @@ class ParallelTests(unittest.TestCase):
             for changed_after_put in (False, True):
                 with self.subTest(automatic=mode is not None, changed_after_put=changed_after_put):
                     active = state.copy()
-                    providers = {'a': {'proxies': [{'name': 'same', 'provider-name': 'a'}]}}
-                    other = {'proxies': [{'name': 'same', 'provider-name': 'b'}]}
+                    providers = {'a': {'proxies': [{'name': 'current'}, {'name': 'same'}]}}
+                    other = {'proxies': [{'name': 'current'}, {'name': 'same'}]}
                     if not changed_after_put:
                         providers['b'] = other
                     writes = []
@@ -102,7 +102,7 @@ class ParallelTests(unittest.TestCase):
                           patch.object(c, 'active_state', return_value=(state, state['nodes'])),
                           patch.object(g.runtime, 'read_json', return_value=selection),
                           patch.object(g.t, 'api', side_effect=api),
-                          patch.object(g.t, 'entry_config', return_value={'use': ['a', 'b'], 'url': revision}),
+                          patch.object(g.t, 'entry_config', return_value={'use': ['a'], 'url': revision}),
                           patch.object(g.t, 'persist_selection') as persist):
                         with self.assertRaisesRegex(RuntimeError, '归属'):
                             g.change('same', 'current', mode)

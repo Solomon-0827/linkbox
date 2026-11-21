@@ -1,0 +1,20 @@
+{
+  "inputs": {
+    "sources": [
+      {"id": "a", "nodes": ["fast", "same"]},
+      {"id": "b", "nodes": [], "unreadable": true}
+    ],
+    "selection": {"a": ["fast", "same", "vanished"], "b": ["other", "same"]},
+    "live": ["fast", "other", "same"],
+    "current": "same"
+  },
+  "expected": {
+    "selection": {"a": ["fast"], "b": ["other", "same"]},
+    "candidates": [
+      {"name": "fast", "owner": "a"},
+      {"name": "other", "owner": "b"},
+      {"name": "same", "owner": "b"}
+    ],
+    "entry": "same"
+  }
+}

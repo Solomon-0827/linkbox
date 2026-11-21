@@ -32,8 +32,12 @@ def write_json(path, obj):
 
 
 def clear_latest_results():
-    for filename in ('chain-results.json', 'latency-results.json'):
-        write_json(t.BASE / filename, {'results': {}})
+    write_json(t.BASE / 'latest-benchmark.json', {'kind': None})
+
+
+def save_benchmark(kind, record):
+    write_json(t.BASE / (kind + '-results.json'), record)
+    write_json(t.BASE / 'latest-benchmark.json', {'kind': kind})
 
 
 def physical_network():
@@ -273,7 +277,7 @@ def run(concurrency=runtime.CONCURRENCY):
         after,_=active_state();unchanged=after==before
         record={'finished_at':dt.datetime.now().astimezone().isoformat(),'started_at':started,'network':network,'expected_ip':expected,'results':results,
                 'before':before,'after':after,'selection_unchanged':unchanged,'reason':reason}
-        write_json(t.BASE/'chain-results.json',record)
+        save_benchmark('chain', record)
         directory=t.BASE/'chain-reports';directory.mkdir(exist_ok=True)
         write_json(directory/(dt.datetime.now().strftime('%Y%m%d-%H%M%S')+'.json'),record)
         good=sum(x['chain_delay'] is not None for x in results.values())

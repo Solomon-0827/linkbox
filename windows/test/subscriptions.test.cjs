@@ -92,6 +92,27 @@ async function fixture(t) {
   refreshWith: value => {refreshed = value;}, saved: async () => JSON.parse(await fs.readFile(policy, 'utf8'))};
 }
 
+test('saving another subscription keeps unreadable cache selection and provider', async t => {
+ const {b, root, write, apply, saved, refreshWith} = await fixture(t);
+ await apply({a:['current','fast'], b:['same','other']});
+ const before = (await b.config())['proxy-providers'].b;
+ await write('profiles/a.yaml', {proxies:['current','fast','same'].map(n => node(n))});
+ await fs.writeFile(path.join(root, 'profiles/b.yaml'), 'proxies: [');
+ const {sources:[, unreadable]} = await sub.catalog(b);
+ assert.deepEqual(unreadable.nodes, []);
+ await apply({a:['current','fast','same'], b:[]});
+ assert.deepEqual((await saved()).selected_nodes, {a:['current','fast'], b:['same','other']});
+ await sub.remove(b, {entry:'current', names:['fast']});
+ assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['same','other']});
+ assert.deepEqual((await b.config())['proxy-providers'].b, before);
+ assert.match(unreadable.warning, /保留原勾选/);
+ refreshWith({a:['fast']});
+ const original = await saved();
+ await assert.rejects(b.updateSubscriptions(), /下载/);
+ assert.deepEqual(await saved(), original);
+ assert.deepEqual((await b.config())['proxy-providers'].b, before);
+});
+
 test('catalog exposes both copies and selects exactly one owner', async t => {
  const {b, write, apply, state} = await fixture(t);
  await write('profiles/b.yaml', {proxies: [node('current'), node('other')]});
@@ -455,13 +476,40 @@ test('initialization retries after files are written but reload is unconfirmed',
  };
  await assert.rejects(sub.initialize(b), /尚未确认/);
  assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
- await assert.rejects(sub.initialize(b), /请先刷新状态/);
- assert.equal(reloads.length, 1);
+ await assert.rejects(sub.initialize(b), /尚未确认/);
+ assert.equal(reloads.length, 2);
  await controller(...reloads[0]);
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(await sub.initialize(b), false);
- assert.equal(requests.length, 2);
+ assert.equal(requests.length, 1);
+});
+
+for (const late of [false, true]) test(`Refresh finishes an existing user's pending update (${late ? 'late reload' : 'lost request'})`, async t => {
+ const {b, root, apply, requests, state, saved} = await fixture(t);
+ await apply({a:['current','fast','quick'], b:[]});
+ b.history = {latestResults:{fast:{chainDelay:10,owner:'a'}}};
+ const controller = b.request, pending = [];
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') { pending.push(args); throw Error('timeout'); }
+  return controller(...args);
+ };
+ await assert.rejects(apply({a:['fast','quick'], b:[]}), /尚未确认/);
+ assert.equal(pending.length, 1);
+ if (late) {
+  await controller(...pending[0]);
+  assert.equal(state.entry, 'fast');
+ }
+ requests.length = 0;
+ b.history = {latestResults:{quick:{chainDelay:10,owner:'a'}}};
+ b.request = controller;
+ assert.equal(await sub.initialize(b), true);
+ assert.equal(state.entry, 'quick');
+ assert.deepEqual(requests.map(({route}) => route), [...(late ? [] : ['/configs?force=false']), ENTRY_ROUTE]);
+ const index = YAML.parse(await fs.readFile(path.join(root, 'profiles.yaml'), 'utf8'));
+ assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'quick'}]);
+ assert.equal((await saved()).pending_update, undefined);
+ assert.equal(await sub.initialize(b), false);
 });
 
 test('unconfirmed reload blocks switching and reconcile until Refresh confirms it', async t => {
@@ -485,9 +533,10 @@ test('unconfirmed reload blocks switching and reconcile until Refresh confirms i
  await assert.rejects(b.benchmark('chain', () => true), guard);
  b.state = observe;
  await assert.rejects(apply({a:['fast'], b:[]}), guard);
- await assert.rejects(sub.initialize(b), guard);
+ await assert.rejects(b.updateSubscriptions(), guard);
+ await assert.rejects(sub.initialize(b), /尚未确认/);
  assert.equal(requests.length, 0);
- assert.equal(reloads.length, 1);
+ assert.equal(reloads.length, 2);
  await controller(...reloads[0]);
  delete b.state;
  await assert.rejects(b.switchNode('fast','current'), guard);
@@ -497,7 +546,7 @@ test('unconfirmed reload blocks switching and reconcile until Refresh confirms i
 });
 
 test('initialization replans from the latest results after a failed switch', async t => {
- const {b, legacy, refreshWith, state, saved} = await fixture(t);
+ const {b, legacy, refreshWith, state, saved, requests} = await fixture(t);
  await legacy({selected_nodes:{a:['current','fast','quick'], b:['other']}});
  refreshWith({a:['fast','quick'], b:['other']});
  b.history = {kind:'chain', latestResults:{quick:{owner:'a', chainDelay:10}}};
@@ -508,11 +557,16 @@ test('initialization replans from the latest results after a failed switch', asy
  };
  await assert.rejects(sub.initialize(b), /无法切换/);
  assert.equal(state.entry, 'fast');
- assert.equal((await saved()).initialization_pending, true);
+ const policy = await saved();
+ assert.equal(policy.initialization_pending, true);
+ assert.equal(policy.pending_update.switch_owed, true);
+ assert.equal(policy.reload_unconfirmed, undefined);
  b.history = {kind:'chain', latestResults:{other:{owner:'b', chainDelay:5}}};
  b.request = controller;
+ requests.length = 0;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'other');
+ assert.deepEqual(requests.map(({route}) => route), [ENTRY_ROUTE]);
  assert.equal(await sub.initialize(b), false);
 });
 

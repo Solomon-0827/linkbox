@@ -70,13 +70,28 @@ def entry_config():
     return next((g for g in config.get('proxy-groups', []) if g['name'] == ENTRY), {})
 
 
-def live_entry_providers(revision, group):
-    # Mihomo exposes the selector's testUrl and member names, but omits its provider list.
-    if not revision or revision != group.get('url') or not revision.startswith(ENTRY_REVISION_PREFIX):
+def live_entry_providers(revision, group, live, providers):
+    use = group.get('use') or []
+    if (not use or not revision or revision != group.get('url') or not revision.startswith(ENTRY_REVISION_PREFIX)
+            or providers.get(ENTRY, {}).get('proxies')):
         return []
-    _, separator, owners = revision[len(ENTRY_REVISION_PREFIX):].partition(':')
-    use = owners.split(',') if separator and owners else []
-    return use if use == group.get('use') else []
+    names = {owner: [node['name'] for node in provider.get('proxies', [])]
+             for owner, provider in providers.items() if provider.get('vehicleType') != 'Compatible'}
+    if not all(names.get(owner) for owner in use) or live != [name for owner in use for name in names[owner]]:
+        return []
+    # Mihomo exposes ordered member names. Reject if another provider sequence explains them too.
+    by_first = {}
+    for members in names.values():
+        if members:
+            by_first.setdefault(members[0], []).append(members)
+    paths = [1] + [0] * len(live)
+    for i, name in enumerate(live):
+        if paths[i]:
+            for members in by_first.get(name, []):
+                end = i + len(members)
+                if live[i:end] == members:
+                    paths[end] = min(2, paths[end] + paths[i])
+    return use if paths[-1] == 1 else []
 
 
 def require_confirmed_reload():
@@ -96,12 +111,11 @@ def switch_lock():
         yield
 
 
-def entry_member_owned(live, providers, use, name, owner):
+def entry_member_owned(state, providers, group, name, owner):
+    live = state['live']
     if not owner or live.count(name) != 1:
         return False
-    # Mihomo exposes static group members through a Compatible provider.
-    if any(node['name'] == name for node in providers.get(ENTRY, {}).get('proxies', [])):
-        return False
+    use = live_entry_providers(state.get('entry_revision'), group, live, providers)
     possible = [key for key in use if any(node['name'] == name
                 for node in providers.get(key, {}).get('proxies', []))]
     return possible == [owner]
@@ -203,15 +217,16 @@ def switch_entry(current, target, owner):
     import runtime
     if selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner:
         raise RuntimeError('节点归属已变化，请先更新订阅')
-    if not entry_member_owned(fresh_p[ENTRY].get('all', []), proxy_providers(),
-                              live_entry_providers(fresh_p[ENTRY].get('testUrl'), entry_config()), target, owner):
+    def entry_group_state(proxies):
+        return {'live': proxies[ENTRY].get('all', []), 'entry_revision': proxies[ENTRY].get('testUrl')}
+
+    if not entry_member_owned(entry_group_state(fresh_p), proxy_providers(), entry_config(), target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
     if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
             or after_p[EXIT].get('dialer-proxy') != ENTRY or after_c.get('mode') != 'global'
-            or not entry_member_owned(after_p[ENTRY].get('all', []), proxy_providers(),
-                                      live_entry_providers(after_p[ENTRY].get('testUrl'), entry_config()), target, owner)):
+            or not entry_member_owned(entry_group_state(after_p), proxy_providers(), entry_config(), target, owner)):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:

@@ -15,26 +15,29 @@ from reconcile import selection_owners
 def node_rows(p, selection):
     owners = selection_owners(selection)
     inventory = t.node_inventory(p, owners)
-    cache={}
-    try:cache=json.loads((t.BASE/'latency-results.json').read_text()).get('results',{})
-    except (OSError,ValueError):pass
-    chains={}
-    try:chains=json.loads((t.BASE/'chain-results.json').read_text()).get('results',{})
-    except (OSError,ValueError):pass
+    records = [runtime.read_json(file) for file in ('latency-results.json', 'chain-results.json')]
+
+    def finished_at(record):
+        try:
+            return datetime.datetime.fromisoformat(record.get('finished_at', '')).timestamp()
+        except (TypeError, ValueError):
+            return 0
+
+    records.sort(key=finished_at)
     rows=[]
     for name, provider in owners.items():
         node, _ = inventory.get(name, ({}, None))
         history=node.get('history',[])
         last=history[-1] if history else {}
-        saved=cache.get(name)
         # Prefer this tool's explicitly measured baseline; label its timestamp in the UI.
         row={'name':name,'provider':runtime.provider_label(provider),
              'delay':last.get('delay') or None,'time':last.get('time',''),
              'status':'历史可达' if last.get('delay',0)>0 else '未验证',
              'source':'Clash 历史健康检查','error':''}
-        if saved and saved.get('owner') in (None, provider):row.update(saved)
-        chain = chains.get(name, {})
-        if chain.get('owner') in (None, provider):row.update(chain)
+        for record in records:
+            saved = record.get('results', {}).get(name, {})
+            if saved.get('owner') in (None, provider):
+                row.update(saved)
         rows.append(row)
     return rows
 
@@ -49,7 +52,7 @@ def snapshot(include_nodes=True):
     return data
 
 def latency():
-    from chain_test import clear_latest_results, write_json
+    from chain_test import clear_latest_results, save_benchmark
     lock=open(t.BASE/'latency.lock','a')
     try:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -92,7 +95,7 @@ def latency():
                 wait(pending,timeout=.2,return_when=FIRST_COMPLETED)
         after=snapshot(False)
         unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live','entry_revision'])
-        write_json(t.BASE/'latency-results.json', {
+        save_benchmark('latency', {
             'finished_at': datetime.datetime.now().astimezone().isoformat(),
             'results': results, 'selection_unchanged': unchanged,
         })
@@ -116,8 +119,7 @@ def change(target,previous,guard=None):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
     owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
     owner = owners.get(target)
-    use = t.live_entry_providers(s.get('entry_revision'), t.entry_config())
-    if not t.entry_member_owned(s['live'], t.proxy_providers(), use, target, owner):
+    if not t.entry_member_owned(s, t.proxy_providers(), t.entry_config(), target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
@@ -125,8 +127,7 @@ def change(target,previous,guard=None):
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
     if (selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner
-            or not t.entry_member_owned(after['live'], t.proxy_providers(),
-                                        t.live_entry_providers(after.get('entry_revision'), t.entry_config()), target, owner)):
+            or not t.entry_member_owned(after, t.proxy_providers(), t.entry_config(), target, owner)):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)

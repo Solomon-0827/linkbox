@@ -304,14 +304,16 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 self.assertEqual(gui.change('same', 'current', mode)['state']['entry'], 'same')
         self.assertEqual(self.requests, [ENTRY_ROUTE, ENTRY_ROUTE])
 
-    def test_switch_refuses_live_entry_using_another_owner(self):
+    def test_switch_refuses_live_entry_using_another_owner_even_with_retained_revision(self):
         self.write_profile('a', ['current', 'same'])
         self.write_profile('b', ['current', 'same'])
         self.apply({'a': [], 'b': ['current', 'same']})
         live_b = self.active.copy(), self.providers
         self.apply({'a': ['current', 'same'], 'b': []})
         providers_a = self.providers
+        revision = self.active['entry_revision']
         self.active, self.providers = live_b
+        self.active['entry_revision'] = revision
         self.providers.update(providers_a)
         state = {**self.active, 'nodes': ['current', 'same']}
         nodes = {name: node(name) for name in state['nodes']}
@@ -329,6 +331,72 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, '节点归属'):
                         gui.change('same', 'current', mode)
         self.assertEqual(self.requests, [])
+
+    def test_refresh_reloads_when_request_never_reached_clash(self):
+        self.check_pending_update(reload_applied_late=False)
+
+    def test_refresh_finishes_when_reload_applied_after_polling(self):
+        self.check_pending_update(reload_applied_late=True)
+
+    def check_pending_update(self, reload_applied_late):
+        self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
+        results = self.base / 'chain-results.json'
+        results.write_text(json.dumps({'results': {'fast': {'chain_delay': 10, 'owner': 'a'}}}))
+        pending = []
+
+        def lose_request(method, route, body=None, **_):
+            if route == '/configs?force=false':
+                pending.append(body)
+                raise TimeoutError()
+            return self.controller(method, route, body)
+
+        self.api.side_effect = lose_request
+        with self.assertRaisesRegex(RuntimeError, '尚未确认'):
+            self.apply({'a': ['fast', 'quick'], 'b': []})
+        self.assertEqual(len(pending), 1)
+        if reload_applied_late:
+            self.controller('PUT', '/configs?force=false', pending[0])
+            self.assertEqual(self.active['entry'], 'fast')
+        self.requests.clear()
+        results.write_text(json.dumps({'results': {'quick': {'chain_delay': 10, 'owner': 'a'}}}))
+        self.api.side_effect = self.controller
+        self.assertTrue(picker.initialize())
+        self.assertEqual(self.active['entry'], 'quick')
+        self.assertEqual(self.requests, ([] if reload_applied_late else ['/configs?force=false']) + [ENTRY_ROUTE])
+        self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
+                         [{'name': t.ENTRY, 'now': 'quick'}])
+        self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
+        self.assertFalse(picker.initialize())
+
+    def test_failed_benchmark_start_preserves_display_history_and_invalidates_ranking(self):
+        history = {'results': {'fast': {'owner': 'a', 'delay': 10, 'chain_delay': 20}},
+                   'finished_at': '2026-11-20T00:00:00+00:00'}
+        for start in (update.c.run, gui.latency):
+            with self.subTest(benchmark=start.__module__):
+                for name in ('chain-results.json', 'latency-results.json'):
+                    (self.base / name).write_text(json.dumps(history))
+                with (patch.object(update.c, 'active_state', side_effect=RuntimeError('controller read failed')),
+                      patch.object(gui, 'snapshot', side_effect=RuntimeError('controller read failed'))):
+                    with self.assertRaisesRegex(RuntimeError, 'controller read failed'):
+                        start()
+                self.assertEqual(update.benchmark_results(), {})
+                for name in ('chain-results.json', 'latency-results.json'):
+                    self.assertEqual(json.loads((self.base / name).read_text()), history)
+
+    def test_completed_entrance_benchmark_updates_history_and_ranking(self):
+        self.apply({'a': ['current'], 'b': []})
+        (self.base / 'chain-results.json').write_text(json.dumps({
+            'finished_at': '2026-11-20T00:00:00+00:00',
+            'results': {'current': {'owner': 'a', 'delay': 10, 'chain_delay': 20}},
+        }))
+        with (patch.object(gui, 'snapshot', return_value={**self.active, 'nodes': ['current']}),
+              patch.object(t, 'state', return_value=({}, {})),
+              patch.object(t, 'node_inventory', return_value={}),
+              patch.object(t, 'api', return_value={'delay': 5})):
+            gui.latency()
+            row, = gui.node_rows({}, {'a': ['current']})
+        self.assertEqual((row['delay'], row['chain_delay']), (5, 20))
+        self.assertEqual(update.benchmark_results(), {'current': {'chain': None, 'entrance': 5, 'owner': 'a'}})
 
     def test_unconfirmed_reload_blocks_switches_until_refresh_confirms(self):
         self.apply({'a': ['current', 'fast'], 'b': []})
@@ -351,9 +419,11 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, message):
             self.apply({'a': ['fast'], 'b': []})
         with self.assertRaisesRegex(RuntimeError, message):
+            picker.synchronize()
+        with self.assertRaisesRegex(RuntimeError, '尚未确认'):
             picker.initialize()
         self.assertEqual(self.requests, [])
-        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(writes), 2)
         self.controller('PUT', '/configs?force=false', writes[0])
         with (patch('sys.argv', ['gui_backend.py', 'startup', 'chain']),
               patch.object(gui, 'snapshot', side_effect=lambda: {
@@ -376,11 +446,16 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '无法切换'):
             picker.initialize()
         self.assertEqual(self.active['entry'], 'fast')
-        self.assertTrue(json.loads(self.policy.read_bytes())['initialization_pending'])
+        policy = json.loads(self.policy.read_bytes())
+        self.assertTrue(policy['initialization_pending'])
+        self.assertTrue(policy['pending_update']['switch_owed'])
+        self.assertNotIn('reload_unconfirmed', policy)
         results.write_text(json.dumps({'results': {'other': {'chain_delay': 5, 'owner': 'b'}}}))
         self.api.side_effect = self.controller
+        self.requests.clear()
         self.assertTrue(picker.initialize())
         self.assertEqual(self.active['entry'], 'other')
+        self.assertEqual(self.requests, [ENTRY_ROUTE])
         self.assertFalse(picker.initialize())
 
     def test_interrupted_benchmark_cannot_rank_the_next_reconciliation(self):
@@ -602,9 +677,9 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '尚未确认'):
             picker.initialize()
         self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['current', 'fast']})
-        with self.assertRaisesRegex(RuntimeError, '请先刷新状态'):
+        with self.assertRaisesRegex(RuntimeError, '尚未确认'):
             picker.initialize()
-        self.assertEqual(len(reloads), 1)
+        self.assertEqual(len(reloads), 2)
         self.controller('PUT', '/configs?force=false', reloads[0])
         self.api.side_effect = self.controller
         with patch('sys.argv', ['gui_backend.py', 'startup', 'chain']), patch.object(
@@ -612,7 +687,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             gui.main()
             self.assertTrue(json.loads(output.call_args.args[0])['initialized'])
         self.assertFalse(picker.initialize())
-        self.assertEqual(self.requests, ['/configs?force=false'] * 2)
+        self.assertEqual(self.requests, ['/configs?force=false'])
 
     def test_no_live_match_requires_picker_without_retrying_on_refresh(self):
         self.downloaded = {'a': ['new'], 'b': ['other']}
