@@ -34,7 +34,7 @@ def fetch(url):
         for n in doc['proxies']:
             if not isinstance(n,dict) or not all(n.get(k) for k in ['name','type','server','port']) or n['name'] in names:raise ValueError()
             names.add(n['name'])
-        return {**doc, 'proxies': [n for n in doc['proxies'] if n['name'] not in (t.ENTRY, t.EXIT, 'DIRECT', 'REJECT') and not NOTICE.search(n['name'])]}
+        return doc
     except Exception:raise RuntimeError('订阅下载或解析失败；未改动当前配置') from None
 
 
@@ -97,8 +97,10 @@ def entry_seed_owners(config, sources):
             source = by_url.get(source_key(url)) if url else available.get(name)
         except ValueError:
             continue
+        if source is None:
+            continue
         for node in live_providers.get(name, []):
-            owners.setdefault(node['name'], source['name'] if source else None)
+            owners.setdefault(node['name'], source['name'])
     return owners
 
 
@@ -348,7 +350,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         preview_file = runtime.BASE / picker.PREVIEW
         config_file, script, profiles = root / 'clash-verge.yaml', root / 'profiles/Script.js', root / 'profiles.yaml'
         baselines = {path: read(path) for path in (config_file, script, profiles, policy_file)}
-        sources, fingerprint, preview_id = picker.discover(for_update=syncing)
+        sources, fingerprint, preview_profiles = picker.discover(for_update=syncing)
         if request is not None:
             selection = picker.validate_selection(sources, fingerprint, request, selection)
             if request['current'] != before['entry']:
@@ -364,22 +366,29 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 raise RuntimeError('本地缓存暂不可读，保留原勾选')
             selection = {owner: [n for n in items if n not in names] for owner, items in selection.items()}
         updates = {}
+        downloaded_profiles = preview_profiles if request is not None else None
         if syncing:
             refreshed = []
+            downloaded_profiles = {}
             for source, _ in sources:
                 try:
                     doc = fetch(source['url'])
+                    cleaned = picker.clean(doc)
+                    if cleaned is None:
+                        raise ValueError()
                 except Exception:
                     continue
                 else:
-                    refreshed.append((source, doc))
+                    refreshed.append((source, cleaned))
+                    downloaded_profiles[source['name']] = doc
             if len(refreshed) != len(sources):
                 raise RuntimeError('订阅下载或解析失败，未改动当前配置')
             sources = refreshed
             if t.relay_state() != before or picker.discover(for_update=True)[1] != fingerprint:
                 raise RuntimeError(EXTERNAL_CHANGE)
-        if syncing or (preview_id and request is not None):
-            updates.update({root / 'profiles' / source['profile_file']: dump(doc) for source, doc in sources})
+        if downloaded_profiles:
+            updates.update({root / 'profiles' / source['profile_file']: dump(downloaded_profiles[source['name']])
+                            for source, _ in sources if source['name'] in downloaded_profiles})
         try:
             config = yaml.safe_load(baselines[config_file] or b'')
         except yaml.YAMLError:
@@ -396,7 +405,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         plan = reconcile(inventory, selection, before['live'], before['entry'], seed_owners=seed_owners)
         if not plan['candidates']:
             if syncing:
-                preview_data = {'revision': fingerprint, 'documents': {s['name']: doc for s, doc in sources}}
+                preview_data = {'revision': fingerprint, 'profiles': downloaded_profiles}
                 atomic(preview_file, dump(preview_data))
             raise RuntimeError(NO_SELECTION)
 
@@ -434,6 +443,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         updates[config_file] = dump(updated)
         updates[script] = script_text(baselines[script], managed)
         payload, members = reload_payload(updated, root, updates, baselines)
+        # A saved relay can be absent from the live group while its subscription cache is unreadable.
         selected = {owner: [name for name in names if name in members]
                     for owner, names in plan['selection'].items()}
         desired = reconcile(inventory, selected, [], None, metric, benchmark_results())['entry']
@@ -444,11 +454,6 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         index = yaml.safe_load(baselines[profiles])
         if update_selector(index, planned_entry):
             updates[profiles] = dump(index)
-        pin = policy.get('pinned_entry')
-        if pin and pin not in members:
-            plan['selection'] = {owner: [name for name in names if name != pin]
-                                 for owner, names in plan['selection'].items()}
-            plan['selection'] = {owner: names for owner, names in plan['selection'].items() if names}
         saved = {'selected_nodes': plan['selection'], 'provider_labels': labels}
         updates[runtime.BASE / 'subscriptions.json'] = json.dumps({'sources': registry}, ensure_ascii=False, indent=2).encode()
         updates[policy_file] = json.dumps(saved, ensure_ascii=False, indent=2).encode()

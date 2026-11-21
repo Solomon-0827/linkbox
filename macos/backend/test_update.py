@@ -1,4 +1,5 @@
 import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -71,7 +72,7 @@ class SubscriptionFixture:
         self.api = stack.enter_context(patch.object(t, 'api', side_effect=self.controller))
         stack.enter_context(patch.object(t, 'relay_state', side_effect=lambda **_: self.active.copy()))
         self.downloaded = {}
-        self.fetch = stack.enter_context(patch.object(update, 'fetch', side_effect=self.download))
+        self.fetch = stack.enter_context(patch.object(update, 'fetch', wraps=update.fetch, side_effect=self.download))
 
     def write_profile(self, owner, names):
         (self.root / 'profiles' / (owner + '.yaml')).write_bytes(update.dump({'proxies': [node(n) for n in names]}))
@@ -245,6 +246,50 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertFalse(any((self.base / 'backups').rglob('*node-policy.json')))
         self.assertFalse(any(n['name'] == 'current' for n in self.reload['proxies']))
 
+    def assert_verge_profile_keeps_downloaded_chain(self, apply_download):
+        example = Path(__file__).resolve().parents[2] / 'examples/chain.example.yaml'
+        chain = yaml.safe_load(example.read_bytes())
+        chain['proxies'][0]['name'] = 'current'
+        chain['proxies'].append(node('剩余流量'))
+        chain['proxy-groups'][1]['proxies'] = ['current']
+        other = {'proxies': [node(name) for name in (t.ENTRY, 'DIRECT', 'REJECT', 'other')]}
+        downloads = {self.sources[0]['url']: chain, self.sources[1]['url']: other}
+        self.fetch.side_effect = None
+        with patch.object(update.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = lambda req, **_: io.BytesIO(update.dump(downloads[req.full_url]))
+            apply_download()
+
+        cached = yaml.safe_load((self.root / 'profiles/a.yaml').read_bytes())
+        self.assertEqual(cached, chain)
+        self.assertEqual(yaml.safe_load((self.root / 'profiles/b.yaml').read_bytes()), other)
+        provider = yaml.safe_load((self.root / 'providers/linkbox/a.yaml').read_bytes())
+        self.assertEqual([n['name'] for n in provider['proxies']], ['current'])
+        self.assertEqual([n['name'] for n in picker.catalog()['sources'][0]['nodes']], ['current'])
+        if core := os.environ.get('LINKBOX_TEST_CORE'):
+            script = self.root / 'profiles/Script.js'
+            regenerated = run_process(['node', '-e',
+                'const fs = require("node:fs"), vm = require("node:vm");'
+                'const context = {profile: JSON.parse(fs.readFileSync(0, "utf8"))};'
+                'const script = fs.readFileSync(process.argv[1], "utf8");'
+                'console.log(JSON.stringify(vm.runInNewContext(script + "\\nmain(profile)", context)));',
+                str(script)], input=json.dumps(cached), text=True, capture_output=True, check=True)
+            config = self.root / 'regenerated.yaml'
+            config.write_text(regenerated.stdout)
+            run_process([core, '-t', '-d', str(self.root), '-f', str(config)], capture_output=True, check=True)
+
+    def test_first_run_keeps_downloaded_verge_chain(self):
+        self.assert_verge_profile_keeps_downloaded_chain(lambda: self.assertTrue(picker.initialize()))
+
+    def test_save_from_sync_preview_keeps_downloaded_verge_chain(self):
+        self.policy.write_text(json.dumps({'selected_nodes': {'a': ['fast']}}))
+
+        def apply_download():
+            with self.assertRaisesRegex(RuntimeError, '管理节点'):
+                picker.synchronize()
+            self.apply({'a': ['current'], 'b': []})
+
+        self.assert_verge_profile_keeps_downloaded_chain(apply_download)
+
     def test_startup_retries_after_download_failure(self):
         self.fetch.side_effect = RuntimeError('下载失败')
         with patch('sys.argv', ['gui_backend.py', 'startup', 'chain']), patch.object(
@@ -292,6 +337,18 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast'], 'b': ['current']})
         self.assertEqual([n['name'] for n in self.reload['proxy-providers']['b']['payload']], ['current'])
         self.assertEqual(self.active['entry'], 'current')
+
+    def test_first_run_falls_back_for_named_file_provider(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxy-groups'][0].update(use=['Verge cache'], proxies=[])
+        config['proxy-providers'] = {'Verge cache': {'type': 'file', 'path': 'profiles/a.yaml'}}
+        self.config.write_bytes(update.dump(config))
+        self.active['live'] = ['current']
+        self.providers = {'Verge cache': {'vehicleType': 'File', 'proxies': [node('current')]}}
+        self.downloaded = {'a': ['current'], 'b': ['current']}
+
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current']})
 
     def test_first_run_falls_back_when_live_provider_endpoint_fails(self):
         config = yaml.safe_load(self.config.read_bytes())
@@ -377,7 +434,19 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
                          [{'name': t.ENTRY, 'now': 'other'}])
         saved = json.loads(self.policy.read_bytes())
-        self.assertEqual(saved['selected_nodes'], {'a': ['fast'], 'b': ['other']})
+        self.assertEqual(saved['selected_nodes'], {'a': ['current', 'fast'], 'b': ['other']})
+        self.downloaded = {'a': ['current', 'fast'], 'b': ['other']}
+        picker.synchronize()
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], saved['selected_nodes'])
+        self.assertEqual([n['name'] for n in picker.catalog()['sources'][0]['nodes'] if n['selected']],
+                         ['current', 'fast'])
+
+    def test_save_ranks_selected_relays_using_legacy_benchmark(self):
+        (self.base / 'chain-results.json').write_text(json.dumps({'results': {
+            'fast': {'chain_delay': 80}, 'quick': {'chain_delay': 20},
+        }}))
+        self.apply({'a': ['fast', 'quick'], 'b': []})
+        self.assertEqual(self.active['entry'], 'quick')
 
     def test_other_group_keeps_static_reference_and_entry_uses_owner_once(self):
         config = yaml.safe_load(self.config.read_bytes())

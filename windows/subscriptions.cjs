@@ -67,11 +67,13 @@ async function discover(b, forUpdate = false) {
  if (forUpdate) return {sources: sources.map(({source}) => ({source})), fingerprint: revision};
  const rawPreview = await read(path.join(b.dataDir, PREVIEW));
  const preview = parseProfile(rawPreview);
- const previewId = preview?.revision === revision ? digest(rawPreview) : null;
+ const previewProfiles = preview?.revision === revision ? preview.profiles : null;
+ const previewId = previewProfiles ? digest(rawPreview) : null;
  const inventory = sources.map(({source, raw}) => ({
-  source, document: previewId ? preview.documents[source.name] : clean(parseProfile(raw)),
+  source, document: clean(previewProfiles && Object.hasOwn(previewProfiles, source.name) ?
+   previewProfiles[source.name] : parseProfile(raw)),
  }));
- return {sources: inventory, fingerprint: hash([revision, previewId]), previewId};
+ return {sources: inventory, fingerprint: hash([revision, previewId]), previewProfiles};
 }
 function inventoryFor(sources) {
  return sources.map(({source, document}) => document ?
@@ -115,8 +117,9 @@ async function entrySeedOwners(b, config, sources) {
   let source;
   try { source = url ? byURL.get(sourceKey(url)) : byID.get(name); }
   catch { continue; }
+  if (!source) continue;
   for (const {name: relay} of liveProviders.get(name) || []) {
-   if (!owners.has(relay)) owners.set(relay, source?.name ?? null);
+   if (!owners.has(relay)) owners.set(relay, source.name);
   }
  }
  return owners;
@@ -291,7 +294,8 @@ async function rollback(written, originals) {
 
 function benchmarkResults(b) {
  const history = b.history || {};
- return Object.fromEntries(Object.entries(history.reason ? {} : history.latestResults ?? {})
+ const results = Object.hasOwn(history, 'latestResults') ? history.latestResults : history.results;
+ return Object.fromEntries(Object.entries(history.reason ? {} : results ?? {})
   .filter(([, row]) => history.kind !== 'chain' || (typeof row?.chainDelay === 'number' && row.chainDelay > 0))
   .map(([name, row]) => [name, {
    chain: history.kind === 'entrance' ? undefined : row?.chainDelay, entrance: row?.entranceDelay, owner: row?.owner,
@@ -403,26 +407,32 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
     [owner, items.filter(n => !names.includes(n))]));
   }
   const updates = new Map();
+  let downloadedProfiles = request !== null ? discovered.previewProfiles : null;
   if (syncing) {
    const refreshed = [];
+   const downloads = new Map();
    for (const {source} of sources) {
     try {
      const raw = YAML.parse(await b.textRequest(source.url, before.mixedPort, {timeout: 45000, max: 8*1024*1024}));
      const document = clean(raw);
      if (!document) throw Error();
      refreshed.push({source, document});
+     downloads.set(source.name, raw);
     } catch {
      // Still attempt the remaining subscriptions before refusing the update.
     }
    }
    if (refreshed.length !== sources.length) throw Error('订阅下载或解析失败，未改动当前配置');
    sources = refreshed;
+   downloadedProfiles = Object.fromEntries(downloads);
    if (sig(await b.state()) !== sig(before) ||
        (await discover(b, true)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   }
-  if (syncing || (discovered.previewId && request !== null)) {
-   for (const {source, document} of sources) {
-    updates.set(path.join(b.root, 'profiles', source.profile_file), YAML.stringify(document));
+  if (downloadedProfiles) {
+   for (const {source} of sources) {
+    if (Object.hasOwn(downloadedProfiles, source.name)) {
+     updates.set(path.join(b.root, 'profiles', source.profile_file), YAML.stringify(downloadedProfiles[source.name]));
+    }
    }
   }
   const config = parseProfile(baselines.get(configFile));
@@ -438,7 +448,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   if (!plan.candidates.length) {
    if (syncing) {
     await atomic(previewFile, YAML.stringify({
-     revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
+     revision: discovered.fingerprint, profiles: downloadedProfiles,
     }));
    }
    throw Error(NO_SELECTION);
@@ -476,6 +486,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   updates.set(configFile, YAML.stringify(updated));
   updates.set(script, scriptText(baselines.get(script), managed));
   const {payload, members} = await reloadPayload(updated, b.root, updates, baselines);
+  // A saved relay can be absent from the live group while its subscription cache is unreadable.
   const selected = Object.fromEntries(Object.entries(plan.selection).map(([owner, names]) =>
    [owner, names.filter(name => members.has(name))]));
   const {entry: desired} = reconcile({sources:inventory, selection:selected, live:[], current:null,
@@ -486,11 +497,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const index = YAML.parse(baselines.get(profiles).toString());
   if (updateSelector(index, plannedEntry)) {
    updates.set(profiles, YAML.stringify(index));
-  }
-  const pin = saved.pinned_entry;
-  if (pin && !members.has(pin)) {
-   plan.selection = Object.fromEntries(Object.entries(plan.selection)
-    .map(([owner, names]) => [owner, names.filter(name => name !== pin)]).filter(([,names]) => names.length));
   }
   const nextPolicy = {
    selected_nodes: plan.selection,

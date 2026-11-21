@@ -6,6 +6,7 @@ const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 const {EventEmitter} = require('node:events');
 const http = require('node:http');
+const vm = require('node:vm');
 const YAML = require('yaml');
 const {Backend, ClashHTTPError, ENTRY, EXIT} = require('../backend.cjs');
 const sub = require('../subscriptions.cjs');
@@ -261,6 +262,39 @@ test('first run downloads before seeding even with truncated Verge YAML and drop
  assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
 });
 
+for (const mode of ['first run', 'Save from Sync preview']) {
+ test(`${mode} keeps the downloaded Verge chain`, async t => {
+  const {b, root, policy, apply} = await fixture(t);
+  const chain = YAML.parse(await fs.readFile(path.join(__dirname, '../../examples/chain.example.yaml'), 'utf8'));
+  chain.proxies[0].name = 'current';
+  chain.proxies.push(node('剩余流量'));
+  chain['proxy-groups'][1].proxies = ['current'];
+  const other = {proxies: [ENTRY, 'DIRECT', 'REJECT', 'other'].map(name => node(name))};
+  b.textRequest = async url => YAML.stringify(url.endsWith('/a') ? chain : other);
+  if (mode === 'first run') {
+   assert.equal(await sub.initialize(b), true);
+  } else {
+   await fs.writeFile(policy, JSON.stringify({selected_nodes: {a:['fast']}}));
+   await assert.rejects(b.updateSubscriptions(), /管理节点/);
+   await apply({a:['current'], b:[]});
+  }
+
+  const cached = YAML.parse(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'));
+  assert.deepEqual(cached, chain);
+  assert.deepEqual(YAML.parse(await fs.readFile(path.join(root, 'profiles/b.yaml'), 'utf8')), other);
+  const provider = YAML.parse(await fs.readFile(path.join(root, 'providers/linkbox/a.yaml'), 'utf8'));
+  assert.deepEqual(provider.proxies.map(n => n.name), ['current']);
+  assert.deepEqual((await sub.catalog(b)).sources[0].nodes.map(n => n.name), ['current']);
+  if (process.env.LINKBOX_TEST_CORE) {
+   const script = await fs.readFile(path.join(root, 'profiles/Script.js'), 'utf8');
+   const regenerated = vm.runInNewContext(script + '\nmain(profile)', {profile: cached});
+   const config = path.join(root, 'regenerated.yaml');
+   await fs.writeFile(config, JSON.stringify(regenerated));
+   execFileSync(process.env.LINKBOX_TEST_CORE, ['-t', '-d', root, '-f', config]);
+  }
+ });
+}
+
 test('first run seeds in live provider order with picker fallback', async t => {
  const {b, config, state, write, refreshWith, saved, setProviders} = await fixture(t);
  Object.assign(config['proxy-groups'][0], {use:['b','a'], proxies:['quick']});
@@ -291,6 +325,19 @@ test('first run keeps the live owner for HTTP providers without paths', async t 
  assert.deepEqual((await saved()).selected_nodes, {a:['fast'], b:['current']});
  assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-providers'].b.payload.map(n => n.name), ['current']);
  assert.equal(state.entry, 'current');
+});
+
+test('first run falls back for a named file provider', async t => {
+ const {b, config, state, write, refreshWith, saved, setProviders} = await fixture(t);
+ Object.assign(config['proxy-groups'][0], {use:['Verge cache'], proxies:[]});
+ config['proxy-providers'] = {'Verge cache':{type:'file', path:'profiles/a.yaml'}};
+ await write('clash-verge.yaml', config);
+ state.live = ['current'];
+ setProviders({'Verge cache':{vehicleType:'File', proxies:[node('current')]}});
+ refreshWith({a:['current'], b:['current']});
+
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current']});
 });
 
 test('first run falls back when the live provider endpoint fails', async t => {
@@ -377,7 +424,25 @@ test('upgrade saving B switches off a pin excluded by unreadable A', async t => 
  assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
  const index = YAML.parse(await fs.readFile(path.join(root,'profiles.yaml'),'utf8'));
  assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'other'}]);
- assert.deepEqual((await saved()).selected_nodes, {a:['fast'], b:['other']});
+ const selection = {a:['current','fast'], b:['other']};
+ assert.deepEqual((await saved()).selected_nodes, selection);
+ refreshWith({a:['current','fast'], b:['other']});
+ await b.updateSubscriptions();
+ assert.deepEqual((await saved()).selected_nodes, selection);
+ assert.deepEqual((await sub.catalog(b)).sources[0].nodes.filter(n => n.selected).map(n => n.name), ['current','fast']);
+});
+
+test('Save ranks selected relays using legacy benchmark results until latestResults is written', async t => {
+ const results = {fast:{chainDelay:80}, quick:{chainDelay:20}};
+ for (const [history, expected] of [[{kind:'chain', results}, 'quick'],
+  [{kind:'chain', results, latestResults:{}}, 'fast']]) {
+  const {b, data, root, state, apply} = await fixture(t);
+  await fs.writeFile(path.join(data, 'results.json'), JSON.stringify(history));
+  await b.init();
+  b.settings.configDir = root;
+  await apply({a:['fast','quick'], b:[]});
+  assert.equal(state.entry, expected);
+ }
 });
 
 for (const flag of ['include-all-proxies', 'include-all']) {

@@ -84,10 +84,11 @@ def discover(for_update=False):
         return [(source, None) for source, _ in sources], revision, None
     raw_preview = update.read(runtime.BASE / PREVIEW)
     preview = document(raw_preview)
-    preview_id = digest(raw_preview) if preview.get('revision') == revision else None
-    inventory = [(source, preview['documents'][source['name']] if preview_id
-                  else clean(document(raw))) for source, raw in sources]
-    return inventory, fingerprint([revision, preview_id]), preview_id
+    preview_profiles = preview.get('profiles') if preview.get('revision') == revision else None
+    preview_id = digest(raw_preview) if preview_profiles else None
+    inventory = [(source, clean((preview_profiles or {}).get(source['name']) or document(raw)))
+                 for source, raw in sources]
+    return inventory, fingerprint([revision, preview_id]), preview_profiles
 
 
 def clean(doc):
