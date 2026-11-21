@@ -49,4 +49,9 @@ function selectionOwners(selection) {
  return owners;
 }
 
-module.exports = {reconcile, selectionOwners};
+function sameEntryMembers(live, planned) {
+ const names = new Set(live), expected = new Set(planned);
+ return names.size === expected.size && [...expected].every(name => names.has(name));
+}
+
+module.exports = {reconcile, selectionOwners, sameEntryMembers};

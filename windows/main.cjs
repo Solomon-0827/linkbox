@@ -32,10 +32,10 @@ async function coffee(){if(coffeePending)return coffeePending;coffeePending=(asy
  const code=await fs.readFile(path.join(__dirname,'coffee-extract.js'),'utf8');let last={};try{await coffeeWindow.loadURL('https://ip.net.coffee/claude/');const until=Date.now()+45000;while(Date.now()<until){last=await coffeeWindow.webContents.executeJavaScript(code);if(/^\d+$/.test(last.score)&&last.ip&&Object.values(last.udp||{}).some(Boolean)&&Object.values(last.dns||{}).some(Boolean))break;await new Promise(r=>setTimeout(r,1500));}return {...last,time:new Date().toISOString()};}finally{coffeeWindow?.destroy();coffeeWindow=null;}})();try{return await coffeePending;}finally{coffeePending=null;}}
 const demoNodes=['日本 JP V1-3','香港 HK 01','新加坡 SG 02','日本 JP V1-2','美国新 ISP A1','香港 HK 02'].map((name,i)=>({name,provider:i%2?'mmti':'Neko',delay:[286,312,349,422,null,518][i],status:i===4?'failed':'done',kind:'chain'}));
 let initialization,startupChecked=false,initializedSelection=false;
-async function startupState(){
+async function startupState(refresh=false){
  const state=await backend.state();
  if(state.mode!=='global'||state.exit!=='美国静态家宽'||state.dialer!=='中转入口')return state;
- initialization ||= subscriptions.initialize(backend).then(changed=>({changed}))
+ initialization ||= subscriptions.initialize(backend,{refresh}).then(changed=>({changed}))
   .catch(error=>({changed:false,selectionError:safeError(error)}));
  const pending=initialization;
  const {changed,selectionError}=await pending;
@@ -51,7 +51,7 @@ ipcMain.handle('linkbox',async(event,action,data)=>{
  try{
  if(DEMO){if(action==='benchmarkSettings')return {ok:true,data:benchmarkSettings(backend.settings)};if(action==='state')return {ok:true,data:{mode:'global',tun:true,entry:'日本 JP V1-3',exit:'美国静态家宽',dialer:'中转入口',nodes:demoNodes,lastTest:new Date().toISOString(),expectedIP:'203.0.113.10',settings:{hourly:true},progress:{running:false}}};if(action==='ip')return {ok:true,data:{ip:'203.0.113.10',country:'United States',region:'California',city:'Los Angeles',asn:7018,isp:'AT&T Enterprises, LLC'}};if(action==='coffee')return {ok:true,data:{score:'100',ip:'203.0.113.10',props:{类型:'家庭住宅 IP'},dns:{结果:'未检测到泄露'},udp:{结果:'未检测到泄露'},time:new Date().toISOString()}};return {ok:true,data:{message:'预览模式不执行代理操作'}};}
  let value;switch(action){
- case 'state':value=await (data?.initialize===true?startupState():backend.state());break;
+ case 'state':value=await (data?.initialize===true?startupState(data.refresh===true):backend.state());break;
  case 'ip':value=await backend.ipInfo();break;
  case 'coffee':value=await coffee();break;
  case 'switch':if(typeof data?.name!=='string'||typeof data?.previous!=='string')throw Error('无效节点');value=await backend.switchNode(data.name,data.previous);break;

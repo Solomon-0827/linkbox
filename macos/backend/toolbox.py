@@ -13,13 +13,12 @@ import tempfile
 import urllib.parse
 
 from runtime import BASE, CONFIG_DIR
-from reconcile import selection_owners
+from reconcile import same_entry_members, selection_owners
 
 SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
 PROFILES = CONFIG_DIR / 'profiles.yaml'
 EXIT = '美国静态家宽'
 ENTRY = '中转入口'
-ENTRY_REVISION_PREFIX = 'https://www.gstatic.com/generate_204#linkbox-'
 RELOAD_PENDING = '配置尚未被 Clash 确认，请先刷新状态'
 
 class ClashHTTPError(RuntimeError):
@@ -55,43 +54,7 @@ def relay_state(**request_options):
     group = proxies.get(ENTRY, {})
     return {'mode': config.get('mode'), 'tun': bool(config.get('tun', {}).get('enable')),
             'entry': group.get('now'), 'exit': proxies.get('GLOBAL', {}).get('now'),
-            'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': group.get('all', []),
-            'entry_revision': group.get('testUrl')}
-
-
-def proxy_providers(**request_options):
-    return api('GET', '/providers/proxies', **request_options)['providers']
-
-
-def entry_config():
-    import runtime
-    import yaml
-    config = yaml.safe_load((runtime.CONFIG_DIR / 'clash-verge.yaml').read_bytes())
-    return next((g for g in config.get('proxy-groups', []) if g['name'] == ENTRY), {})
-
-
-def live_entry_providers(revision, group, live, providers):
-    use = group.get('use') or []
-    if (not use or not revision or revision != group.get('url') or not revision.startswith(ENTRY_REVISION_PREFIX)
-            or providers.get(ENTRY, {}).get('proxies')):
-        return []
-    names = {owner: [node['name'] for node in provider.get('proxies', [])]
-             for owner, provider in providers.items() if provider.get('vehicleType') != 'Compatible'}
-    if not all(names.get(owner) for owner in use) or live != [name for owner in use for name in names[owner]]:
-        return []
-    # Mihomo exposes ordered member names. Reject if another provider sequence explains them too.
-    by_first = {}
-    for members in names.values():
-        if members:
-            by_first.setdefault(members[0], []).append(members)
-    paths = [1] + [0] * len(live)
-    for i, name in enumerate(live):
-        if paths[i]:
-            for members in by_first.get(name, []):
-                end = i + len(members)
-                if live[i:end] == members:
-                    paths[end] = min(2, paths[end] + paths[i])
-    return use if paths[-1] == 1 else []
+            'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': sorted(set(group.get('all', [])))}
 
 
 def require_confirmed_reload():
@@ -111,14 +74,8 @@ def switch_lock():
         yield
 
 
-def entry_member_owned(state, providers, group, name, owner):
-    live = state['live']
-    if not owner or live.count(name) != 1:
-        return False
-    use = live_entry_providers(state.get('entry_revision'), group, live, providers)
-    possible = [key for key in use if any(node['name'] == name
-                for node in providers.get(key, {}).get('proxies', []))]
-    return possible == [owner]
+def entry_member_owned(live, owners, name, owner):
+    return owner is not None and owners.get(name) == owner and same_entry_members(live, owners)
 
 
 def node_inventory(proxies, owners):
@@ -215,18 +172,15 @@ def switch_entry(current, target, owner):
     if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current or target not in fresh_p[ENTRY].get('all', []):
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
     import runtime
-    if selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner:
-        raise RuntimeError('节点归属已变化，请先更新订阅')
-    def entry_group_state(proxies):
-        return {'live': proxies[ENTRY].get('all', []), 'entry_revision': proxies[ENTRY].get('testUrl')}
-
-    if not entry_member_owned(entry_group_state(fresh_p), proxy_providers(), entry_config(), target, owner):
+    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+    if not entry_member_owned(fresh_p[ENTRY].get('all', []), owners, target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
+    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
     if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
             or after_p[EXIT].get('dialer-proxy') != ENTRY or after_c.get('mode') != 'global'
-            or not entry_member_owned(entry_group_state(after_p), proxy_providers(), entry_config(), target, owner)):
+            or not entry_member_owned(after_p[ENTRY].get('all', []), owners, target, owner)):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:

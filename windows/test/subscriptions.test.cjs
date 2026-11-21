@@ -42,7 +42,7 @@ async function fixture(t) {
   [ENTRY]: {vehicleType: 'Compatible', proxies: [node('current')]},
   a: {vehicleType: 'HTTP', proxies: [node('fast')]},
  };
- let refreshed = {};
+ let refreshed = {}, keepStaleEntry = false;
  b.state = async () => structuredClone(state);
  b.validateConfig = async file => {
   assert.equal(YAML.parse(await fs.readFile(file, 'utf8'))['proxy-groups'][0].name, ENTRY);
@@ -55,7 +55,7 @@ async function fixture(t) {
   if (method === 'GET' && route === '/configs') return {mode:state.mode, tun:{enable:state.tun}};
   if (method === 'GET' && route === '/proxies') return {proxies:{
    GLOBAL:{now:state.exit}, [EXIT]:{'dialer-proxy':state.dialer},
-   [ENTRY]:{now:state.entry, all:state.live, testUrl:state.entryRevision},
+   [ENTRY]:{now:state.entry, all:state.live},
   }};
   if (method === 'GET' && route === '/providers/proxies') return {providers};
   assert.equal(method, 'PUT');
@@ -67,9 +67,8 @@ async function fixture(t) {
    providers = Object.fromEntries(Object.entries(payload['proxy-providers']).map(([owner, p]) => [
     owner, {proxies: p.payload, vehicleType: 'Inline'},
    ]));
-   state.entryRevision = group.url;
    state.live = group.use.flatMap(id => payload['proxy-providers'][id].payload.map(n => n.name));
-   if (!state.live.includes(state.entry)) state.entry = state.live[0];
+   if (!keepStaleEntry && !state.live.includes(state.entry)) state.entry = state.live[0];
   } else {
    assert.equal(route, ENTRY_ROUTE);
    assert.ok(state.live.includes(body.name));
@@ -89,7 +88,74 @@ async function fixture(t) {
  };
  return {b, root, data, config, policy, state, requests, downloads, atReload, items, write, request, apply, legacy,
   setProviders: value => {providers = value;},
+  keepStaleEntryOnReload: () => {keepStaleEntry = true;},
   refreshWith: value => {refreshed = value;}, saved: async () => JSON.parse(await fs.readFile(policy, 'utf8'))};
+}
+
+test('Save confirms with identical names loaded by an include-all group', async t => {
+ const {b, config, write, apply, saved, requests} = await fixture(t);
+ config['proxy-providers'] = {b:{type:'inline', payload:['current','fast'].map(n => node(n))}};
+ config['proxy-groups'].push({name:'secondary', type:'select', 'include-all':true});
+ await write('clash-verge.yaml', config);
+ await apply({a:['current','fast'], b:[]});
+ assert.equal((await saved()).reload_unconfirmed, undefined);
+ delete b.state;
+ assert.equal((await b.switchNode('fast', 'current')).entry, 'fast');
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
+});
+
+test('manual Refresh reapplies saved owners after a same-name edit', async t => {
+ const {b, config, write, apply, requests, state} = await fixture(t);
+ config['proxy-providers'] = {b:{type:'inline', payload:['current','fast'].map(n => node(n))}};
+ await write('clash-verge.yaml', config);
+ await apply({a:['current','fast'], b:[]});
+ const external = await b.config();
+ external['proxy-groups'][0].use = ['b'];
+ await write('clash-verge.yaml', external);
+ Object.assign(state, {entry:'fast', live:['fast','current']});
+ requests.length = 0;
+ assert.equal(await sub.initialize(b, {refresh:true}), true);
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
+ assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-groups'][0].use, ['a']);
+ assert.equal(state.entry, 'fast');
+});
+
+test('Refresh confirms after equivalent config reserialization', async t => {
+ await checkLateReloadAfterSave(t, ['fast','quick'], {rewrite:true});
+});
+
+test('Refresh keeps a relay selected in Verge after a late reload', async t => {
+ await checkLateReloadAfterSave(t, ['current','fast'], {vergeEntry:'fast'});
+});
+
+async function checkLateReloadAfterSave(t, names, {rewrite, vergeEntry}) {
+ const {b, root, apply, requests, state, saved} = await fixture(t);
+ const controller = b.request, pending = [];
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') { pending.push(args); throw Error('timeout'); }
+  return controller(...args);
+ };
+ if (vergeEntry) state.live.push('external');
+ await assert.rejects(apply({a:names, b:[]}), /尚未确认/);
+ assert.equal(pending.length, 1);
+ await controller(...pending[0]);
+ if (rewrite) {
+  const configFile = path.join(root, 'clash-verge.yaml');
+  const original = await fs.readFile(configFile, 'utf8'), parsed = YAML.parse(original);
+  const rewritten = YAML.stringify(parsed, {collectionStyle:'flow'});
+  assert.notEqual(original, rewritten);
+  assert.deepEqual(YAML.parse(rewritten), parsed);
+  await fs.writeFile(configFile, rewritten);
+  state.live.reverse();
+ }
+ if (vergeEntry) state.entry = vergeEntry;
+ requests.length = 0;
+ b.request = controller;
+ assert.equal(await sub.initialize(b), true);
+ assert.equal(state.entry, vergeEntry || names[0]);
+ assert.deepEqual(requests, []);
+ assert.equal((await saved()).pending_update, undefined);
+ assert.equal((await saved()).reload_unconfirmed, undefined);
 }
 
 test('saving another subscription keeps unreadable cache selection and provider', async t => {
@@ -182,7 +248,8 @@ test('sync keeps saved nodes outside the live group and removes vanished nodes a
 });
 
 test('benchmark winner switches after reload in subscription order', async t => {
- const {b, state, requests, root, apply, downloads} = await fixture(t);
+ const {b, state, requests, root, apply, downloads, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  b.settings.metric = 'entrance';
  b.history = {latestResults:{fast:{chainDelay:10,entranceDelay:90,owner:'a'}, other:{chainDelay:30,entranceDelay:20,owner:'b'}}};
  await apply({a:['fast'],b:['same','other']});
@@ -202,7 +269,8 @@ test('benchmark winner switches after reload in subscription order', async t => 
 });
 
 test('present winner is loaded before switching', async t => {
- const {b, write, apply, requests, atReload, state} = await fixture(t);
+ const {b, write, apply, requests, atReload, state, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  b.history = {latestResults: {fast: {chainDelay:20, owner:'a'}}};
  await write('profiles/a.yaml', {proxies: [node('quick'), node('fast')]});
  const controller = b.request;
@@ -372,7 +440,7 @@ test('deleted subscriptions disappear from picker and a rotation retains the sta
 });
 
 test('lost reload response keeps new files even with unchanged group membership', async t => {
- const {b, root, state, apply, refreshWith, requests} = await fixture(t);
+ const {b, root, state, apply, refreshWith, requests, saved} = await fixture(t);
  await apply({a:['current','fast'],b:[]});
  const before = structuredClone(state);
  refreshWith({a:['current','fast','new'],b:['other']});
@@ -387,7 +455,7 @@ test('lost reload response keeps new files even with unchanged group membership'
  assert.deepEqual(requests.map(r => r.route), ['/configs?force=false']);
  assert.deepEqual(state.live, before.live);
  assert.equal(state.entry, before.entry);
- assert.notEqual(state.entryRevision, before.entryRevision);
+ assert.equal((await saved()).reload_unconfirmed, undefined);
  assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /new/);
 });
 
@@ -407,28 +475,26 @@ test('unobservable reload keeps new files and requests refresh', async t => {
 });
 
 for(const recover of [true, false]) test('switch retries after reading state, then ' + (recover ? 'recovers' : 'reports failure'), async t => {
- const {b, state, apply, requests, saved} = await fixture(t);
+ const {b, state, apply, requests, saved, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  b.history = {latestResults: {quick: {chainDelay:20, owner:'a'}}};
  const controller = b.request;
  const calls = [];
- const observe = b.state;
- b.state = async () => {calls.push('state');return observe();};
  b.request = async (...args) => {
   calls.push(args[2]);
   if(args[2] === ENTRY_ROUTE && (!recover || !requests.some(r => r.route === ENTRY_ROUTE))){
    requests.push({route:args[2], body:args[3]});
    throw Error('switch failed');
   }
-  const result = await controller(...args);
-  if(args[2] === '/configs?force=false') state.entry = 'fast';
-  return result;
+  return controller(...args);
  };
  if(recover) await apply({a:['fast','quick'],b:[]});
  else await assert.rejects(apply({a:['fast','quick'],b:[]}), /配置已更新，但无法切换/);
  assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', ENTRY_ROUTE, ENTRY_ROUTE]);
  const first = calls.indexOf(ENTRY_ROUTE);
- assert.deepEqual(calls.slice(first + 1, first + 3), ['state', '/providers/proxies']);
- assert.equal(state.entry, recover ? 'quick' : 'fast');
+ assert.equal(calls[first + 1], '/configs');
+ assert.equal(calls[first + 2], '/proxies');
+ assert.equal(state.entry, recover ? 'quick' : 'current');
  assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick']});
 });
 
@@ -441,7 +507,7 @@ test('a delayed reload is read back without resending it', async t => {
    writes.push(args);
    throw Error('timeout');
   }
-  if (writes.length && args[2] === '/providers/proxies' && ++reads === 2) await controller(...writes[0]);
+  if (writes.length && args[2] === '/proxies' && ++reads === 2) await controller(...writes[0]);
   return controller(...args);
  };
  await apply({a:['quick'],b:[]});
@@ -467,7 +533,8 @@ test('upgrade download failure keeps saved relays and tries every source', async
 });
 
 test('initialization retries after files are written but reload is unconfirmed', async t => {
- const {b, refreshWith, saved, requests} = await fixture(t);
+ const {b, refreshWith, saved, requests, state} = await fixture(t);
+ state.live.push('external');
  refreshWith({a:['current','fast'],b:['other']});
  const controller = b.request, reloads = [];
  b.request = async (...args) => {
@@ -486,7 +553,8 @@ test('initialization retries after files are written but reload is unconfirmed',
 });
 
 for (const late of [false, true]) test(`Refresh finishes an existing user's pending update (${late ? 'late reload' : 'lost request'})`, async t => {
- const {b, root, apply, requests, state, saved} = await fixture(t);
+ const {b, root, apply, requests, state, saved, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  await apply({a:['current','fast','quick'], b:[]});
  b.history = {latestResults:{fast:{chainDelay:10,owner:'a'}}};
  const controller = b.request, pending = [];
@@ -498,7 +566,7 @@ for (const late of [false, true]) test(`Refresh finishes an existing user's pend
  assert.equal(pending.length, 1);
  if (late) {
   await controller(...pending[0]);
-  assert.equal(state.entry, 'fast');
+  assert.equal(state.entry, 'current');
  }
  requests.length = 0;
  b.history = {latestResults:{quick:{chainDelay:10,owner:'a'}}};
@@ -546,7 +614,8 @@ test('unconfirmed reload blocks switching and reconcile until Refresh confirms i
 });
 
 test('initialization replans from the latest results after a failed switch', async t => {
- const {b, legacy, refreshWith, state, saved, requests} = await fixture(t);
+ const {b, legacy, refreshWith, state, saved, requests, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  await legacy({selected_nodes:{a:['current','fast','quick'], b:['other']}});
  refreshWith({a:['fast','quick'], b:['other']});
  b.history = {kind:'chain', latestResults:{quick:{owner:'a', chainDelay:10}}};
@@ -556,10 +625,10 @@ test('initialization replans from the latest results after a failed switch', asy
   return controller(...args);
  };
  await assert.rejects(sub.initialize(b), /无法切换/);
- assert.equal(state.entry, 'fast');
+ assert.equal(state.entry, 'current');
  const policy = await saved();
  assert.equal(policy.initialization_pending, true);
- assert.equal(policy.pending_update.switch_owed, true);
+ assert.deepEqual(policy.pending_update, {members:['fast','quick','other']});
  assert.equal(policy.reload_unconfirmed, undefined);
  b.history = {kind:'chain', latestResults:{other:{owner:'b', chainDelay:5}}};
  b.request = controller;
@@ -596,11 +665,12 @@ for (const kind of ['chain', 'entrance']) test(`an interrupted ${kind} benchmark
 });
 
 test('a switch is verified again after a short delay', async t => {
- const {b, apply, requests, state} = await fixture(t);
+ const {b, apply, requests, state, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  b.history = {latestResults:{quick:{chainDelay:10}}};
  let readsAfterSwitch = 0;
- const read = b.state;
- b.state = async () => {
+ const read = b.relayState.bind(b);
+ b.relayState = async () => {
   if (requests.some(request => request.route === ENTRY_ROUTE) && ++readsAfterSwitch === 2) state.entry = 'fast';
   return read();
  };
@@ -624,7 +694,8 @@ test('no live match requires the picker without retrying initialization', async 
 test('missing relay cannot win reconciliation on an old benchmark delay', async t => {
  const {inputs, expected} = JSON.parse(await fs.readFile(
   path.join(__dirname,'../../fixtures/reconcile/latest-benchmark-only.json'), 'utf8'));
- const {b, state, policy, refreshWith} = await fixture(t);
+ const {b, state, policy, refreshWith, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  await fs.writeFile(policy, JSON.stringify({selected_nodes:inputs.selection}));
  b.settings.metric = inputs.metric;
  b.history = {results:{stale:{owner:'a',entranceDelay:10,chainDelay:100}}};
@@ -642,7 +713,8 @@ test('missing relay cannot win reconciliation on an old benchmark delay', async 
 });
 
 test('an already-saved failed chain row cannot win reconciliation on an older entrance delay', async t => {
- const {b, state, policy, refreshWith} = await fixture(t);
+ const {b, state, policy, refreshWith, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  await fs.writeFile(policy, JSON.stringify({selected_nodes:{a:['current','stale','fresh']}}));
  b.settings.metric = 'entrance';
  b.history = {kind:'chain',latestResults:{
@@ -654,16 +726,13 @@ test('an already-saved failed chain row cannot win reconciliation on an older en
  assert.equal(state.entry, 'fresh');
 });
 
-test('post-switch verification rejects a static collision in ENTRY', async t => {
- const {b, apply, requests, saved} = await fixture(t);
+test('post-switch verification rejects an added ENTRY member', async t => {
+ const {b, apply, requests, saved, state, keepStaleEntryOnReload} = await fixture(t);
+ keepStaleEntryOnReload();
  const controller = b.request;
- let switched = false;
  b.request = async (...args) => {
   const result = await controller(...args);
-  if (args[2] === ENTRY_ROUTE) switched = true;
-  if (switched && args[2] === '/providers/proxies') {
-   result.providers[ENTRY] = {vehicleType:'Compatible',proxies:[node('other')]};
-  }
+  if (args[2] === ENTRY_ROUTE) state.live.push('external');
   return result;
  };
  b.history = {latestResults:{other:{chainDelay:20,owner:'b'}}};

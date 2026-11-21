@@ -944,7 +944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resetOnline()
         refreshingOnline=["status"]
         (refreshButton as? SoftButton)?.spinning=true
-        invoke(["startup",autoMetric],message:"正在刷新状态…") { _ in
+        invoke(["startup",autoMetric,"--refresh"],message:"正在刷新状态…") { _ in
             self.refreshOnline()
         }
     }

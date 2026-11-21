@@ -1,9 +1,9 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('node:crypto'),YAML=require('yaml'),exec=require('node:util').promisify(require('node:child_process').execFile);
-const {reconcile, selectionOwners}=require('./reconcile.cjs');
+const {reconcile, sameEntryMembers, selectionOwners}=require('./reconcile.cjs');
 const {isDeepStrictEqual}=require('node:util');
 const timers=require('node:timers/promises');
-const {signature: sig, ClashHTTPError, liveEntryProviders, ENTRY_REVISION_PREFIX, RELOAD_PENDING}=require('./backend.cjs');
+const {signature: sig, ClashHTTPError, RELOAD_PENDING}=require('./backend.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -132,6 +132,14 @@ const SWITCH_FAILED = '配置已更新，但无法切换中转入口，请刷新
 const ENTRY_ROUTE = '/proxies/' + encodeURIComponent(ENTRY);
 const CHAIN_KEYS = ['mode', 'tun', 'exit', 'dialer'];
 
+function configureEntry(groups, use) {
+ const group = groups.find(g => g.name === ENTRY);
+ if (!group) throw Error('缺少中转入口组');
+ group.proxies = [];
+ group.use = use;
+ for (const key of ['url', 'include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type']) delete group[key];
+}
+
 function transform(config, managed, replace) {
  const updated = structuredClone(config);
  const groups = updated['proxy-groups'] || [];
@@ -143,12 +151,7 @@ function transform(config, managed, replace) {
  }
  updated['proxy-providers'] = {...providers, ...managed.providers};
  updated.proxies = (updated.proxies || []).filter(n => !replace.includes(n.name));
- const group = groups.find(g => g.name === ENTRY);
- if (!group) throw Error('缺少中转入口组');
- group.proxies = [];
- group.use = managed.use;
- group.url = managed.revision;
- for (const key of ['include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type']) delete group[key];
+ configureEntry(groups, managed.use);
  updated.dns ||= {};
  for (const key of ['nameserver-policy', 'proxy-server-nameserver-policy']) {
   updated.dns[key] = {...updated.dns[key], ...managed.dns};
@@ -171,8 +174,8 @@ main=function(config,profileName){
     else delete providers[name];}
   r["proxy-providers"]={...providers,...m.providers};
   const g=groups.find(g=>g.name==="中转入口");
-  if(g){g.proxies=[];g.use=m.use;g.url=m.revision;
-    for(const k of ["include-all","include-all-proxies","include-all-providers","filter","exclude-filter","exclude-type"])delete g[k];}
+  if(g){g.proxies=[];g.use=m.use;
+    for(const k of ["url","include-all","include-all-proxies","include-all-providers","filter","exclude-filter","exclude-type"])delete g[k];}
   r.dns=r.dns||{};
   for(const k of ["nameserver-policy","proxy-server-nameserver-policy"])r.dns[k]={...(r.dns[k]||{}),...m.dns};
   return r;
@@ -204,29 +207,18 @@ function legacyPin(original, config, savedName) {
  return [savedName];
 }
 
-async function proxyProviders(b) {
- return (await b.api('GET', '/providers/proxies', undefined, 1000)).providers;
-}
-
 async function observeReload(b) {
- try { return [await b.state(1000), await proxyProviders(b)]; } catch { return null; }
+ try { return await b.relayState(1000); } catch { return null; }
 }
 
-function confirmedState(observed, group, selection) {
- if (!observed) return null;
- const [after, providers] = observed;
- const use = liveEntryProviders(after.entryRevision, group, after.live, providers);
- if (use.length &&
-     use.every(owner => isDeepStrictEqual(providers[owner]?.proxies?.map(node => node.name), selection[owner]))) {
-  return after;
- }
- return null;
+function confirmedState(observed, members) {
+ return observed && sameEntryMembers(observed.live, members) ? observed : null;
 }
 
-async function waitForReload(b, group, selection) {
+async function waitForReload(b, members) {
  const deadline = performance.now() + 10000;
  for (let attempt = 0; attempt < 6; attempt++) {
-  const after = confirmedState(await observeReload(b), group, selection);
+  const after = confirmedState(await observeReload(b), members);
   if (after) return after;
   const remaining = deadline - performance.now();
   if (attempt === 5 || remaining <= 0) break;
@@ -235,7 +227,9 @@ async function waitForReload(b, group, selection) {
  throw Error(RELOAD_UNCERTAIN);
 }
 
-async function selectAfterReload(b, before, desired, group, selection, after) {
+async function selectAfterReload(b, before, after, members, selection, inventory) {
+ const owners = selectionOwners(selection);
+
  function checkedState(observed, error) {
   if (!observed || CHAIN_KEYS.some(key => observed[key] !== before[key])) {
    throw Error(error);
@@ -244,16 +238,25 @@ async function selectAfterReload(b, before, desired, group, selection, after) {
  }
 
  after = checkedState(after, POST_RELOAD_CHANGE);
- if (after.entry === desired) return;
- for (let attempt = 0; attempt < 2 && after.entry !== desired; attempt++) {
+ if (owners.has(after.entry)) return after.entry;
+ const plan = reconcile({sources:await inventory(), selection, live:after.live, current:null,
+  metric:b.settings.metric, results:benchmarkResults(b)});
+ const desired = plan.entry ?? owners.keys().next().value;
+ after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
+ for (let attempt = 0; attempt < 2; attempt++) {
+  if (owners.has(after.entry)) return after.entry;
   try { await b.api('PUT', ENTRY_ROUTE, {name: desired}); }
   catch { /* Check whether the switch applied before retrying. */ }
-  after = checkedState(confirmedState(await observeReload(b), group, selection), SWITCH_FAILED);
+  after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
+  if (after.entry === desired) {
+   await timers.setTimeout(300);
+   after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
+   if (after.entry !== desired) throw Error(SWITCH_FAILED);
+   return desired;
+  }
  }
- if (after.entry !== desired) throw Error(SWITCH_FAILED);
- await timers.setTimeout(300);
- after = checkedState(confirmedState(await observeReload(b), group, selection), SWITCH_FAILED);
- if (after.entry !== desired) throw Error(SWITCH_FAILED);
+ if (owners.has(after.entry)) return after.entry;
+ throw Error(SWITCH_FAILED);
 }
 
 async function rollback(written, originals) {
@@ -294,12 +297,12 @@ async function reloadPayload(config, root, selection, updates) {
  return YAML.stringify(live);
 }
 
-async function finishUpdate(b, policyFile, saved, pending, group, after, desired, profiles) {
- pending.switch_owed ||= after.entry !== desired;
- saved.pending_update = pending;
- delete saved.reload_unconfirmed;
- await atomic(policyFile, JSON.stringify(saved, null, 2));
- await selectAfterReload(b, pending.chain, desired, group, saved.selected_nodes, after);
+async function finishUpdate(b, policyFile, saved, members, before, after, profiles, inventory) {
+ if (saved.reload_unconfirmed) {
+  delete saved.reload_unconfirmed;
+  await atomic(policyFile, JSON.stringify(saved, null, 2));
+ }
+ const desired = await selectAfterReload(b, before, after, members, saved.selected_nodes, inventory);
  const original = await read(profiles);
  const index = YAML.parse(original.toString());
  if (updateSelector(index, desired)) {
@@ -311,44 +314,47 @@ async function finishUpdate(b, policyFile, saved, pending, group, after, desired
  await atomic(policyFile, JSON.stringify(saved, null, 2));
 }
 
-async function resumeUpdate(b, policyFile, saved) {
- await b.config(); // Resolve the controller and local config paths.
- const rawConfig = await read(b.configFile);
- const config = YAML.parse(rawConfig.toString());
- const group = config['proxy-groups']?.find(item => item.name === ENTRY);
- const profiles = path.join(b.root, 'profiles.yaml'), selection = saved.selected_nodes;
- const observed = await observeReload(b);
- if (!observed) throw Error(RELOAD_PENDING);
- let pending = saved.pending_update;
- if (!pending) {
-  // Recover the previous format using the saved selector and disk membership.
-  const index = await doc(profiles);
-  const profile = index.items.find(item => item.uid === index.current);
-  const desired = profile?.selected?.find(choice => choice.name === ENTRY)?.now;
-  pending = {config_hash:digest(rawConfig), chain:Object.fromEntries(CHAIN_KEYS.map(key => [key, observed[0][key]])),
-   previous_entry:desired, switch_owed:desired !== observed[0].entry,
-   sources:(group?.use || []).map(id => ({id, nodes:selection[id]}))};
- }
- if (pending.config_hash !== digest(rawConfig)) throw Error(EXTERNAL_CHANGE);
- if (CHAIN_KEYS.some(key => observed[0][key] !== pending.chain[key])) throw Error(POST_RELOAD_CHANGE);
- let after = confirmedState(observed, group, selection);
- if (!after) {
+async function resumeUpdate(b, policyFile, saved, reapply = false) {
+ const selection = saved.selected_nodes;
+ // Older pending records can recover the planned names from the saved selection.
+ const members = saved.pending_update?.members ?? [...selectionOwners(selection).keys()];
+ const before = await observeReload(b);
+ if (!before) throw Error(RELOAD_PENDING);
+ b.assertChain(before);
+ if (!b.root) await b.config();
+ let after = confirmedState(before, members);
+ if (reapply || !after) {
+  const config = await b.config();
+  if (config.proxies?.find(node => node.name === EXIT)?.['dialer-proxy'] !== ENTRY) {
+   throw Error('固定出口的链式上游已变化，未修改');
+  }
+  const use = Object.entries(selection).filter(([, names]) => names.length).map(([owner]) => owner);
+  if (use.some(owner => !Object.hasOwn(config['proxy-providers'] || {}, owner))) {
+   throw Error('代理缓存不完整，未修改');
+  }
+  configureEntry(config['proxy-groups'] || [], use);
   const payload = await reloadPayload(config, b.root, selection, new Map());
+  saved.pending_update = {members};
   saved.reload_unconfirmed = true;
   await atomic(policyFile, JSON.stringify(saved, null, 2));
   try { await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000); }
-  catch { /* Read back even when the response was lost. */ }
-  after = await waitForReload(b, group, selection);
+  catch (error) {
+   if (reapply && error instanceof ClashHTTPError && error.rejected) {
+    delete saved.pending_update;
+    delete saved.reload_unconfirmed;
+    await atomic(policyFile, JSON.stringify(saved, null, 2));
+    throw Error('Clash 未更新，请刷新状态后重试');
+   }
+  }
+  after = await waitForReload(b, members);
  }
- const current = pending.switch_owed ? null : pending.previous_entry;
- const plan = reconcile({sources:pending.sources, selection, live:after.live, current,
-  metric:b.settings.metric, results:benchmarkResults(b)});
- if (plan.entry === null) throw Error(NO_SELECTION);
- await finishUpdate(b, policyFile, saved, pending, group, after, plan.entry, profiles);
+ const profiles = path.join(b.root, 'profiles.yaml');
+ await finishUpdate(b, policyFile, saved, members, before, after, profiles,
+  async () => inventoryFor((await discover(b)).sources));
  return true;
 }
 
-async function run(b, request = null, {removal = null, initialize = false} = {}) {
+async function run(b, request = null, {removal = null, initialize = false, refresh = false} = {}) {
  if (b.busy) throw Error('已有操作正在运行');
  b.busy = true;
  try {
@@ -362,7 +368,10 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    return await resumeUpdate(b, policyFile, saved);
   }
   if (saved.reload_unconfirmed) throw Error(RELOAD_PENDING);
-  if (initialize && !needsInitialization) return false;
+  if (initialize && !needsInitialization) {
+   if (refresh && selectionOwners(selection).size) return await resumeUpdate(b, policyFile, saved, true);
+   return false;
+  }
   const before = await b.state();
   b.assertChain(before);
   await b.config();
@@ -414,8 +423,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    }
   }
   const inventory = inventoryFor(sources);
-  const switchOwed = saved.initialization_pending || saved.pending_update?.switch_owed;
-  const plan = reconcile({sources:inventory, selection, live:before.live, current:switchOwed ? null : before.entry,
+  const plan = reconcile({sources:inventory, selection, live:before.live, current:before.entry,
    metric:b.settings.metric, results:benchmarkResults(b)});
   if (!plan.candidates.length) {
    if (syncing) await atomic(previewFile, YAML.stringify({
@@ -431,7 +439,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const registryFile = path.join(b.dataDir, 'subscriptions.json');
   const replace = legacyPin(baselines.get(script), config, saved.pinned_entry);
-  const desired = plan.entry;
   const definitions = new Map(), dns = {}, existing = config['proxy-providers'] || {};
   for (const {source, document} of sources) {
    const owner = source.name;
@@ -457,11 +464,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const retired = Object.fromEntries(Object.entries(existing).filter(([name, definition]) =>
    !definitions.has(name) && definition.path &&
    path.resolve(b.root, definition.path) === path.join(b.root, 'providers', 'linkbox', name + '.yaml')));
-  // The test URL identifies the revision. Membership is verified separately.
-  const revision = ENTRY_REVISION_PREFIX + crypto.randomUUID().replaceAll('-', '');
-  const managed = {providers: Object.fromEntries(definitions), retired, dns, use, revision};
+  const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
   const updated = transform(config, managed, replace);
-  const group = updated['proxy-groups'].find(item => item.name === ENTRY);
   updates.set(script, scriptText(baselines.get(script), managed));
   updates.set(configFile, YAML.stringify(updated));
   const index = YAML.parse(baselines.get(profiles).toString());
@@ -471,10 +475,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    provider_labels: Object.fromEntries(sources.map(({source}) => [source.name, source.display_name])),
   };
   if (needsInitialization) nextPolicy.initialization_pending = true;
-  const pending = {config_hash:digest(updates.get(configFile)),
-   chain:Object.fromEntries(CHAIN_KEYS.map(key => [key, before[key]])), previous_entry:before.entry,
-   switch_owed:desired !== before.entry, sources:inventory};
-  nextPolicy.pending_update = pending;
+  const members = plan.candidates.map(({name}) => name);
+  nextPolicy.pending_update = {members};
   nextPolicy.reload_unconfirmed = true;
   updates.set(policyFile, JSON.stringify(nextPolicy, null, 2));
   updates.set(registryFile, JSON.stringify({sources: sources.map(({source}) => source)}, null, 2));
@@ -524,8 +526,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
     throw Error('Clash 未更新，文件已回退；请刷新状态后重试');
    }
   }
-  const after = await waitForReload(b, group, plan.selection);
-  await finishUpdate(b, policyFile, nextPolicy, pending, group, after, desired, profiles);
+  const after = await waitForReload(b, members);
+  await finishUpdate(b, policyFile, nextPolicy, members, before, after, profiles, () => inventory);
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
  } finally {
@@ -533,8 +535,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
  }
 }
 
-async function initialize(b) {
- return run(b, null, {initialize: true});
+async function initialize(b, {refresh = false} = {}) {
+ return run(b, null, {initialize: true, refresh});
 }
 
 async function remove(b, request) {

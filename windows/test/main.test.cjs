@@ -24,7 +24,12 @@ test('only startup and manual Refresh retry transient initialization failures', 
  const webContents = {mainFrame:{}}, event = {sender:webContents,senderFrame:webContents.mainFrame};
  const electron = {app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
   ipcMain:{handle(_channel,fn){handler=fn;}}};
- const subscriptions = {async initialize(){if (++calls === 1) throw Error('offline');return calls === 2;}};
+ const refreshes = [];
+ const subscriptions = {async initialize(_backend,{refresh}){
+  refreshes.push(refresh);
+  if (++calls === 1) throw Error('offline');
+  return calls === 2;
+ }};
  const fake = {root:'fixture',state:async()=>({
   mode:'global',exit:'美国静态家宽',dialer:'中转入口',entry:'current',nodes:[],settings:{},expectedIP:'203.0.113.10',
  })};
@@ -65,6 +70,7 @@ test('only startup and manual Refresh retry transient initialization failures', 
  assert.equal(select('#notice').textContent,'');
  assert.equal(calls,2);
  await select('#refresh').onclick();
+ assert.deepEqual(refreshes,[false,true,true]);
  assert.equal(vm.runInContext('initializedSelection',context),true);
  assert.deepEqual(reads,[true,false,false,false,false,false,true,true]);
 });

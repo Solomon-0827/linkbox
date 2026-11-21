@@ -45,7 +45,6 @@ def snapshot(include_nodes=True):
     c,p=t.state()
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
     data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':list(selection_owners(selection)),'live':p.get(t.ENTRY,{}).get('all',[]),'expected_ip':runtime.expected_ip()}
-    data['entry_revision'] = p.get(t.ENTRY, {}).get('testUrl')
     if include_nodes:
         try:data['node_rows']=node_rows(p, selection)
         except Exception as e:data['node_rows_error']=str(e)
@@ -94,7 +93,7 @@ def latency():
                 if not pending:break
                 wait(pending,timeout=.2,return_when=FIRST_COMPLETED)
         after=snapshot(False)
-        unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live','entry_revision'])
+        unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live'])
         save_benchmark('latency', {
             'finished_at': datetime.datetime.now().astimezone().isoformat(),
             'results': results, 'selection_unchanged': unchanged,
@@ -119,15 +118,15 @@ def change(target,previous,guard=None):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
     owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
     owner = owners.get(target)
-    if not t.entry_member_owned(s, t.proxy_providers(), t.entry_config(), target, owner):
+    if not t.entry_member_owned(s['live'], owners, target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
-    if (selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner
-            or not t.entry_member_owned(after, t.proxy_providers(), t.entry_config(), target, owner)):
+    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+    if not t.entry_member_owned(after['live'], owners, target, owner):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)
@@ -165,7 +164,9 @@ def main():
         result = {'startup_checked': ready}
         if ready:
             try:
-                result['initialized'] = subscription_picker.initialize(sys.argv[2])
+                result['initialized'] = subscription_picker.initialize(sys.argv[2], refresh='--refresh' in sys.argv[3:])
+                if result['initialized'] and '--refresh' in sys.argv[3:]:
+                    result['message'] = '已刷新 Clash 状态。'
             except RuntimeError as error:
                 result['startup_checked'] = False
                 result['message'] = str(error)

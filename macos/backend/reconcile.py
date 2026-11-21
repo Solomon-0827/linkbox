@@ -49,3 +49,7 @@ def selection_owners(selection):
         for name in names:
             owners.setdefault(name, owner)
     return owners
+
+
+def same_entry_members(live, planned):
+    return set(live) == set(planned)

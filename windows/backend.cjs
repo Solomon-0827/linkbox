@@ -1,9 +1,8 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),http=require('node:http'),https=require('node:https'),net=require('node:net');
 const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
-const {selectionOwners}=require('./reconcile.cjs');
+const {sameEntryMembers,selectionOwners}=require('./reconcile.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
-const ENTRY_REVISION_PREFIX='https://www.gstatic.com/generate_204#linkbox-';
 const RELOAD_PENDING='配置尚未被 Clash 确认，请先刷新状态';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function jsonRead(p,fallback={}){try{return JSON.parse(await fs.readFile(p,'utf8'));}catch{return fallback;}}
@@ -27,53 +26,7 @@ function autoCandidate(results,current,metric){
  const currentRow=results[current],baseline=currentRow[key];
  return !valid(currentRow.chainDelay)||(valid(baseline)&&baseline-best[1][key]>=Math.max(20,baseline*.10))?best[0]:null;
 }
-function signature(s){return JSON.stringify([s.mode,s.tun,s.entry,s.exit,s.dialer,s.live,s.entryRevision]);}
-function liveEntryProviders(revision, group, live, providers){
- const use = group?.use || [];
- if (!use.length || !revision || revision !== group.url || !revision.startsWith(ENTRY_REVISION_PREFIX) ||
-     providers[ENTRY]?.proxies?.length) return [];
- const names = new Map(Object.entries(providers).filter(([, provider]) => provider.vehicleType !== 'Compatible')
-  .map(([owner, provider]) => [owner, (provider.proxies || []).map(node => node.name)]));
- if (!use.every(owner => names.get(owner)?.length) ||
-     !isDeepStrictEqual(live, use.flatMap(owner => names.get(owner)))) return [];
- // Mihomo exposes ordered member names. Reject if another provider sequence explains them too.
- const byFirst = new Map();
- for (const members of names.values()) {
-  if (!members.length) continue;
-  if (!byFirst.has(members[0])) byFirst.set(members[0], []);
-  byFirst.get(members[0]).push(members);
- }
- const paths = Array(live.length + 1).fill(0);
- paths[0] = 1;
- for (const [i, name] of live.entries()) {
-  if (!paths[i]) continue;
-  for (const members of byFirst.get(name) || []) {
-   const end = i + members.length;
-   if (members.every((member, offset) => live[i + offset] === member)) {
-    paths[end] = Math.min(2, paths[end] + paths[i]);
-   }
-  }
- }
- return paths.at(-1) === 1 ? use : [];
-}
-function entryOwners(live, providers, use){
- const names = new Set(), ambiguous = new Set();
- for (const name of live) {
-  if (names.has(name)) ambiguous.add(name);
-  names.add(name);
- }
- const owners = new Map();
- // Mihomo exposes static group members through a Compatible provider.
- for (const {name} of providers[ENTRY]?.proxies || []) ambiguous.add(name);
- for (const owner of use) {
-  for (const {name} of providers[owner]?.proxies || []) {
-   if (!names.has(name)) continue;
-   if (owners.has(name)) ambiguous.add(name);
-   owners.set(name, owner);
-  }
- }
- return new Map([...owners].filter(([name]) => !ambiguous.has(name)));
-}
+function signature(s){return JSON.stringify([s.mode,s.tun,s.entry,s.exit,s.dialer,[...new Set(s.live)].sort()]);}
 function switchable(state,name,owner){
  return !!owner&&state.switchable.includes(name)&&state.nodes.some(row=>row.name===name&&row.providerId===owner);
 }
@@ -133,16 +86,21 @@ class Backend{
  async api(method,route,body,timeout){
   if(method!=='GET'&&!(method==='PUT'&&(route==='/proxies/'+encodeURIComponent(ENTRY)||/^\/providers\/proxies\/[^/?]+$/.test(route))))throw Error('不允许该控制操作');
   if(!this.endpoint)await this.discover();return this.request(this.endpoint,method,route,body,timeout);}
+ async relayState(timeout){
+  const read=route=>this.api('GET',route,undefined,timeout);
+  const [c,p]=await Promise.all([read('/configs'),read('/proxies')]);
+  const all=p.proxies||{},g=all[ENTRY]||{};
+  return {mode:c.mode,tun:!!c.tun?.enable,ipv6:c.ipv6,mixedPort:c['mixed-port']||7897,
+   entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live:g.all||[]};
+ }
  async state(timeout){
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
   const cfg=await this.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
   this.expectedIP=this.settings.expectedIP||(net.isIP(configured||'')?configured:'');
-  const read=route=>this.api('GET',route,undefined,timeout);
-  const [c,p,providers]=await Promise.all([read('/configs'),read('/proxies'),read('/providers/proxies')]);
-  const all=p.proxies||{},g=all[ENTRY]||{},live=g.all||[];
+  const [relay,providers]=await Promise.all([
+   this.relayState(timeout),this.api('GET','/providers/proxies',undefined,timeout).catch(()=>({})),
+  ]);
   const owners=selectionOwners(this.nodePolicy.selected_nodes);
-  const use=liveEntryProviders(g.testUrl,cfg['proxy-groups']?.find(group=>group.name===ENTRY),live,providers.providers||{});
-  const liveOwners=entryOwners(live,providers.providers||{},use);
   const liveRows=new Map();
   for(const [owner,provider] of Object.entries(providers.providers||{})){
    for(const node of provider.proxies||[]){
@@ -154,9 +112,8 @@ class Backend{
    return {name,providerId:owner,provider:this.nodePolicy.provider_labels?.[owner]||owner,
     type:liveRows.get(name)?.type,...(result.owner==null||result.owner===owner?result:{})};
   });
-  return {expectedIP:this.expectedIP,mode:c.mode,tun:!!c.tun?.enable,ipv6:c.ipv6,mixedPort:c['mixed-port']||7897,
-   entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live,nodes,entryRevision:g.testUrl,
-   switchable:live.filter(name=>liveOwners.has(name)&&liveOwners.get(name)===owners.get(name)),lastTest:this.history.finishedAt,
+  return {...relay,expectedIP:this.expectedIP,nodes,
+   switchable:sameEntryMembers(relay.live,owners.keys())?[...owners.keys()]:[],lastTest:this.history.finishedAt,
    settings:{...benchmarkSettings(this.settings),hourly:this.settings.hourly!==false,configDir:this.root,corePath:this.settings.corePath||''},
    progress:this.progress};
  }
@@ -331,4 +288,4 @@ class Backend{
  const result={time:new Date().toISOString(),expected:this.expectedIP,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,ClashHTTPError,autoCandidate,benchmarkSettings,isolatedConfig,signature,liveEntryProviders,ENTRY_REVISION_PREFIX,RELOAD_PENDING,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,ClashHTTPError,autoCandidate,benchmarkSettings,isolatedConfig,signature,RELOAD_PENDING,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
