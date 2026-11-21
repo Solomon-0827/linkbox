@@ -15,6 +15,7 @@ async function read(p){try{return await fs.readFile(p)}catch(e){if(e.code==='ENO
 async function doc(p){const r=await read(p);return r?YAML.parse(r.toString())||{}:{}}
 async function policy(b){return doc(path.join(b.dataDir,'node-policy.json'))}
 function committedPolicy({pending_update, reload_unconfirmed, ...saved}) {return saved;}
+function targetSelection(saved) {return saved.pending_update?.selection ?? saved.selected_nodes;}
 function parseProfile(raw){
  try { return raw ? YAML.parse(raw.toString()) : null; }
  catch (error) { if (!(error instanceof YAML.YAMLParseError)) throw error; return null; }
@@ -120,7 +121,7 @@ async function catalog(b) {
  const {sources, fingerprint} = await discover(b);
  const state = await b.state();
  const owners = selectionOwners(reconcile({sources: inventoryFor(sources),
-  selection: (await policy(b)).selected_nodes, live: state.live, current: state.entry}).selection);
+  selection: targetSelection(await policy(b)), live: state.live, current: state.entry}).selection);
  const current = state.entry;
  const currentOwner = owners.get(current) ?? sources.find(({document}) =>
   document?.proxies.some(n => n.name === current))?.source.name;
@@ -331,16 +332,35 @@ async function providerPayload(definition, root, readCache, filtered) {
 async function entryPlan(config, root) {
  const entry = config['proxy-groups']?.find(group => group.name === ENTRY);
  if (!entry) throw Error('缺少中转入口组');
- const staticNodes = new Map(config.proxies.map(node => [node.name, node]));
+ const staticNodes = new Map((config.proxies || []).map(node => [node.name, node]));
  const members = new Map((entry.proxies || []).map(name => [name, {owner:null, node:staticNodes.get(name)}]));
- for (const owner of entry.use || []) {
-  const providers = config['proxy-providers'] || {};
+ const accepts = nameFilter(entry);
+ const includeAll = entry['include-all'];
+ if (includeAll || entry['include-all-proxies']) {
+  for (const [name, node] of staticNodes) {
+   if (accepts(name) && !members.has(name)) members.set(name, {owner:null, node});
+  }
+ }
+ const providers = config['proxy-providers'] || {};
+ const use = includeAll || entry['include-all-providers'] ? Object.keys(providers).sort() : entry.use || [];
+ for (const owner of use) {
   if (!Object.hasOwn(providers, owner)) throw Error('代理缓存不完整，未修改');
   for (const node of await providerPayload(providers[owner], root, read, true)) {
-   if (!members.has(node.name)) members.set(node.name, {owner, node});
+   if (accepts(node.name) && !members.has(node.name)) members.set(node.name, {owner, node});
   }
  }
  return members;
+}
+
+async function confirmPendingOwners(b, owners, committed) {
+ const previous = selectionOwners(committed);
+ if (committed != null && !sameEntryMembers(previous.keys(), owners.keys())) return true;
+ const changed = [...owners].filter(([name, owner]) => previous.get(name) !== owner);
+ if (!changed.length) return true;
+ // Equal names can hide a provider change. Look for the new owner before confirming it.
+ const providers = providerNodes(await b.api('GET', '/providers/proxies').catch(() => null));
+ const names = new Map([...providers].map(([owner, nodes]) => [owner, new Set(nodes.map(node => node.name))]));
+ return changed.every(([name, owner]) => names.get(owner)?.has(name) && !names.get(previous.get(name))?.has(name));
 }
 
 async function reloadPayload(config, root, updates, baselines) {
@@ -378,13 +398,23 @@ async function sendReload(b, payload) {
  }
 }
 
+async function finishUpdate(policyFile, saved, profiles, entry) {
+ const original = await read(profiles);
+ const index = YAML.parse(original.toString());
+ if (updateSelector(index, entry)) {
+  if (!equal(original, await read(profiles))) throw Error(EXTERNAL_CHANGE);
+  await atomic(profiles, YAML.stringify(index));
+ }
+ await atomic(policyFile, JSON.stringify(saved, null, 2));
+}
+
 async function run(b, request = null, {removal = null, initialize = false} = {}) {
  if (b.busy) throw Error('已有操作正在运行');
  b.busy = true;
  const update = (async () => {
   const saved = await policy(b);
   const policyFile = path.join(b.dataDir, 'node-policy.json');
-  let selection = saved.selected_nodes;
+  let selection = targetSelection(saved);
   const legacy = ['pinned_entry', 'node_providers', 'verge_sync', 'blocked_providers', 'excluded_nodes']
    .some(key => Object.hasOwn(saved, key));
   const needsInitialization = selection == null || legacy || saved.initialization_pending === true;
@@ -398,7 +428,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    if (pending?.root !== undefined && pending.root !== b.root) {
     throw Error('Clash 配置目录已变化，请在管理节点里重新勾选');
    }
-   selection = pending?.selection ?? selection;
   }
   const syncing = !recovering && request === null && removal === null;
   const previewFile = path.join(b.dataDir, PREVIEW), initializationPolicy = hash([b.root, committedPolicy(saved)]);
@@ -452,11 +481,40 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   if (config.proxies.find(node => node.name === EXIT)?.['dialer-proxy'] !== ENTRY) {
    throw Error('固定出口的链式上游已变化，未修改');
   }
-  if (recovering && sources.some(({source, document}) =>
-   !document && selection && Object.hasOwn(selection, source.name) && selection[source.name].length)) {
-   throw Error('本地缓存暂不可读，保留原勾选');
-  }
   const inventory = inventoryFor(sources);
+  const registry = sources.map(({source}) => source);
+  const labels = Object.fromEntries(registry.map(source => [source.name, source.display_name]));
+  if (recovering) {
+   const disk = await entryPlan(config, b.root).catch(() => null);
+   const owners = selectionOwners(pending?.selection);
+   // The journal is written first, so matching live and disk alone could confirm an older selection.
+   if (owners.size && disk && sameEntryMembers(before.live, disk.keys()) &&
+       disk.size === owners.size && [...disk].every(([name, {owner}]) => owners.get(name) === owner) &&
+       await confirmPendingOwners(b, owners, saved.selected_nodes)) {
+    if (sig(await b.state()) !== sig(before)) throw Error(EXTERNAL_CHANGE);
+    for (const [file, raw] of baselines) {
+     if (!equal(raw, await read(file))) throw Error(EXTERNAL_CHANGE);
+    }
+    let entry = before.entry;
+    if (!owners.has(entry)) {
+     // Keep the ranking aware of duplicate names, even when picker caches have changed.
+     const candidates = new Map(inventory.map(source => [source.id, source.nodes]));
+     for (const [owner, names] of Object.entries(selection)) {
+      candidates.set(owner, [...new Set([...names, ...(candidates.get(owner) || [])])]);
+     }
+     const ranking = [...candidates].map(([id, nodes]) => ({id, nodes}));
+     const {entry:desired} = reconcile({sources:ranking, selection, live:[], current:null,
+      metric:b.settings.metric, results:benchmarkResults(b)});
+     entry = await selectAfterReload(b, before, before, new Set(disk.keys()), owners, desired);
+    }
+    await finishUpdate(policyFile, {selected_nodes:selection, provider_labels:labels}, profiles, entry);
+    return true;
+   }
+   if (sources.some(({source, document}) =>
+    !document && selection && Object.hasOwn(selection, source.name) && selection[source.name].length)) {
+    throw Error('本地缓存暂不可读，保留原勾选');
+   }
+  }
   const seedOwners = selection == null ? await entrySeedOwners(b, config, sources) : undefined;
   const plan = reconcile({sources:inventory, selection, live:before.live, current:before.entry, seedOwners});
   if (!plan.candidates.length) {
@@ -518,11 +576,11 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const nextPolicy = {
    selected_nodes: plan.selection,
-   provider_labels: Object.fromEntries(sources.map(({source}) => [source.name, source.display_name])),
+   provider_labels: labels,
   };
   const oldOwners = selectionOwners(saved.selected_nodes), newOwners = selectionOwners(plan.selection);
   const requireResponse = recovering || [...newOwners].some(([name, owner]) => oldOwners.get(name) !== owner);
-  updates.set(registryFile, JSON.stringify({sources: sources.map(({source}) => source)}, null, 2));
+  updates.set(registryFile, JSON.stringify({sources:registry}, null, 2));
   const originals = new Map([[policyFile, baselines.get(policyFile)]]);
   for (const file of updates.keys()) originals.set(file, baselines.has(file) ? baselines.get(file) : await read(file));
 
@@ -555,7 +613,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    }
   }
   const written = [];
-  if (!recovering) {
+  if (!recovering || !isDeepStrictEqual(pending?.selection, plan.selection)) {
    const journal = {root: b.root, selection: plan.selection};
    await atomic(policyFile, JSON.stringify({...committedPolicy(saved), pending_update: journal}, null, 2));
    written.push(policyFile);
@@ -581,13 +639,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   if (requireResponse && !acknowledged) throw Error(RELOAD_UNCERTAIN);
   const after = await waitForReload(b, members);
   const selectedEntry = await selectAfterReload(b, before, after, members, selectedNames, desired);
-  const currentProfile = await read(profiles);
-  const currentIndex = YAML.parse(currentProfile.toString());
-  if (updateSelector(currentIndex, selectedEntry)) {
-   if (!equal(currentProfile, await read(profiles))) throw Error(EXTERNAL_CHANGE);
-   await atomic(profiles, YAML.stringify(currentIndex));
-  }
-  await atomic(policyFile, JSON.stringify(nextPolicy, null, 2));
+  await finishUpdate(policyFile, nextPolicy, profiles, selectedEntry);
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
  })();

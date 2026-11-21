@@ -286,13 +286,38 @@ def entry_plan(config, root):
         entry = next(g for g in config.get('proxy-groups', []) if g['name'] == t.ENTRY)
         static_nodes = {node['name']: node for node in config.get('proxies', [])}
         members = {name: (None, static_nodes.get(name)) for name in entry.get('proxies') or []}
-        for owner in entry.get('use') or []:
-            definition = config['proxy-providers'][owner]
-            for node in provider_payload(definition, root, read, filtered=True):
-                members.setdefault(node['name'], (owner, node))
+        accepts = name_filter(entry)
+        include_all = entry.get('include-all')
+        if include_all or entry.get('include-all-proxies'):
+            for name, node in static_nodes.items():
+                if accepts(name):
+                    members.setdefault(name, (None, node))
+        providers = config.get('proxy-providers') or {}
+        use = sorted(providers) if include_all or entry.get('include-all-providers') else entry.get('use') or []
+        for owner in use:
+            for node in provider_payload(providers[owner], root, read, filtered=True):
+                if accepts(node['name']):
+                    members.setdefault(node['name'], (owner, node))
         return members
     except (OSError, ValueError, TypeError, AttributeError, KeyError, StopIteration, RuntimeError, re.error, yaml.YAMLError):
         return None
+
+
+def confirm_pending_owners(owners, committed):
+    previous = selection_owners(committed)
+    if committed is not None and not same_entry_members(previous, owners):
+        return True
+    changed = {name: owner for name, owner in owners.items() if previous.get(name) != owner}
+    if not changed:
+        return True
+    # Equal names can hide a provider change. Look for the new owner before confirming it.
+    try:
+        providers = t.provider_nodes(t.api('GET', '/providers/proxies'))
+    except Exception:
+        return False
+    names = {owner: {node['name'] for node in nodes} for owner, nodes in providers.items()}
+    return all(name in names.get(owner, ()) and name not in names.get(previous.get(name), ())
+               for name, owner in changed.items())
 
 
 def reload_payload(config, root, updates, baselines):
@@ -325,6 +350,16 @@ def policy_bytes(policy):
     return json.dumps(policy, ensure_ascii=False, indent=2).encode()
 
 
+def finish_update(policy_file, saved, profiles, entry):
+    original = profiles.read_bytes()
+    index = yaml.safe_load(original)
+    if update_selector(index, entry):
+        if read(profiles) != original:
+            raise RuntimeError(EXTERNAL_CHANGE)
+        atomic(profiles, dump(index))
+    atomic(policy_file, policy_bytes(saved))
+
+
 def rollback(written, originals):
     for path in reversed(written):
         data = originals[path]
@@ -354,7 +389,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             raise RuntimeError('已有测速或订阅更新正在运行') from None
         policy = runtime.read_json('node-policy.json')
         policy_file = runtime.BASE / 'node-policy.json'
-        selection = policy.get('selected_nodes')
+        selection = picker.target_selection(policy)
         legacy = any(key in policy for key in ('pinned_entry', 'node_providers', 'verge_sync',
                                                 'blocked_providers', 'excluded_nodes'))
         needs_initialization = selection is None or legacy or policy.get('initialization_pending') is True
@@ -369,7 +404,6 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             pending = pending or {}
             if pending.get('root', str(root)) != str(root):
                 raise RuntimeError('Clash 配置目录已变化，请在管理节点里重新勾选')
-            selection = pending.get('selection', selection)
         syncing = not recovering and request is None and removal is None
         preview_file = runtime.BASE / picker.PREVIEW
         initialization_policy = picker.fingerprint([str(root), picker.committed_policy(policy)])
@@ -419,9 +453,32 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         exit_node = next((n for n in config.get('proxies', []) if n['name'] == t.EXIT), {})
         if exit_node.get('dialer-proxy') != t.ENTRY:
             raise RuntimeError('固定出口的链式上游已变化，未修改')
-        if recovering and any(doc is None and (selection or {}).get(source['name']) for source, doc in sources):
-            raise RuntimeError('本地缓存暂不可读，保留原勾选')
         inventory = picker.inventory(sources)
+        registry = [s for s, _ in sources]
+        labels = {s['name']: s['display_name'] for s in registry}
+        if recovering:
+            disk = entry_plan(config, root)
+            owners = selection_owners(pending.get('selection'))
+            # The journal is written first, so matching live and disk alone could confirm an older selection.
+            if (owners and disk is not None and same_entry_members(before['live'], disk)
+                    and owners == {name: owner for name, (owner, _) in disk.items()}
+                    and confirm_pending_owners(owners, policy.get('selected_nodes'))):
+                if t.relay_state() != before or any(read(p) != raw for p, raw in baselines.items()):
+                    raise RuntimeError(EXTERNAL_CHANGE)
+                entry = before['entry']
+                if entry not in owners:
+                    # Keep the ranking aware of duplicate names, even when picker caches have changed.
+                    candidates = {source['id']: source['nodes'] for source in inventory}
+                    for owner, names in selection.items():
+                        candidates[owner] = list(dict.fromkeys([*names, *candidates.get(owner, [])]))
+                    ranking = [{'id': owner, 'nodes': names} for owner, names in candidates.items()]
+                    desired = reconcile(ranking, selection, [], None, metric, benchmark_results())['entry']
+                    entry = select_after_reload(before, before, disk, owners, desired)
+                saved = {'selected_nodes': selection, 'provider_labels': labels}
+                finish_update(policy_file, saved, profiles, entry)
+                return True
+            if any(doc is None and (selection or {}).get(source['name']) for source, doc in sources):
+                raise RuntimeError('本地缓存暂不可读，保留原勾选')
         seed_owners = entry_seed_owners(config, sources) if selection is None else None
         plan = reconcile(inventory, selection, before['live'], before['entry'], seed_owners=seed_owners)
         if not plan['candidates']:
@@ -475,14 +532,12 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         index = yaml.safe_load(baselines[profiles])
         if update_selector(index, before['entry'] if before['entry'] in selected_names else desired):
             updates[profiles] = dump(index)
-        registry = [s for s, _ in sources]
         pin = policy.get('pinned_entry')
         if pin and pin not in members:
             plan['selection'] = {owner: [name for name in names if name != pin]
                                  for owner, names in plan['selection'].items()}
             plan['selection'] = {owner: names for owner, names in plan['selection'].items() if names}
-        saved = {'selected_nodes': plan['selection'],
-                 'provider_labels': {s['name']: s['display_name'] for s in registry}}
+        saved = {'selected_nodes': plan['selection'], 'provider_labels': labels}
         old_owners = selection_owners(policy.get('selected_nodes'))
         new_owners = selection_owners(plan['selection'])
         require_response = recovering or any(old_owners.get(name) != owner for name, owner in new_owners.items())
@@ -511,7 +566,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             for i, path in enumerate(backup_files):
                 (backup / (str(i) + '-' + path.name)).write_bytes(originals[path])
         written = []
-        if not recovering:
+        if not recovering or pending.get('selection') != plan['selection']:
             last_saved = picker.committed_policy(policy)
             journal = {'root': str(root), 'selection': plan['selection']}
             atomic(policy_file, policy_bytes({**last_saved, 'pending_update': journal}))
@@ -534,13 +589,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             raise RuntimeError(RELOAD_UNCERTAIN)
         after = wait_for_reload(members)
         desired = select_after_reload(before, after, members, selected_names, desired)
-        original = profiles.read_bytes()
-        index = yaml.safe_load(original)
-        if update_selector(index, desired):
-            if read(profiles) != original:
-                raise RuntimeError(EXTERNAL_CHANGE)
-            atomic(profiles, dump(index))
-        atomic(policy_file, policy_bytes(saved))
+        finish_update(policy_file, saved, profiles, desired)
         if initialize:
             return True
         message = '已同步 Clash Verge 订阅。' if syncing else '已保存节点选择。'

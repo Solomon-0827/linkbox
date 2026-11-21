@@ -106,6 +106,95 @@ async function fixture(t) {
   refreshWith: value => {refreshed = value;}, saved: async () => JSON.parse(await fs.readFile(policy, 'utf8'))};
 }
 
+for (const flag of ['include-all-providers', 'include-all-proxies', 'include-all']) {
+ test(`switches an unmanaged ENTRY using ${flag}`, async t => {
+  const {b, config, state, write} = await fixture(t);
+  config.proxies = ['current','static-fast','static-slow','static-drop'].map(name => node(name));
+  config['proxy-providers'] = {a:{type:'inline',
+   payload:['provider-fast','provider-slow','provider-drop','provider-hidden'].map(name => node(name)),
+   'exclude-filter':'hidden'}};
+  config['proxy-groups'][0] = {name:ENTRY, type:'select', proxies:['current'], [flag]:true,
+   filter:'fast|drop|hidden', 'exclude-filter':'drop'};
+  await write('clash-verge.yaml', config);
+  state.live = ['current'];
+  if (flag !== 'include-all-providers') state.live.push('static-fast');
+  if (flag !== 'include-all-proxies') state.live.push('provider-fast');
+  delete b.state;
+  const target = state.live.at(-1);
+  assert.equal((await b.switchNode(target,'current')).entry, target);
+ });
+}
+
+async function saveWithLostAcknowledgment(t) {
+ const fx = await fixture(t);
+ const {b, state, write, apply, saved, requests} = fx;
+ await apply({a:['current','fast'], b:[]});
+ await write('profiles/b.yaml', {proxies:[node('fast','b.example.invalid'),node('other')]});
+ const controller = b.request;
+ b.request = async (...args) => {
+  const result = await controller(...args);
+  if (args[2] === '/configs?force=false') throw Error('response lost');
+  return result;
+ };
+ await assert.rejects(apply({a:[], b:['fast','other']}), /尚未确认/);
+ requests.length = 0;
+ assert.deepEqual(state.live, ['fast','other']);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+ return {...fx, controller};
+}
+
+test('Refresh commits an applied Save without reload', async t => {
+ const {b, saved, requests} = await saveWithLostAcknowledgment(t);
+ const validate = t.mock.method(b, 'validateConfig');
+ delete b.state;
+ assert.deepEqual(await sub.startup(b), {changed:true});
+ assert.deepEqual(await sub.startup(b), {changed:false});
+ assert.deepEqual((await b.state()).nodes.map(row => row.name), ['fast','other']);
+ const {nodes} = await b.loadNodes();
+ assert.deepEqual([...nodes.keys()], ['fast','other']);
+ assert.equal(nodes.get('fast').server, 'b.example.invalid');
+ const policy = await saved();
+ assert.deepEqual(policy.selected_nodes, {b:['fast','other']});
+ assert.equal(policy.provider_labels.b, 'B');
+ assert.equal(policy.pending_update, undefined);
+ assert.deepEqual(requests, []);
+ assert.equal(validate.mock.callCount(), 0);
+});
+
+test('Sync starts from the applied but unacknowledged Save', async t => {
+ const {b, controller, state, refreshWith, saved} = await saveWithLostAcknowledgment(t);
+ b.request = controller;
+ refreshWith({a:['current','fast'], b:['fast','other','new']});
+ await b.updateSubscriptions();
+ const policy = await saved();
+ assert.deepEqual(policy.selected_nodes, {b:['fast','other']});
+ assert.equal(policy.pending_update, undefined);
+ assert.deepEqual(state.live, ['fast','other']);
+});
+
+test('Refresh confirms a recomputed selection after another lost acknowledgment', async t => {
+ const {b, apply, write, saved, requests} = await fixture(t);
+ await apply({a:['current','fast'], b:[]});
+ const controller = b.request;
+ let replaying = false;
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') {
+   if (replaying) await controller(...args);
+   throw Error('response lost');
+  }
+  return controller(...args);
+ };
+ await assert.rejects(apply({a:['fast','quick'], b:[]}), /尚未确认/);
+ await write('profiles/a.yaml', {proxies:[node('fast')]});
+ replaying = true;
+ await assert.rejects(sub.initialize(b), /尚未确认/);
+ assert.deepEqual((await saved()).pending_update.selection, {a:['fast']});
+ requests.length = 0;
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
+ assert.deepEqual(requests, []);
+});
+
 test('Save confirms with identical names loaded by an include-all group', async t => {
  const {b, config, write, apply, saved, requests} = await fixture(t);
  config['proxy-providers'] = {b:{type:'inline', payload:['current','fast'].map(n => node(n))}};
@@ -171,7 +260,7 @@ test('same-name owner move with connection refused rolls back', async t => {
  assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-groups'][0].use, ['a']);
 });
 
-test('same-name owner move requires a reload response on Refresh', async t => {
+test('Refresh confirms an applied same-name owner move', async t => {
  const {b, state, apply, write, saved, requests} = await fixture(t);
  await write('profiles/b.yaml', {proxies:[node('current'),node('fast')]});
  await apply({a:['current','fast'], b:[]});
@@ -189,7 +278,8 @@ test('same-name owner move requires a reload response on Refresh', async t => {
  b.request = controller;
  requests.length = 0;
  assert.equal(await sub.initialize(b), true);
- assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
+ assert.deepEqual(requests, []);
+ assert.deepEqual((await saved()).selected_nodes, {b:['current','fast']});
  assert.equal((await saved()).pending_update, undefined);
 });
 
@@ -403,7 +493,7 @@ async function checkLateReloadAfterSave(t, names, {rewrite, vergeEntry}) {
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, vergeEntry || names[0]);
- assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
+ assert.deepEqual(requests, []);
  assert.equal((await saved()).pending_update, undefined);
  assert.equal((await saved()).reload_unconfirmed, undefined);
 }
@@ -752,8 +842,13 @@ for (const scenario of ['preview Save', 'first-run Sync', 'ordinary Save']) {
    assert.deepEqual((await saved()).selected_nodes, {a:[name]});
   } else {
    refreshWith(fresh);
+   if (scenario !== 'first-run Sync') {
+    await assert.rejects(b.updateSubscriptions(), /管理节点/);
+    assert.deepEqual((await saved()).pending_update.selection, journalSelection);
+    refreshWith({...fresh,a:[...fresh.a, ...journalSelection.a]});
+   }
    await b.updateSubscriptions();
-   assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+   assert.deepEqual((await saved()).selected_nodes, journalSelection);
   }
   const final = await saved();
   assert.deepEqual(journals, [{root:fx.root, selection:final.selected_nodes}]);
@@ -1029,7 +1124,7 @@ test('initialization retries after files are written but reload is unconfirmed',
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(await sub.initialize(b), false);
- assert.equal(requests.length, 2);
+ assert.equal(requests.length, 1);
 });
 
 for (const late of [false, true]) test(`Refresh finishes an existing user's pending update (${late ? 'late reload' : 'lost request'})`, async t => {
@@ -1053,7 +1148,7 @@ for (const late of [false, true]) test(`Refresh finishes an existing user's pend
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'quick');
- assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.deepEqual(requests.map(({route}) => route), late ? [ENTRY_ROUTE] : ['/configs?force=false', ENTRY_ROUTE]);
  const index = YAML.parse(await fs.readFile(path.join(root, 'profiles.yaml'), 'utf8'));
  assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'quick'}]);
  assert.equal((await saved()).pending_update, undefined);
@@ -1107,7 +1202,7 @@ test('initialization replans from the latest results after a failed switch', asy
  requests.length = 0;
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'other');
- assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.deepEqual(requests.map(({route}) => route), [ENTRY_ROUTE]);
  assert.equal(await sub.initialize(b), false);
 });
 

@@ -26,6 +26,11 @@ def committed_policy(policy):
             if key not in ('pending_update', 'reload_unconfirmed')}
 
 
+def target_selection(policy):
+    pending = (policy.get('pending_update') or {}).get('selection')
+    return policy.get('selected_nodes') if pending is None else pending
+
+
 def document(raw):
     try:
         value = yaml.safe_load(raw) if raw is not None else None
@@ -129,7 +134,7 @@ def inventory(sources):
 def catalog():
     sources, fingerprint, _ = discover()
     state = t.relay_state()
-    saved = runtime.read_json('node-policy.json').get('selected_nodes')
+    saved = target_selection(runtime.read_json('node-policy.json'))
     owners = selection_owners(reconcile(inventory(sources), saved, state['live'], state['entry'])['selection'])
     current = state['entry']
     current_source = owners.get(current)
