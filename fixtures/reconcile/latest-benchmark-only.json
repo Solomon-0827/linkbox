@@ -1,0 +1,23 @@
+{
+  "inputs": {
+    "sources": [
+      {"id": "a", "nodes": ["stale", "fresh"]}
+    ],
+    "selection": {"a": ["gone", "stale", "fresh"]},
+    "live": ["gone", "stale", "fresh"],
+    "current": "gone",
+    "metric": "entrance",
+    "results": {
+      "stale": {"owner": "a", "chain": null, "entrance": null},
+      "fresh": {"owner": "a", "chain": 120, "entrance": 50}
+    }
+  },
+  "expected": {
+    "selection": {"a": ["stale", "fresh"]},
+    "candidates": [
+      {"name": "stale", "owner": "a"},
+      {"name": "fresh", "owner": "a"}
+    ],
+    "entry": "fresh"
+  }
+}

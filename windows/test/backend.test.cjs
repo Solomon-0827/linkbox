@@ -5,7 +5,23 @@ test('IPv6 incomplete probes must never pass',()=>{assert.equal(ipv6Assessment([
 test('Claude connections require exact endpoint evidence and verified proxy exit',()=>{const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1',OwningProcess:123}],cons=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽','GLOBAL']}];assert.equal(assessClaude(rows,cons,EXPECTED).status,'ok');assert.equal(assessClaude(rows,cons,'203.0.113.11').status,'warn');assert.equal(assessClaude([],[],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[...cons,...cons],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[{...cons[0],chains:['DIRECT']}],EXPECTED).status,'bad');});
 test('live API rejects reloads, connection closes, route patches and deletions',async()=>{const b=new Backend('/tmp');for(const [method,url]of [['PUT','/configs'],['PATCH','/configs'],['DELETE','/connections'],['PUT','/proxies/GLOBAL'],['POST','/restart']])await assert.rejects(b.api(method,url));});
 test('switch validates stale state before writes and writes only entrance',async()=>{const b=new Backend('/tmp'),state={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a',providerId:'a'},{name:'b',providerId:'a'}],live:['a','b'],switchable:['a','b']};let wrote=[];b.state=async()=>state;b.api=async(m,u,p)=>{wrote.push([m,u,p]);state.entry=p.name};await assert.rejects(b.switchNode('b','stale'));assert.equal(wrote.length,0);await b.switchNode('b','a');assert.deepEqual(wrote,[['PUT','/proxies/'+encodeURIComponent('中转入口'),{name:'b'}]]);});
-test('HTTP API timeout and auth are scoped to local request',async()=>{const server=http.createServer((req,res)=>{assert.equal(req.headers.authorization,'Bearer local-test');res.end('{"version":"test"}')});await new Promise(r=>server.listen(0,'127.0.0.1',r));try{const b=new Backend('/tmp'),r=await b.request({hostname:'127.0.0.1',port:server.address().port,secret:'local-test'},'GET','/version');assert.equal(r.version,'test')}finally{server.close()}});
+test('local HTTP API distinguishes a rejection with a body from an empty HTTP error', async () => {
+ const server = http.createServer((req, res) => {
+  assert.equal(req.headers.authorization, 'Bearer local-test');
+  if (req.url === '/version') return res.end('{"version":"test"}');
+  res.statusCode = 400;
+  res.end(req.url === '/rejected' ? '{"message":"rejected"}' : undefined);
+ });
+ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+ try {
+  const b = new Backend('/tmp'), endpoint = {hostname:'127.0.0.1',port:server.address().port,secret:'local-test'};
+  assert.equal((await b.request(endpoint,'GET','/version')).version, 'test');
+  await assert.rejects(b.request(endpoint,'PUT','/rejected'), {rejected:true});
+  await assert.rejects(b.request(endpoint,'PUT','/empty'), {rejected:false});
+ } finally {
+  server.close();
+ }
+});
 test('parallel benchmark is bounded and leaves live API read-only',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-pool-'));try{const b=await new Backend(dir).init();const s={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi',addresses:['192.0.2.2']});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.corePath=async()=>'mock.exe';b.api=async()=>{throw Error('unexpected mutation')};let active=0,peak=0;b.testNode=async()=>{peak=Math.max(peak,++active);await new Promise(r=>setTimeout(r,10));active--;return {delay:100,status:'done',kind:'chain'}};const result=await b.benchmark();assert.equal(Object.keys(result.results).length,8);assert.equal(peak,5);assert.equal(active,0);assert.equal(s.entry,'a');assert.equal(b.busy,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
 test('network changes discard results and do not switch nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-change-'));try{const b=await new Backend(dir).init();let changed=false;const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a'}]};b.state=async()=>s;b.network=async()=>({name:changed?'Ethernet':'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map([['a',{}]]),exit:{}});b.corePath=async()=>'mock';b.testNode=async()=>{changed=true;return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.match(r.reason,/变化/);assert.equal(s.entry,'a')}finally{await fs.rm(dir,{recursive:true,force:true})}});
 test('a cancelled benchmark never runs remaining nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-cancel-'));try{const b=await new Backend(dir).init();const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.corePath=async()=>'mock';let calls=0;b.testNode=async()=>{calls++;b.cancel();return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.ok(calls<=5);assert.equal(b.busy,false);assert.equal(b.progress.running,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
@@ -102,7 +118,8 @@ test('benchmark loads duplicate credentials only from the selected owner and inc
  const b = await new Backend(folder).init(), ENTRY = '中转入口', EXIT = '美国静态家宽';
  const node = server => ({name:'same',server});
  const config = {proxies:[node('local.example.invalid'),{name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY}],
-  'proxy-providers':{a:{payload:[node('a.example.invalid')]},b:{payload:[node('b.example.invalid')]}}};
+  'proxy-providers':{a:{payload:[node('a.example.invalid')]},b:{payload:[node('b.example.invalid')]}},
+  'proxy-groups':[{name:ENTRY,use:['a','b']}]};
  b.config = async () => config;
  b.api = async (method,route) => {
   assert.equal(method,'GET');
@@ -132,7 +149,8 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
   await fs.writeFile(path.join(folder, 'node-policy.json'), JSON.stringify({selected_nodes:{a:['current','same']}}));
   const current = {name:'current',server:'current.invalid'}, same = {name:'same',server:'a.invalid'};
   const exit = {name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY};
-  b.config = async () => ({proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}}});
+  b.config = async () => ({proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
+   'proxy-groups':[{name:ENTRY,use:['a','b']}]});
   b.network = async () => ({interface:'Wi-Fi'});
   b.corePath = async () => '/mock';
   b.testNode = async node => ({delay: node.name === 'current' ? 400 : 100});
@@ -156,3 +174,34 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
   assert.deepEqual(writes, changedAfterPut ? ['same'] : []);
  });
 }
+
+for (const automatic of [false, true]) test(
+ `${automatic ? 'automatic' : 'manual'} switch ignores a duplicate loaded by another group`, async t => {
+ const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-switch-group-'));
+ t.after(() => fs.rm(folder, {recursive:true, force:true}));
+ const {ENTRY, EXIT} = require('../backend.cjs');
+ const b = await new Backend(folder).init();
+ b.settings.autoRelay = true;
+ await fs.writeFile(path.join(folder, 'node-policy.json'), JSON.stringify({selected_nodes:{a:['current','same']}}));
+ const current = {name:'current',server:'current.invalid'}, same = {name:'same',server:'a.invalid'};
+ const exit = {name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY};
+ const config = {proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
+  'proxy-groups':[{name:ENTRY,use:['a']},{name:'secondary',use:['b']}]};
+ b.config = async () => config;
+ b.network = async () => ({interface:'fixture'});
+ b.corePath = async () => '/mock';
+ b.testNode = async node => ({delay:node.name === 'current' ? 400 : 100});
+ let entry = 'current';
+ b.api = async (method, route, body) => {
+  if (method === 'PUT') {entry = body.name;return;}
+  if (route === '/configs') return {mode:'global'};
+  if (route === '/proxies') return {proxies:{
+   GLOBAL:{now:EXIT},[ENTRY]:{now:entry,all:['current','same']},[EXIT]:{'dialer-proxy':ENTRY},
+   secondary:{now:'same',all:['same']},
+  }};
+  return {providers:{a:{proxies:[current,same]},b:{proxies:[{name:'same',server:'b.invalid'}]}}};
+ };
+ if (automatic) assert.equal((await b.benchmark('chain', () => true)).switchedTo, 'same');
+ else assert.equal((await b.switchNode('same','current')).entry, 'same');
+ assert.equal(entry, 'same');
+});

@@ -113,7 +113,7 @@ def change(target,previous,guard=None):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
     owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
     owner = owners.get(target)
-    if not t.entry_member_owned(s['live'], t.proxy_providers(), target, owner):
+    if not t.entry_member_owned(s['live'], t.proxy_providers(), t.entry_provider_names(), target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
@@ -121,7 +121,7 @@ def change(target,previous,guard=None):
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
     if (selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner
-            or not t.entry_member_owned(after['live'], t.proxy_providers(), target, owner)):
+            or not t.entry_member_owned(after['live'], t.proxy_providers(), t.entry_provider_names(), target, owner)):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)

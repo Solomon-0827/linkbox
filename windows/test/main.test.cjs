@@ -19,19 +19,54 @@ test('dynamic scheduler replaces its previous timer and skips while the UI is bu
  vm.runInContext('backend.settings.hourly=false;scheduleAuto()',context);assert.deepEqual(cleared,[1,2]);assert.equal(intervals.length,2);
 });
 
-test('startup state retries a failed initialization on Refresh and stops after success', async () => {
- let calls=0;
- const electron={app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},ipcMain:{handle(){}}};
- const subscriptions={async initialize(){if(++calls===1)throw Error('offline');return true;}};
- const fake={root:'fixture',state:async()=>({mode:'global',exit:'美国静态家宽',dialer:'中转入口'})};
- const context=vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?subscriptions:
-  name==='./backend.cjs'?{safeError:e=>e.message}:require(name),process:{argv:[],platform:'darwin'},__dirname,fake});
+test('only startup and manual Refresh retry transient initialization failures', async () => {
+ let calls = 0, handler;
+ const webContents = {mainFrame:{}}, event = {sender:webContents,senderFrame:webContents.mainFrame};
+ const electron = {app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
+  ipcMain:{handle(_channel,fn){handler=fn;}}};
+ const subscriptions = {async initialize(){if (++calls === 1) throw Error('offline');return calls === 2;}};
+ const fake = {root:'fixture',state:async()=>({
+  mode:'global',exit:'美国静态家宽',dialer:'中转入口',entry:'current',nodes:[],settings:{},expectedIP:'203.0.113.10',
+ })};
+ const context = vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?subscriptions:
+  name==='./backend.cjs'?{safeError:e=>e.message}:require(name),process:{argv:[],platform:'darwin'},__dirname,fake,webContents});
  vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),context);
- vm.runInContext('backend=fake',context);
- assert.equal((await vm.runInContext('startupState()',context)).selectionError,'offline');
- assert.equal((await vm.runInContext('startupState()',context)).selectionError,undefined);
- await vm.runInContext('startupState()',context);
+ vm.runInContext('backend=fake;win={webContents}',context);
+ const elements = new Map(), reads = [];
+ const element = () => ({value:'',classList:{add(){},remove(){},toggle(){}},replaceChildren(){},setAttribute(){},addEventListener(){}});
+ const select = id => {
+  if (!elements.has(id)) elements.set(id, element());
+  return elements.get(id);
+ };
+ let poll;
+ const renderer = vm.createContext({
+  document:{querySelector:select,querySelectorAll:()=>[],addEventListener(){},
+   createElement:element,createDocumentFragment:element},
+  window:{linkbox:{
+   async call(action,data){
+    if (action !== 'state') return {ok:true,data:{ip:'203.0.113.10'}};
+    reads.push(data?.initialize === true);
+    return handler(event,action,data);
+   },
+   onProgress(){},onAutomatic(){},
+  }},
+  setInterval(fn,ms){assert.equal(ms,30000);poll=fn;},
+ });
+ vm.runInContext(fs.readFileSync(require.resolve('../renderer.js'),'utf8'),renderer);
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(select('#notice').textContent,'offline');
+ for (let i=0;i<5;i++) {
+  poll();
+  await new Promise(resolve=>setImmediate(resolve));
+ }
+ assert.equal(calls,1);
+ assert.equal(select('#notice').textContent,'offline');
+ await select('#refresh').onclick();
+ assert.equal(select('#notice').textContent,'');
  assert.equal(calls,2);
+ await select('#refresh').onclick();
+ assert.equal(vm.runInContext('initializedSelection',context),true);
+ assert.deepEqual(reads,[true,false,false,false,false,false,true,true]);
 });
 
 test('every renderer action crosses the real preload allowlist and has a main IPC handler', async () => {

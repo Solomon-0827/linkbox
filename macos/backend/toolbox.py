@@ -18,6 +18,12 @@ PROFILES = CONFIG_DIR / 'profiles.yaml'
 EXIT = '美国静态家宽'
 ENTRY = '中转入口'
 
+class ClashHTTPError(RuntimeError):
+    def __init__(self, status, body):
+        super().__init__(f'Clash API 返回 {status}: {body.decode(errors="replace")[:200]}')
+        self.rejected = 400 <= status < 600 and bool(body)
+
+
 def api(method, path, payload=None):
     class Connection(http.client.HTTPConnection):
         def connect(self):
@@ -30,7 +36,7 @@ def api(method, path, payload=None):
         response = conn.getresponse()
         body = response.read()
         if response.status >= 300:
-            raise RuntimeError(f'Clash API 返回 {response.status}: {body.decode(errors="replace")[:200]}')
+            raise ClashHTTPError(response.status, body)
         return json.loads(body) if body else None
     finally:
         conn.close()
@@ -52,14 +58,22 @@ def proxy_providers():
     return api('GET', '/providers/proxies')['providers']
 
 
-def entry_member_owned(live, providers, name, owner):
+def entry_provider_names():
+    import runtime
+    import yaml
+    config = yaml.safe_load((runtime.CONFIG_DIR / 'clash-verge.yaml').read_bytes())
+    group = next((g for g in config.get('proxy-groups', []) if g['name'] == ENTRY), {})
+    return group.get('use') or []
+
+
+def entry_member_owned(live, providers, use, name, owner):
     if not owner or live.count(name) != 1:
         return False
     # Mihomo exposes static group members through a Compatible provider.
     if any(node['name'] == name for node in providers.get(ENTRY, {}).get('proxies', [])):
         return False
-    possible = [key for key, provider in providers.items() if provider.get('vehicleType') != 'Compatible'
-                and any(node['name'] == name for node in provider.get('proxies', []))]
+    possible = [key for key in use if any(node['name'] == name
+                for node in providers.get(key, {}).get('proxies', []))]
     return possible == [owner]
 
 
@@ -150,11 +164,14 @@ def switch():
     fresh_c, fresh_p = state()
     if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current or target not in fresh_p[ENTRY].get('all', []):
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
-    if target not in node_inventory(fresh_p, owners):
+    if not entry_member_owned(fresh_p[ENTRY].get('all', []), proxy_providers(), entry_provider_names(), target, owners[target]):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
-    if after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT or after_c.get('mode') != 'global':
+    if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
+            or after_p[EXIT].get('dialer-proxy') != ENTRY or after_c.get('mode') != 'global'
+            or not entry_member_owned(after_p[ENTRY].get('all', []), proxy_providers(),
+                                      entry_provider_names(), target, owners[target])):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:

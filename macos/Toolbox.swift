@@ -485,7 +485,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var busy = false
     var controls: [NSControl] = []
     var nodePicker:SubscriptionPicker?
-    var startupChecked=false
     var manageButton:NSButton!
     var updateButton: NSButton!
     var refreshButton: NSButton!
@@ -618,9 +617,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tray.menu=trayMenu;statusItem=tray
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         invoke(["startup",autoMetric],message:"正在读取 Clash 状态…") { result in
-            self.startupChecked=result["startup_checked"] as? Bool ?? false
             self.refreshOnline()
-            if self.startupChecked && result["initialized"] as? Bool != true { self.startAutomaticTest() }
+            if result["startup_checked"] as? Bool == true && result["initialized"] as? Bool != true { self.startAutomaticTest() }
         }
         configureAutoTests()
     }
@@ -946,8 +944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resetOnline()
         refreshingOnline=["status"]
         (refreshButton as? SoftButton)?.spinning=true
-        invoke(startupChecked ? ["status"] : ["startup",autoMetric],message:"正在刷新状态…") { result in
-            if let checked=result["startup_checked"] as? Bool { self.startupChecked=checked }
+        invoke(["startup",autoMetric],message:"正在刷新状态…") { _ in
             self.refreshOnline()
         }
     }

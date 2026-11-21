@@ -101,6 +101,7 @@ class ParallelTests(unittest.TestCase):
                           patch.object(c, 'active_state', return_value=(state, state['nodes'])),
                           patch.object(g.runtime, 'read_json', return_value=selection),
                           patch.object(g.t, 'api', side_effect=api),
+                          patch.object(g.t, 'entry_provider_names', return_value=['a', 'b']),
                           patch.object(g.t, 'persist_selection') as persist):
                         with self.assertRaisesRegex(RuntimeError, '归属'):
                             g.change('same', 'current', mode)

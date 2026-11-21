@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 const YAML = require('yaml');
-const {Backend, ENTRY, EXIT} = require('../backend.cjs');
+const {Backend, ClashHTTPError, ENTRY, EXIT} = require('../backend.cjs');
 const sub = require('../subscriptions.cjs');
 
 const node = (name, server = 'relay.example.invalid') => ({
@@ -123,15 +123,18 @@ test('first run downloads before seeding even with truncated Verge YAML and drop
 });
 
 test('upgrade with saved selection cleans the old pin and switches once', async t => {
- const {b, state, legacy, downloads, requests, saved} = await fixture(t);
- await legacy({selected_nodes:{a:['fast']}});
+ const {b, root, state, legacy, downloads, requests, saved, refreshWith} = await fixture(t);
+ await legacy({selected_nodes:{a:['fast'],b:['other']}});
+ await fs.writeFile(path.join(root, 'profiles/a.yaml'), 'proxies: [');
+ refreshWith({a:['fast'],b:['other']});
  assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'fast');
  assert.ok(!YAML.parse(requests.at(-1).body.payload).proxies.some(n => n.name === 'current'));
  assert.equal((await saved()).pinned_entry, undefined);
  assert.equal(await sub.initialize(b), false);
  assert.equal(requests.filter(r => r.route === '/configs?force=false').length, 1);
- assert.equal(downloads.length, 0);
+ assert.equal(downloads.length, 2);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast'],b:['other']});
 });
 
 test('sync keeps saved nodes outside the live group and removes vanished nodes and sources', async t => {
@@ -149,18 +152,18 @@ test('sync keeps saved nodes outside the live group and removes vanished nodes a
  assert.match(await fs.readFile(path.join(root,'profiles/a.yaml'),'utf8'), /brand-new/);
 });
 
-test('absent benchmark winner is first at reload and persisted', async t => {
+test('benchmark winner switches after reload in subscription order', async t => {
  const {b, state, requests, root, apply, downloads} = await fixture(t);
  b.settings.metric = 'entrance';
  b.history = {latestResults:{fast:{chainDelay:10,entranceDelay:90,owner:'a'}, other:{chainDelay:30,entranceDelay:20,owner:'b'}}};
  await apply({a:['fast'],b:['same','other']});
- assert.deepEqual(requests.map(r=>r.route), ['/configs?force=false']);
+ assert.deepEqual(requests.map(r=>r.route), ['/configs?force=false', ENTRY_ROUTE]);
  assert.equal(state.entry, 'other');
  const live = YAML.parse(requests[0].body.payload);
  assert.equal(live['proxy-providers'].b.type, 'inline');
  assert.equal(live['proxy-providers'].b.path, undefined);
- assert.deepEqual(live['proxy-groups'][0].use, ['b','a']);
- assert.equal(live['proxy-providers'].b.payload[0].name, 'other');
+ assert.deepEqual(live['proxy-groups'][0].use, ['a','b']);
+ assert.equal(live['proxy-providers'].b.payload[0].name, 'same');
  const saved = YAML.parse(await fs.readFile(path.join(root,'clash-verge.yaml'),'utf8'));
  assert.equal(saved['proxy-providers'].b.type, 'http');
  assert.equal(saved['proxy-providers'].b.filter, '^same$|^other$');
@@ -169,11 +172,18 @@ test('absent benchmark winner is first at reload and persisted', async t => {
  assert.equal(downloads.length, 0);
 });
 
-test('present owned winner is switched before reload', async t => {
- const {apply, requests, atReload, state} = await fixture(t);
+test('present winner is loaded before switching', async t => {
+ const {b, write, apply, requests, atReload, state} = await fixture(t);
+ b.history = {latestResults: {fast: {chainDelay:20, owner:'a'}}};
+ await write('profiles/a.yaml', {proxies: [node('quick'), node('fast')]});
+ const controller = b.request;
+ b.request = async (...args) => {
+  if (args[2] === ENTRY_ROUTE) assert.equal(atReload.length, 1);
+  return controller(...args);
+ };
  await apply({a:['fast','quick'],b:[]});
- assert.deepEqual(requests.map(r => r.route), [ENTRY_ROUTE, '/configs?force=false']);
- assert.deepEqual(atReload, ['fast']);
+ assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.deepEqual(atReload, ['current']);
  assert.equal(state.entry, 'fast');
 });
 
@@ -216,6 +226,27 @@ test('other group keeps its static reference and ENTRY uses the selected owner o
  assert.deepEqual(payload['proxy-providers'].a.payload.map(n => n.name), ['current']);
 });
 
+for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-providers':true}]) {
+ test('other group retains a deselected provider through ' + Object.keys(reference)[0], async t => {
+  const {b, root, write, apply, requests} = await fixture(t);
+  await apply({a:['current'],b:['other']});
+  const config = await b.config(), previous = config['proxy-providers'].b;
+  config['proxy-groups'].push({name:'secondary',type:'select',...reference,filter:'^other$'});
+  await write('clash-verge.yaml', config);
+  if (process.env.LINKBOX_TEST_CORE) b.validateConfig = file => {
+   execFileSync(process.env.LINKBOX_TEST_CORE, ['-t', '-d', root, '-f', file]);
+  };
+  await apply({a:['current'],b:[]});
+  const live = YAML.parse(requests.at(-1).body.payload);
+  assert.deepEqual(live['proxy-groups'][0].use, ['a']);
+  assert.equal(live['proxy-providers'].b.filter, '^other$');
+  assert.deepEqual((await b.config())['proxy-providers'].b, previous);
+  const script = await fs.readFile(path.join(root,'profiles/Script.js'),'utf8');
+  const context = require('node:vm').createContext({input:{'proxy-groups':config['proxy-groups']}});
+  assert.deepEqual(JSON.parse(require('node:vm').runInContext(script + "\nJSON.stringify(main(input))", context))['proxy-providers'].b, previous);
+ });
+}
+
 test('validation failure and external state change cancel before any reload', async t => {
  const {b, root, apply, state, requests} = await fixture(t);
  const file = path.join(root,'clash-verge.yaml'), original = await fs.readFile(file);
@@ -227,22 +258,37 @@ test('validation failure and external state change cancel before any reload', as
  assert.deepEqual(await fs.readFile(file), original);
 });
 
-test('failed reload restores the files and does not attempt to switch', async t => {
- const {b, root, policy, apply, setProviders} = await fixture(t);
+test('explicit reload rejection restores the files even when readback is unavailable', async t => {
+ const {b, root, policy, apply} = await fixture(t);
  const file = path.join(root,'clash-verge.yaml'), original = await fs.readFile(file);
- let count = 0;
- setProviders({});
- const controller = b.request;
- b.request = async (...args) => {
-  if(args[1] === 'PUT'){count++;throw Error('timeout');}
-  return controller(...args);
+ const requests = [];
+ b.request = async (_endpoint, method, route) => {
+  requests.push(route);
+  if (method === 'PUT') throw new ClashHTTPError(400, true);
+  throw Error('offline');
  };
  await assert.rejects(apply({a:['fast'],b:[]}), /文件已回退/);
- assert.equal(count, 1);
+ assert.deepEqual(requests, ['/configs?force=false']);
  assert.deepEqual(await fs.readFile(file), original);
  await assert.rejects(fs.access(path.join(root,'profiles/Script.js')));
  await assert.rejects(fs.access(policy));
  assert.equal(b.busy, false);
+});
+
+test('empty HTTP error response cannot trigger rollback', async t => {
+ const {b, apply, saved} = await fixture(t);
+ const controller = b.request, writes = [];
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') {
+   writes.push(args[3]);
+   throw new ClashHTTPError(500, false);
+  }
+  return controller(...args);
+ };
+ await assert.rejects(apply({a:['quick'],b:[]}), /尚未确认/);
+ assert.equal(writes.length, 2);
+ assert.deepEqual(writes[0], writes[1]);
+ assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
 });
 
 test('remove applies the same selection and refuses the current, stale or unknown entries', async t => {
@@ -284,7 +330,7 @@ test('deleted subscriptions disappear from picker and a rotation retains the sta
 });
 
 test('lost reload response keeps new files even with unchanged group membership', async t => {
- const {b, root, state, apply, refreshWith} = await fixture(t);
+ const {b, root, state, apply, refreshWith, requests} = await fixture(t);
  await apply({a:['current','fast'],b:[]});
  const before = structuredClone(state);
  refreshWith({a:['current','fast','new'],b:['other']});
@@ -294,7 +340,9 @@ test('lost reload response keeps new files even with unchanged group membership'
   if(args[2] === '/configs?force=false') throw Error('response lost');
   return result;
  };
+ requests.length = 0;
  await b.updateSubscriptions();
+ assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', '/configs?force=false']);
  assert.deepEqual(state, before);
  assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /new/);
 });
@@ -309,7 +357,7 @@ test('unobservable reload keeps new files and requests refresh', async t => {
   if(args[2] === '/configs?force=false'){offline = true;throw Error('response lost');}
   return result;
  };
- await assert.rejects(apply({a:['quick'],b:[]}), /无法确认.*已保留.*请刷新/);
+ await assert.rejects(apply({a:['quick'],b:[]}), /已写入新配置，Clash 尚未确认，请刷新状态核对/);
  assert.equal(state.entry, 'quick');
  assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
 });
@@ -338,4 +386,118 @@ for(const recover of [true, false]) test('switch retries after reading state, th
  assert.deepEqual(calls.slice(first + 1, first + 3), ['state', '/providers/proxies']);
  assert.equal(state.entry, recover ? 'quick' : 'fast');
  assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick']});
+});
+
+test('late reload after old readback keeps the same files and policy', async t => {
+ const {b, root, state, apply, saved} = await fixture(t);
+ const controller = b.request, writes = [];
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') {
+   writes.push(args);
+   if (writes.length === 2) throw new ClashHTTPError(400, true);
+   throw Error('timeout');
+  }
+  return controller(...args);
+ };
+ await assert.rejects(apply({a:['quick'],b:[]}), /已写入新配置，Clash 尚未确认，请刷新状态核对/);
+ assert.equal(writes.length, 2);
+ assert.deepEqual(writes[0], writes[1]);
+ await controller(...writes[0]);
+ assert.equal(state.entry, 'quick');
+ assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
+ const config = YAML.parse(await fs.readFile(path.join(root,'clash-verge.yaml'),'utf8'));
+ assert.equal(config['proxy-providers'].a.filter, '^quick$');
+});
+
+test('upgrade download failure keeps saved relays and tries every source', async t => {
+ const {b, root, policy, legacy, requests, downloads, refreshWith} = await fixture(t);
+ await legacy({selected_nodes:{a:['fast'],b:['other']}});
+ refreshWith({b:['other']});
+ const files = [policy, path.join(root,'clash-verge.yaml'), path.join(root,'profiles/a.yaml'), path.join(root,'profiles/Script.js')];
+ const before = await Promise.all(files.map(file => fs.readFile(file)));
+ await assert.rejects(sub.initialize(b), /订阅下载/);
+ assert.equal(downloads.length, 2);
+ assert.deepEqual(await Promise.all(files.map(file => fs.readFile(file))), before);
+ assert.equal(requests.length, 0);
+ refreshWith({a:['fast'],b:['other']});
+ assert.equal(await sub.initialize(b), true);
+});
+
+test('initialization retries after files are written but reload is unconfirmed', async t => {
+ const {b, refreshWith, saved, requests} = await fixture(t);
+ refreshWith({a:['current','fast'],b:['other']});
+ const controller = b.request;
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') throw Error('timeout');
+  return controller(...args);
+ };
+ await assert.rejects(sub.initialize(b), /尚未确认/);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+ b.request = controller;
+ assert.equal(await sub.initialize(b), true);
+ assert.equal(await sub.initialize(b), false);
+ assert.equal(requests.length, 1);
+});
+
+test('no live match requires the picker without retrying initialization', async t => {
+ const {b, policy, refreshWith, downloads, requests, apply} = await fixture(t);
+ refreshWith({a:['new'],b:['other']});
+ await assert.rejects(sub.initialize(b), /管理节点/);
+ await assert.rejects(sub.initialize(b), /管理节点/);
+ assert.equal(downloads.length, 2);
+ assert.equal(requests.length, 0);
+ await assert.rejects(fs.access(policy), {code:'ENOENT'});
+ await apply({a:['new'],b:[]});
+ assert.equal(await sub.initialize(b), false);
+});
+
+test('missing relay cannot win reconciliation on an old benchmark delay', async t => {
+ const {inputs, expected} = JSON.parse(await fs.readFile(
+  path.join(__dirname,'../../fixtures/reconcile/latest-benchmark-only.json'), 'utf8'));
+ const {b, state, policy, refreshWith} = await fixture(t);
+ await fs.writeFile(policy, JSON.stringify({selected_nodes:inputs.selection}));
+ b.settings.metric = inputs.metric;
+ b.history = {results:{stale:{owner:'a',entranceDelay:10,chainDelay:100}}};
+ Object.assign(state, {entry:inputs.current,live:inputs.live,
+  nodes:inputs.selection.a.map(name => ({name,providerId:'a'}))});
+ b.loadNodes = async () => ({nodes:new Map([['fresh',node('fresh')]]),exit:node(EXIT)});
+ b.network = async () => ({interface:'fixture'});
+ b.corePath = async () => '/mock';
+ b.testNode = async () => ({status:'done',delay:120,entranceDelay:50});
+ const result = await b.benchmark();
+ assert.equal(result.latestResults.stale.entranceDelay, null);
+ refreshWith({a:inputs.sources[0].nodes,b:['other']});
+ await b.updateSubscriptions();
+ assert.equal(state.entry, expected.entry);
+});
+
+test('an already-saved failed chain row cannot win reconciliation on an older entrance delay', async t => {
+ const {b, state, policy, refreshWith} = await fixture(t);
+ await fs.writeFile(policy, JSON.stringify({selected_nodes:{a:['current','stale','fresh']}}));
+ b.settings.metric = 'entrance';
+ b.history = {kind:'chain',latestResults:{
+  stale:{owner:'a',entranceDelay:10,chainDelay:null,status:'failed'},
+  fresh:{owner:'a',entranceDelay:50,chainDelay:120,status:'done'},
+ }};
+ refreshWith({a:['stale','fresh'],b:['other']});
+ await b.updateSubscriptions();
+ assert.equal(state.entry, 'fresh');
+});
+
+test('post-switch verification rejects a static collision in ENTRY', async t => {
+ const {b, apply, requests, saved} = await fixture(t);
+ const controller = b.request;
+ let switched = false;
+ b.request = async (...args) => {
+  const result = await controller(...args);
+  if (args[2] === ENTRY_ROUTE) switched = true;
+  if (switched && args[2] === '/providers/proxies') {
+   result.providers[ENTRY] = {vehicleType:'Compatible',proxies:[node('other')]};
+  }
+  return result;
+ };
+ b.history = {latestResults:{other:{chainDelay:20,owner:'b'}}};
+ await assert.rejects(apply({a:['quick'],b:['other']}), /配置已更新，但无法切换/);
+ assert.deepEqual(requests.map(r=>r.route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.deepEqual((await saved()).selected_nodes, {a:['quick'],b:['other']});
 });
