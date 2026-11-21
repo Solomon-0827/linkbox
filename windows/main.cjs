@@ -51,13 +51,13 @@ async function startupState(){
  initialization ||= subscriptions.startup(backend,ready)
   .catch(error=>({changed:false,selectionError:safeError(error)}));
  const pending=initialization;
- const {changed,selectionError,recoveryHint}=await pending;
+ const {changed,selectionError}=await pending;
  if(initialization===pending){
   initialization=null;
   startupChecked=ready&&!selectionError;
   initializedSelection||=changed;
  }
- return {...(changed||recoveryHint?await backend.state():state),selectionError,recoveryHint};
+ return {...(changed?await backend.state():state),selectionError};
 }
 ipcMain.handle('linkbox',async(event,action,data)=>{
  if(event.sender!==win?.webContents||event.senderFrame!==win.webContents.mainFrame)throw Error('不允许的调用来源');

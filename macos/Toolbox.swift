@@ -469,7 +469,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     let exitLabel = NSTextField(labelWithString: "—")
     let modeLabel = NSTextField(labelWithString: "—")
     let feedback = NSTextField(wrappingLabelWithString: "")
-    var recoveryHint = ""
     let picker = NSPopUpButton(frame: .zero, pullsDown: false)
     let lastTestLabel = NSTextField(labelWithString:"上次测速：暂无记录")
     let spinner = NSProgressIndicator()
@@ -672,7 +671,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         for c in controls { c.isEnabled = !value }
         updateEditingControls()
         if value && !chainRunning { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
-        feedback.stringValue = message == "状态已更新。没有修改代理配置。" ? recoveryHint : message
+        feedback.stringValue = message
     }
     func render(_ s: [String:Any]) {
         expectedIP = s["expected_ip"] as? String ?? ""
@@ -752,11 +751,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                         reportFailure(result["error"] as? String ?? "操作失败");return
                     }
                     if let state = result["state"] as? [String:Any] { self.render(state) }
-                    if args.first == "startup" {
-                        self.recoveryHint = result["recovery_hint"] as? String ?? ""
-                    } else if let action = args.first, ["save-node-selection","update-subscriptions","remove-list-nodes"].contains(action) {
-                        self.recoveryHint = ""
-                    }
                     self.setBusy(false,result["message"] as? String ?? "状态已更新。没有修改代理配置。")
                     if args.first == "chain" || args.first == "latency" || args.first == "status" || args.first == "startup" { self.showFastestNodes() }
                     complete(result)
@@ -846,7 +840,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let count=p["index"] as? Int ?? 0,total=p["total"] as? Int ?? nodeRows.count
         if finished { refreshLastTestTime() }
         if !finished { refreshLastTestTime();lastTestLabel.stringValue=lastTestLabel.stringValue.replacingOccurrences(of:"\(nodeRows.count) 个节点",with:"\(count)/\(total)") }
-        feedback.stringValue=finished && count != total ? "测速已停止" : recoveryHint
+        feedback.stringValue=finished && count != total ? "测速已停止" : ""
     }
     func beginTest(_ kind:String,automatic:Bool=false) {
         guard !busy else { return }

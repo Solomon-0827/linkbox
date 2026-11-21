@@ -93,12 +93,12 @@ class ParallelTests(unittest.TestCase):
         network={'interface':'en0'}
         guard={'network':network,'before':state,'routing_fingerprint':c.routing_fingerprint(original,exit_node,'203.0.113.10',c.DNS_POLICY,'a','b')}
         for fresh,physical in [(original,{'interface':'en1'}),({**original,'b':{'server':'new.invalid'}},network)]:
-            with patch.object(g,'snapshot',return_value=state),patch.object(g.t,'live_entry_plan',return_value={'a': ('a', None), 'b': ('a', None)}),patch.object(c,'load_nodes',return_value=(fresh,exit_node,'203.0.113.10')),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
+            with patch.object(g,'snapshot',return_value=state),patch.object(g.t,'switch_owners',return_value={'a': 'a', 'b': 'a'}),patch.object(c,'load_nodes',return_value=(fresh,exit_node,'203.0.113.10')),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
                 with self.assertRaisesRegex(RuntimeError,'未自动切换'):
                     g.change('b','a',guard)
                 api.assert_not_called()
 
-    def test_manual_and_auto_switch_verify_disk_membership_before_and_after_put(self):
+    def test_manual_and_auto_switch_check_target_membership_before_and_after_put(self):
         state = {'mode': 'global', 'exit': g.t.EXIT, 'dialer': g.t.ENTRY, 'entry': 'current',
                  'nodes': ['current', 'same'], 'live': ['current', 'same']}
         nodes = {'current': {'server': 'current.invalid'}, 'same': {'server': 'a.invalid'}}
@@ -120,13 +120,13 @@ class ParallelTests(unittest.TestCase):
                 with self.subTest(automatic=mode is not None, changed_after_put=changed_after_put):
                     active = state.copy()
                     if not changed_after_put:
-                        active['live'] = ['current', 'same', 'external']
+                        active['live'] = ['current', 'external']
                     writes = []
 
                     def api(method, route, payload=None):
                         self.assertEqual(method, 'PUT')
                         writes.append(payload['name'])
-                        active.update(entry=payload['name'], live=['current', 'same', 'external'])
+                        active.update(entry=payload['name'], live=['current', 'external'])
 
                     with (patch.object(g, 'snapshot', side_effect=lambda: active.copy()),
                           patch.object(c, 'load_nodes', return_value=(nodes, exit_node, '203.0.113.10')),
@@ -136,7 +136,7 @@ class ParallelTests(unittest.TestCase):
                           patch.object(g.runtime, 'read_json', return_value=selection),
                           patch.object(g.t, 'api', side_effect=api),
                           patch.object(g.t, 'persist_selection') as persist):
-                        with self.assertRaisesRegex(RuntimeError, '待核对' if changed_after_put else g.t.ENTRY_NOT_APPLIED):
+                        with self.assertRaisesRegex(RuntimeError, '待核对' if changed_after_put else '节点状态已变化'):
                             g.change('same', 'current', mode)
                         persist.assert_not_called()
                     self.assertEqual(writes, ['same'] if changed_after_put else [])

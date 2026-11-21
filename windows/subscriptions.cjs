@@ -1,12 +1,10 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('node:crypto'),YAML=require('yaml'),exec=require('node:util').promisify(require('node:child_process').execFile);
-const {reconcile, sameEntryMembers, selectionOwners}=require('./reconcile.cjs');
+const {reconcile, selectionOwners}=require('./reconcile.cjs');
 const {isDeepStrictEqual}=require('node:util');
-const timers=require('node:timers/promises');
 const {signature: sig, ClashHTTPError, requestNotSent, providerNodes}=require('./backend.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
-const RECOVERY_HINT='上次订阅更新未完成，可刷新重试，或在管理节点重新保存';
 const INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改';
 const VALIDATION_FAILED = '配置校验失败，未改动当前代理';
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -14,8 +12,6 @@ const digest=raw=>raw && crypto.createHash('sha256').update(raw).digest('hex');
 async function read(p){try{return await fs.readFile(p)}catch(e){if(e.code==='ENOENT')return null;throw e}}
 async function doc(p){const r=await read(p);return r?YAML.parse(r.toString())||{}:{}}
 async function policy(b){return doc(path.join(b.dataDir,'node-policy.json'))}
-function committedPolicy({pending_update, reload_unconfirmed, ...saved}) {return saved;}
-function targetSelection(saved) {return saved.pending_update?.selection ?? saved.selected_nodes;}
 function parseProfile(raw){
  try { return raw ? YAML.parse(raw.toString()) : null; }
  catch (error) { if (!(error instanceof YAML.YAMLParseError)) throw error; return null; }
@@ -34,7 +30,7 @@ function clean(document) {
  }
  return {...document, proxies};
 }
-async function discover(b, forUpdate = false, recovering = false) {
+async function discover(b, forUpdate = false) {
  await b.config(); // Resolve the local Verge configuration directory.
  const profiles = parseProfile(await read(path.join(b.root, 'profiles.yaml')));
  if (!Array.isArray(profiles?.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
@@ -50,7 +46,7 @@ async function discover(b, forUpdate = false, recovering = false) {
   const {url, file} = item;
   if (typeof url !== 'string' || !url.startsWith('https://') ||
       typeof file !== 'string' || !file || file === '.' || file === '..' || path.basename(file) !== file || file.includes('/') || file.includes('\\')) {
-   if (forUpdate || recovering) throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
+   if (forUpdate) throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
    continue;
   }
   const key = sourceKey(url);
@@ -67,7 +63,7 @@ async function discover(b, forUpdate = false, recovering = false) {
   throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
  }
  const revisions = sources.map(({source, raw}) => [source, digest(raw)]);
- const revision = hash([b.root, revisions, committedPolicy(await policy(b))]);
+ const revision = hash([b.root, revisions, (await policy(b)).selected_nodes]);
  if (forUpdate) return {sources: sources.map(({source}) => ({source})), fingerprint: revision};
  const rawPreview = await read(path.join(b.dataDir, PREVIEW));
  const preview = parseProfile(rawPreview);
@@ -82,15 +78,24 @@ function inventoryFor(sources) {
   {id: source.name, nodes: document.proxies.map(n => n.name)} : {id: source.name, nodes: [], unreadable: true});
 }
 
-function nameFilter(definition) {
+function nameFilter(definition, mode = '') {
  function patterns(value) {
   return (value || '').split('`').filter(Boolean).map(pattern => {
    const flags = pattern.match(/^\(\?([ims]+)\)/);
-   return flags ? new RegExp(pattern.slice(flags[0].length), flags[1]) : new RegExp(pattern);
+   return flags ? new RegExp(pattern.slice(flags[0].length), flags[1] + mode) : new RegExp(pattern, mode);
   });
  }
  const include = patterns(definition.filter), exclude = patterns(definition['exclude-filter']);
  return name => (!include.length || include.some(re => re.test(name))) && !exclude.some(re => re.test(name));
+}
+
+function groupFilter(group) {
+ try { return nameFilter(group, 'u'); }
+ catch (error) {
+  if (!(error instanceof SyntaxError)) throw error;
+  // Mihomo accepts expressions that JavaScript cannot compile.
+  return () => true;
+ }
 }
 
 async function entrySeedOwners(b, config, sources) {
@@ -121,7 +126,7 @@ async function catalog(b) {
  const {sources, fingerprint} = await discover(b);
  const state = await b.state();
  const owners = selectionOwners(reconcile({sources: inventoryFor(sources),
-  selection: targetSelection(await policy(b)), live: state.live, current: state.entry}).selection);
+  selection: (await policy(b)).selected_nodes, live: state.live, current: state.entry}).selection);
  const current = state.entry;
  const currentOwner = owners.get(current) ?? sources.find(({document}) =>
   document?.proxies.some(n => n.name === current))?.source.name;
@@ -168,7 +173,7 @@ const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('`', '\\
 const equal = (a, b) => a === null ? b === null : b !== null && a.equals(b);
 const EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新';
 const POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash';
-const RELOAD_UNCERTAIN = '已写入新配置，Clash 尚未确认，请刷新状态核对';
+const RELOAD_UNCERTAIN = '已写入新配置，Clash 未确认，请刷新状态核对';
 const RELOAD_NOT_SENT = '无法连接 Clash 控制接口，未发送重载请求';
 const SWITCH_FAILED = '配置已更新，但无法切换中转入口，请刷新并核对 Clash';
 const ENTRY_ROUTE = '/proxies/' + encodeURIComponent(ENTRY);
@@ -245,57 +250,34 @@ function legacyPin(original, config, savedName) {
  try { pin = JSON.parse(embedded?.[1]).pin; } catch { return []; }
  if (pin?.name !== savedName || !config.proxies.some(node => isDeepStrictEqual(node, pin))) return [];
  if (config['proxy-groups']?.some(g => g.name !== ENTRY && (g.proxies?.includes(savedName) ||
-     ((g['include-all-proxies'] || g['include-all']) && nameFilter(g)(savedName)))) ||
+     ((g['include-all-proxies'] || g['include-all']) && groupFilter(g)(savedName)))) ||
      config.proxies.some(node => node['dialer-proxy'] === savedName)) return [];
  return [savedName];
 }
 
-async function observeReload(b) {
- try { return await b.relayState(1000); } catch { return null; }
-}
-
-function confirmedState(observed, members) {
- return observed && sameEntryMembers(observed.live, members) ? observed : null;
-}
-
-async function waitForReload(b, members) {
- const deadline = performance.now() + 10000;
- for (let attempt = 0; attempt < 6; attempt++) {
-  const after = confirmedState(await observeReload(b), members);
-  if (after) return after;
-  const remaining = deadline - performance.now();
-  if (attempt === 5 || remaining <= 0) break;
-  await timers.setTimeout(Math.min(2000, remaining));
- }
- throw Error(RELOAD_UNCERTAIN);
-}
-
-async function selectAfterReload(b, before, after, members, selected, desired) {
- const acceptable = entry => selected.has(entry) && (selected.has(before.entry) || entry === desired);
-
- function checkedState(observed, error) {
-  if (!observed || CHAIN_KEYS.some(key => observed[key] !== before[key])) {
-   throw Error(error);
-  }
-  return observed;
+async function selectAfterReload(b, before, selected, desired) {
+ async function observe() {
+  const state = await b.relayState().catch(() => null);
+  if (state && CHAIN_KEYS.some(key => state[key] !== before[key])) throw Error(POST_RELOAD_CHANGE);
+  return state;
  }
 
- after = checkedState(after, POST_RELOAD_CHANGE);
- if (acceptable(after.entry)) return after.entry;
- after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
+ let after = await observe();
+ if (after && selected.has(after.entry) && after.live.includes(after.entry) &&
+     (selected.has(before.entry) || after.entry === desired)) {
+  if (selected.has(before.entry) && after.entry !== before.entry) throw Error(POST_RELOAD_CHANGE);
+  return after.entry;
+ }
  for (let attempt = 0; attempt < 2; attempt++) {
-  if (acceptable(after.entry)) return after.entry;
-  try { await b.api('PUT', ENTRY_ROUTE, {name: desired}); }
-  catch { /* Check whether the switch applied before retrying. */ }
-  after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
-  if (after.entry === desired) {
-   await timers.setTimeout(300);
-   after = checkedState(confirmedState(await observeReload(b), members), SWITCH_FAILED);
-   if (after.entry !== desired) throw Error(SWITCH_FAILED);
-   return desired;
+  after ??= await observe();
+  if (after?.live.includes(desired)) {
+   if (after.entry === desired) return desired;
+   try { await b.api('PUT', ENTRY_ROUTE, {name: desired}); }
+   catch { /* The switch may have applied before the response was lost. */ }
   }
+  after = await observe();
+  if (after?.entry === desired && after.live.includes(desired)) return desired;
  }
- if (acceptable(after.entry)) return after.entry;
  throw Error(SWITCH_FAILED);
 }
 
@@ -334,7 +316,7 @@ async function entryPlan(config, root) {
  if (!entry) throw Error('缺少中转入口组');
  const staticNodes = new Map((config.proxies || []).map(node => [node.name, node]));
  const members = new Map((entry.proxies || []).map(name => [name, {owner:null, node:staticNodes.get(name)}]));
- const accepts = nameFilter(entry);
+ const accepts = groupFilter(entry);
  const includeAll = entry['include-all'];
  if (includeAll || entry['include-all-proxies']) {
   for (const [name, node] of staticNodes) {
@@ -350,17 +332,6 @@ async function entryPlan(config, root) {
   }
  }
  return members;
-}
-
-async function confirmPendingOwners(b, owners, committed) {
- const previous = selectionOwners(committed);
- if (committed != null && !sameEntryMembers(previous.keys(), owners.keys())) return true;
- const changed = [...owners].filter(([name, owner]) => previous.get(name) !== owner);
- if (!changed.length) return true;
- // Equal names can hide a provider change. Look for the new owner before confirming it.
- const providers = providerNodes(await b.api('GET', '/providers/proxies').catch(() => null));
- const names = new Map([...providers].map(([owner, nodes]) => [owner, new Set(nodes.map(node => node.name))]));
- return changed.every(([name, owner]) => names.get(owner)?.has(name) && !names.get(previous.get(name))?.has(name));
 }
 
 async function reloadPayload(config, root, updates, baselines) {
@@ -388,24 +359,13 @@ async function reloadPayload(config, root, updates, baselines) {
  return {payload: YAML.stringify(live), members};
 }
 
-async function sendReload(b, payload) {
- try {
-  await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
-  return true;
- } catch (error) {
-  if (requestNotSent(error) || (error instanceof ClashHTTPError && error.rejected)) throw error;
-  return false;
- }
-}
-
-async function finishUpdate(policyFile, saved, profiles, entry) {
+async function persistEntry(profiles, entry) {
  const original = await read(profiles);
  const index = YAML.parse(original.toString());
  if (updateSelector(index, entry)) {
   if (!equal(original, await read(profiles))) throw Error(EXTERNAL_CHANGE);
   await atomic(profiles, YAML.stringify(index));
  }
- await atomic(policyFile, JSON.stringify(saved, null, 2));
 }
 
 async function run(b, request = null, {removal = null, initialize = false} = {}) {
@@ -414,29 +374,18 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
  const update = (async () => {
   const saved = await policy(b);
   const policyFile = path.join(b.dataDir, 'node-policy.json');
-  let selection = targetSelection(saved);
-  const legacy = ['pinned_entry', 'node_providers', 'verge_sync', 'blocked_providers', 'excluded_nodes']
-   .some(key => Object.hasOwn(saved, key));
-  const needsInitialization = selection == null || legacy || saved.initialization_pending === true;
-  const pending = saved.pending_update;
-  const recovering = initialize && pending != null;
-  if (initialize && !needsInitialization && !recovering) return false;
+  let selection = saved.selected_nodes;
+  if (initialize && selection != null) return false;
   const before = await b.state();
   b.assertChain(before);
   await b.config();
-  if (recovering) {
-   if (pending?.root !== undefined && pending.root !== b.root) {
-    throw Error('Clash 配置目录已变化，请在管理节点里重新勾选');
-   }
-  }
-  const syncing = !recovering && request === null && removal === null;
-  const previewFile = path.join(b.dataDir, PREVIEW), initializationPolicy = hash([b.root, committedPolicy(saved)]);
-  if (initialize && !recovering && parseProfile(await read(previewFile))?.initialization_policy === initializationPolicy) throw Error(NO_SELECTION);
+  const syncing = request === null && removal === null;
+  const previewFile = path.join(b.dataDir, PREVIEW);
   const configFile = b.configFile, script = path.join(b.root, 'profiles', 'Script.js');
   const profiles = path.join(b.root, 'profiles.yaml');
   const baselines = new Map();
   for (const file of [configFile, script, profiles, policyFile]) baselines.set(file, await read(file));
-  const discovered = await discover(b, syncing, recovering);
+  const discovered = await discover(b, syncing);
   let {sources} = discovered;
   if (request !== null) {
    selection = validateSelection(discovered, request, selection);
@@ -463,7 +412,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
      if (!document) throw Error();
      refreshed.push({source, document});
     } catch {
-     if (!initialize) throw Error('订阅下载或解析失败，未改动当前配置');
+     // Still attempt the remaining subscriptions before refusing the update.
     }
    }
    if (refreshed.length !== sources.length) throw Error('订阅下载或解析失败，未改动当前配置');
@@ -471,7 +420,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    if (sig(await b.state()) !== sig(before) ||
        (await discover(b, true)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   }
-  if (syncing || (discovered.previewId && (request !== null || recovering))) {
+  if (syncing || (discovered.previewId && request !== null)) {
    for (const {source, document} of sources) {
     updates.set(path.join(b.root, 'profiles', source.profile_file), YAML.stringify(document));
    }
@@ -484,44 +433,12 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const inventory = inventoryFor(sources);
   const registry = sources.map(({source}) => source);
   const labels = Object.fromEntries(registry.map(source => [source.name, source.display_name]));
-  if (recovering) {
-   const disk = await entryPlan(config, b.root).catch(() => null);
-   const owners = selectionOwners(pending?.selection);
-   // The journal is written first, so matching live and disk alone could confirm an older selection.
-   if (owners.size && disk && sameEntryMembers(before.live, disk.keys()) &&
-       disk.size === owners.size && [...disk].every(([name, {owner}]) => owners.get(name) === owner) &&
-       await confirmPendingOwners(b, owners, saved.selected_nodes)) {
-    if (sig(await b.state()) !== sig(before)) throw Error(EXTERNAL_CHANGE);
-    for (const [file, raw] of baselines) {
-     if (!equal(raw, await read(file))) throw Error(EXTERNAL_CHANGE);
-    }
-    let entry = before.entry;
-    if (!owners.has(entry)) {
-     // Keep the ranking aware of duplicate names, even when picker caches have changed.
-     const candidates = new Map(inventory.map(source => [source.id, source.nodes]));
-     for (const [owner, names] of Object.entries(selection)) {
-      candidates.set(owner, [...new Set([...names, ...(candidates.get(owner) || [])])]);
-     }
-     const ranking = [...candidates].map(([id, nodes]) => ({id, nodes}));
-     const {entry:desired} = reconcile({sources:ranking, selection, live:[], current:null,
-      metric:b.settings.metric, results:benchmarkResults(b)});
-     entry = await selectAfterReload(b, before, before, new Set(disk.keys()), owners, desired);
-    }
-    await finishUpdate(policyFile, {selected_nodes:selection, provider_labels:labels}, profiles, entry);
-    return true;
-   }
-   if (sources.some(({source, document}) =>
-    !document && selection && Object.hasOwn(selection, source.name) && selection[source.name].length)) {
-    throw Error('本地缓存暂不可读，保留原勾选');
-   }
-  }
   const seedOwners = selection == null ? await entrySeedOwners(b, config, sources) : undefined;
   const plan = reconcile({sources:inventory, selection, live:before.live, current:before.entry, seedOwners});
   if (!plan.candidates.length) {
    if (syncing) {
     await atomic(previewFile, YAML.stringify({
      revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
-     ...(needsInitialization ? {initialization_policy: initializationPolicy} : {}),
     }));
    }
    throw Error(NO_SELECTION);
@@ -565,8 +482,9 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    metric:b.settings.metric, results:benchmarkResults(b)});
   if (desired === null) throw Error(NO_SELECTION);
   const selectedNames = selectionOwners(selected);
+  const plannedEntry = selectedNames.has(before.entry) ? before.entry : desired;
   const index = YAML.parse(baselines.get(profiles).toString());
-  if (updateSelector(index, selectedNames.has(before.entry) ? before.entry : desired)) {
+  if (updateSelector(index, plannedEntry)) {
    updates.set(profiles, YAML.stringify(index));
   }
   const pin = saved.pinned_entry;
@@ -578,10 +496,9 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    selected_nodes: plan.selection,
    provider_labels: labels,
   };
-  const oldOwners = selectionOwners(saved.selected_nodes), newOwners = selectionOwners(plan.selection);
-  const requireResponse = recovering || [...newOwners].some(([name, owner]) => oldOwners.get(name) !== owner);
   updates.set(registryFile, JSON.stringify({sources:registry}, null, 2));
-  const originals = new Map([[policyFile, baselines.get(policyFile)]]);
+  updates.set(policyFile, JSON.stringify(nextPolicy, null, 2));
+  const originals = new Map();
   for (const file of updates.keys()) originals.set(file, baselines.has(file) ? baselines.get(file) : await read(file));
 
   const temp = await fs.mkdtemp(path.join(b.root, 'linkbox-validate-'));
@@ -595,7 +512,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   } finally {
    await fs.rm(temp, {recursive: true, force: true});
   }
-  if ((await discover(b, syncing, recovering)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
+  if ((await discover(b, syncing)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   if (sig(await b.state()) !== sig(before)) {
    throw Error(EXTERNAL_CHANGE);
   }
@@ -604,7 +521,9 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
 
   const changes = [...updates].filter(([file, data]) => !equal(Buffer.from(data), originals.get(file)));
-  const backupFiles = changes.map(([file]) => file).filter(file => originals.get(file) !== null);
+  // Keep obsolete policy data only in memory for rollback during this update.
+  const backupFiles = changes.map(([file]) => file).filter(file => originals.get(file) !== null &&
+   (file !== policyFile || Object.keys(saved).every(key => Object.hasOwn(nextPolicy, key))));
   if (backupFiles.length) {
    const backup = path.join(b.dataDir, 'backups', 'update-' + crypto.randomUUID());
    await fs.mkdir(backup, {recursive: true});
@@ -613,11 +532,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    }
   }
   const written = [];
-  if (!recovering || !isDeepStrictEqual(pending?.selection, plan.selection)) {
-   const journal = {root: b.root, selection: plan.selection};
-   await atomic(policyFile, JSON.stringify({...committedPolicy(saved), pending_update: journal}, null, 2));
-   written.push(policyFile);
-  }
   try {
    for (const [file, data] of changes) {
     await atomic(file, data);
@@ -627,19 +541,19 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    await rollback(written, originals);
    throw error;
   }
-  let acknowledged;
   try {
-   acknowledged = await sendReload(b, payload);
+   await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
   } catch (error) {
    const unsent = requestNotSent(error);
-   await rollback(written, originals);
-   const message = unsent ? RELOAD_NOT_SENT : 'Clash 未更新';
-   throw Error(message + '，文件已回退；请刷新状态后重试');
+   if (unsent || (error instanceof ClashHTTPError && error.rejected)) {
+    await rollback(written, originals);
+    const message = unsent ? RELOAD_NOT_SENT : error.message;
+    throw Error(message + '，文件已回退；请刷新状态后重试');
+   }
+   throw Error(RELOAD_UNCERTAIN);
   }
-  if (requireResponse && !acknowledged) throw Error(RELOAD_UNCERTAIN);
-  const after = await waitForReload(b, members);
-  const selectedEntry = await selectAfterReload(b, before, after, members, selectedNames, desired);
-  await finishUpdate(policyFile, nextPolicy, profiles, selectedEntry);
+  const entry = await selectAfterReload(b, before, selectedNames, desired);
+  if (entry !== plannedEntry) await persistEntry(profiles, entry);
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
  })();
@@ -657,13 +571,7 @@ async function initialize(b) {
 }
 
 async function startup(b, ready = true) {
- if (!ready && (await policy(b)).pending_update == null) return {changed: false};
- try {
-  return {changed: await initialize(b)};
- } catch (error) {
-  if ((await policy(b)).pending_update == null) throw error;
-  return {changed: false, recoveryHint: RECOVERY_HINT};
- }
+ return {changed: ready && await initialize(b)};
 }
 
 async function remove(b, request) {

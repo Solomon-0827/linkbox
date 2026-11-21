@@ -21,16 +21,6 @@ def digest(raw):
     return None if raw is None else hashlib.sha256(raw).hexdigest()
 
 
-def committed_policy(policy):
-    return {key: value for key, value in policy.items()
-            if key not in ('pending_update', 'reload_unconfirmed')}
-
-
-def target_selection(policy):
-    pending = (policy.get('pending_update') or {}).get('selection')
-    return policy.get('selected_nodes') if pending is None else pending
-
-
 def document(raw):
     try:
         value = yaml.safe_load(raw) if raw is not None else None
@@ -47,22 +37,14 @@ def source_key(url):
     return url
 
 
-def discover(for_update=False, *, recovering=False):
+def discover(for_update=False):
     root = runtime.CONFIG_DIR
     profiles = document(update.read(root / 'profiles.yaml'))
     items = profiles.get('items')
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
     # The saved registry can preserve IDs, but only Verge can list sources.
-    if recovering:
-        try:
-            registry = json.loads((runtime.BASE / 'subscriptions.json').read_text())
-        except FileNotFoundError:
-            registry = {}
-        except (OSError, ValueError):
-            raise RuntimeError('暂时无法读取订阅记录，请刷新后重试') from None
-    else:
-        registry = runtime.read_json('subscriptions.json')
+    registry = runtime.read_json('subscriptions.json')
     by_url = {source_key(s['url']): s for s in registry.get('sources', []) if s.get('url')}
     sources = []
     seen = set()
@@ -70,13 +52,13 @@ def discover(for_update=False, *, recovering=False):
         if item.get('type') != 'remote':
             continue
         if not isinstance(item.get('url'), str) or not item['url'].startswith('https://') or not item.get('file'):
-            if for_update or recovering:
+            if for_update:
                 raise RuntimeError('Clash Verge 订阅需要 HTTPS 地址及本地文件，未更新节点')
             continue
         # Only read local profile files under the known directory.
         filename = item.get('file', '')
         if not isinstance(filename, str) or Path(filename).name != filename or filename in {'.', '..'} or '\\' in filename:
-            if for_update or recovering:
+            if for_update:
                 raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
             continue
         old = by_url.get(source_key(item['url']), {})
@@ -96,7 +78,8 @@ def discover(for_update=False, *, recovering=False):
     if len({s['name'] for s, _ in sources}) != len(sources):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, digest(raw)] for source, raw in sources]
-    revision = fingerprint([str(root), revisions, committed_policy(runtime.read_json('node-policy.json'))])
+    selection = runtime.read_json('node-policy.json').get('selected_nodes')
+    revision = fingerprint([str(root), revisions, selection])
     if for_update:
         return [(source, None) for source, _ in sources], revision, None
     raw_preview = update.read(runtime.BASE / PREVIEW)
@@ -134,7 +117,7 @@ def inventory(sources):
 def catalog():
     sources, fingerprint, _ = discover()
     state = t.relay_state()
-    saved = target_selection(runtime.read_json('node-policy.json'))
+    saved = runtime.read_json('node-policy.json').get('selected_nodes')
     owners = selection_owners(reconcile(inventory(sources), saved, state['live'], state['entry'])['selection'])
     current = state['entry']
     current_source = owners.get(current)
@@ -186,4 +169,6 @@ def synchronize(metric='chain'):
 
 
 def initialize(metric='chain'):
+    if runtime.read_json('node-policy.json').get('selected_nodes') is not None:
+        return False
     return update.run(metric, initialize=True)

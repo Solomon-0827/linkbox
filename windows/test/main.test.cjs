@@ -43,7 +43,7 @@ test('only startup and manual Refresh retry transient initialization failures', 
   ipcMain:{handle(_channel,fn){handler=fn;}}};
  const subscriptions = {async startup(){
   if (++calls === 1) throw Error('offline');
-  if (calls === 2) return {changed:false,recoveryHint:'上次订阅更新未完成，可刷新重试，或在管理节点重新保存'};
+  if (calls === 2) throw Error('订阅下载失败');
   return {changed:true};
  }};
  const fake = {root:'fixture',state:async()=>({
@@ -69,8 +69,8 @@ test('only startup and manual Refresh retry transient initialization failures', 
  assert.equal(calls,1);
  assert.equal(select('#notice').textContent,'offline');
  await select('#refresh').onclick();
- assert.equal(select('#notice').textContent,'上次订阅更新未完成，可刷新重试，或在管理节点重新保存');
- assert.equal(vm.runInContext('startupChecked',context),true);
+ assert.equal(select('#notice').textContent,'订阅下载失败');
+ assert.equal(vm.runInContext('startupChecked',context),false);
  assert.equal(calls,2);
  await select('#refresh').onclick();
  assert.equal(calls,3);

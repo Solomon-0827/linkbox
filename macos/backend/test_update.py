@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
-from subprocess import CalledProcessError, TimeoutExpired, run as run_process
+from subprocess import run as run_process
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -59,7 +59,6 @@ class SubscriptionFixture:
                                 (runtime, 'CONFIG_DIR', self.root)]:
             stack.enter_context(patch.object(obj, key, value))
         self.validate = stack.enter_context(patch.object(update.subprocess, 'run'))
-        self.sleep = stack.enter_context(patch.object(update, 'sleep'))
         self.requests = []
         self.reload = None
         self.providers = {
@@ -152,76 +151,21 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 with patch.object(t, 'persist_selection'):
                     self.assertEqual(gui.change(target, 'current')['state']['entry'], target)
 
-    def save_with_lost_acknowledgment(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        (self.root / 'profiles/b.yaml').write_bytes(
-            update.dump({'proxies': [node('fast', 'b.example.invalid'), node('other')]}))
-
-        def lose_response(method, route, body=None, **kwargs):
-            result = self.controller(method, route, body, **kwargs)
-            if route == '/configs?force=false':
-                raise TimeoutError('response lost')
-            return result
-
-        self.api.side_effect = lose_response
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': [], 'b': ['fast', 'other']})
-        self.requests.clear()
-        self.validate.reset_mock()
-        self.assertEqual(self.active['live'], ['fast', 'other'])
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current', 'fast']})
-
-    def test_refresh_commits_applied_save_without_reload(self):
-        self.save_with_lost_acknowledgment()
-        for _ in range(2):
-            with (patch('sys.argv', ['gui_backend.py', 'startup', 'chain', '--refresh']),
-                  patch('builtins.print') as output):
-                gui.main()
-            self.assertEqual(json.loads(output.call_args.args[0])['state']['nodes'], ['fast', 'other'])
-        saved = json.loads(self.policy.read_bytes())
-        self.assertEqual(saved['selected_nodes'], {'b': ['fast', 'other']})
-        self.assertEqual(saved['provider_labels']['b'], 'B')
-        self.assertNotIn('pending_update', saved)
-        self.assertEqual(self.requests, [])
-        self.validate.assert_not_called()
-        with patch.object(update.c, 'CONFIG_DIR', self.root):
-            nodes, _, _ = update.c.load_nodes()
-            self.assertEqual(list(nodes), ['fast', 'other'])
-            self.assertEqual(nodes['fast']['server'], 'b.example.invalid')
-
-    def test_sync_starts_from_the_applied_unacknowledged_save(self):
-        self.save_with_lost_acknowledgment()
-        self.api.side_effect = self.controller
-        self.downloaded = {'a': ['current', 'fast'], 'b': ['fast', 'other', 'new']}
-        picker.synchronize()
-        saved = json.loads(self.policy.read_bytes())
-        self.assertEqual(saved['selected_nodes'], {'b': ['fast', 'other']})
-        self.assertNotIn('pending_update', saved)
-        self.assertEqual(self.active['live'], ['fast', 'other'])
-
-    def test_refresh_confirms_a_recomputed_selection_after_another_lost_acknowledgment(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-
-        def lose_response(method, route, body=None, **kwargs):
-            if route == '/configs?force=false':
-                if replaying:
-                    self.controller(method, route, body, **kwargs)
-                raise TimeoutError('response lost')
-            return self.controller(method, route, body, **kwargs)
-
-        replaying = False
-        self.api.side_effect = lose_response
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': ['fast', 'quick'], 'b': []})
-        self.write_profile('a', ['fast'])
-        replaying = True
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            picker.initialize()
-        self.assertEqual(json.loads(self.policy.read_bytes())['pending_update']['selection'], {'a': ['fast']})
-        self.requests.clear()
-        self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
-        self.assertEqual(self.requests, [])
+    def test_unmanaged_switch_with_unsupported_group_filter_uses_live_names(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxies'][:2] = [node('入口甲'), node('入口乙')]
+        config['proxy-groups'][0] = {'name': t.ENTRY, 'type': 'select',
+                                     'include-all-proxies': True, 'filter': r'\p{Han}'}
+        self.config.write_bytes(update.dump(config))
+        if core := os.environ.get('LINKBOX_TEST_CORE'):
+            run_process([core, '-t', '-d', str(self.root), '-f', str(self.config)],
+                        capture_output=True, timeout=10, check=True)
+        self.active.update(entry='入口甲', live=['入口甲', '入口乙'])
+        with patch.object(t, 'persist_selection'):
+            with self.assertRaisesRegex(RuntimeError, '节点状态已变化'):
+                gui.change(t.EXIT, '入口甲')
+            self.assertEqual(gui.change('入口乙', '入口甲')['state']['entry'], '入口乙')
+        self.assertEqual(self.requests, [ENTRY_ROUTE])
 
     def test_sync_uses_saved_selection_and_deletes_vanished_nodes_and_sources(self):
         self.apply({'a': ['current', 'fast', 'quick'], 'b': ['other']})
@@ -287,111 +231,6 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                       'selected': {'a': ['new'], 'b': []}})
         self.assertEqual(self.active['entry'], 'new')
         self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['new']})
-        self.assertEqual(yaml.safe_load((self.root / 'profiles/a.yaml').read_bytes())['proxies'], [node('new')])
-
-    def test_preview_save_journal_does_not_block_switches_or_save(self):
-        self.check_stale_journal('preview Save', 'Save')
-
-    def test_preview_save_journal_does_not_block_switches_or_sync(self):
-        self.check_stale_journal('preview Save', 'Sync')
-
-    def test_first_run_journal_does_not_block_switches_or_save(self):
-        self.check_stale_journal('first-run Sync', 'Save')
-
-    def test_first_run_journal_does_not_block_switches_or_sync(self):
-        self.check_stale_journal('first-run Sync', 'Sync')
-
-    def test_vanished_relay_journal_does_not_block_switches_or_save(self):
-        self.check_stale_journal('ordinary Save', 'Save')
-
-    def test_vanished_relay_journal_does_not_block_switches_or_sync(self):
-        self.check_stale_journal('ordinary Save', 'Sync')
-
-    def check_stale_journal(self, scenario, operation):
-        self.downloaded = {'a': ['current', 'fast'], 'b': ['other']}
-        if scenario == 'first-run Sync':
-            self.write_profile('a', ['current'])
-            self.downloaded['a'] = ['fast']
-            self.crash_during_update(picker.initialize, self.policy)
-            expected_journal = {'a': ['fast']}
-        else:
-            self.apply({'a': ['current', 'fast'], 'b': []})
-            pending_name = 'new' if scenario == 'preview Save' else 'quick'
-            if scenario == 'preview Save':
-                self.downloaded['a'] = ['new']
-                with self.assertRaisesRegex(RuntimeError, '管理节点'):
-                    picker.synchronize()
-            self.crash_during_save({'a': [pending_name], 'b': []}, self.policy)
-            expected_journal = {'a': [pending_name]}
-            if scenario == 'ordinary Save':
-                self.write_profile('a', ['current', 'fast'])
-        self.requests.clear()
-        before = self.files()
-        self.assertEqual(json.loads(self.policy.read_bytes())['pending_update']['selection'], expected_journal)
-        if scenario == 'preview Save':
-            self.validate.side_effect = CalledProcessError(1, 'fixture')
-        with (patch('sys.argv', ['gui_backend.py', 'startup', 'chain', '--refresh']),
-              patch('builtins.print') as output):
-            gui.main()
-            refresh = json.loads(output.call_args.args[0])
-        self.assertEqual(self.requests, [])
-        self.assertEqual(self.files(), before)
-        self.validate.side_effect = None
-
-        network = {'interface': 'fixture'}
-        with (patch.object(update.c, 'CONFIG_DIR', self.root),
-              patch.object(update.c, 'physical_network', return_value=network),
-              patch.object(t, 'persist_selection')):
-            self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
-            self.active['entry'] = 'current'
-            tested = update.c.load_nodes()
-            guard = {'network': network, 'before': self.active.copy(),
-                     'routing_fingerprint': update.c.routing_fingerprint(*tested, update.c.DNS_POLICY, 'current', 'fast')}
-            self.assertIn('fast', tested[0])
-            self.assertEqual(gui.change('fast', 'current', guard)['state']['entry'], 'fast')
-        self.assertEqual(self.requests, [ENTRY_ROUTE, ENTRY_ROUTE])
-        self.assertEqual(self.policy.read_bytes(), before[self.policy.name])
-        self.assertEqual(refresh.get('recovery_hint'), '上次订阅更新未完成，可刷新重试，或在管理节点重新保存')
-        self.assertTrue(refresh['startup_checked'])
-
-        journals = []
-
-        def observe_replacement(method, route, body=None, **kwargs):
-            if route == '/configs?force=false':
-                journals.append(json.loads(self.policy.read_bytes())['pending_update'])
-            return self.controller(method, route, body, **kwargs)
-
-        self.api.side_effect = observe_replacement
-        if operation == 'Save':
-            name = 'new' if scenario == 'preview Save' else 'current'
-            self.apply({'a': [name], 'b': []})
-            expected_selection = {'a': [name]}
-        else:
-            self.downloaded['a'] = ['current', 'fast']
-            if scenario != 'first-run Sync':
-                with self.assertRaisesRegex(RuntimeError, update.NO_SELECTION):
-                    picker.synchronize()
-                self.assertEqual(json.loads(self.policy.read_bytes())['pending_update']['selection'], expected_journal)
-                self.downloaded['a'].extend(expected_journal['a'])
-            picker.synchronize()
-            expected_selection = expected_journal
-        self.assertEqual(journals, [{'root': str(self.root), 'selection': expected_selection}])
-        policy = json.loads(self.policy.read_bytes())
-        self.assertEqual(policy['selected_nodes'], expected_selection)
-        self.assertNotIn('pending_update', policy)
-
-    def test_refresh_recovers_a_preview_save_with_its_downloaded_cache(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.downloaded = {'a': ['new'], 'b': ['other']}
-        with self.assertRaisesRegex(RuntimeError, '管理节点'):
-            picker.synchronize()
-        self.crash_during_save({'a': ['new'], 'b': []}, self.policy)
-
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.active['entry'], 'new')
-        policy = json.loads(self.policy.read_bytes())
-        self.assertEqual(policy['selected_nodes'], {'a': ['new']})
-        self.assertNotIn('pending_update', policy)
         self.assertEqual(yaml.safe_load((self.root / 'profiles/a.yaml').read_bytes())['proxies'], [node('new')])
 
     def test_first_run_fetches_before_seeding_and_drops_legacy_data_without_backup(self):
@@ -462,7 +301,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
 
         def unavailable(method, route, body=None, **kwargs):
             if (method, route) == ('GET', '/providers/proxies'):
-                raise t.ClashHTTPError(404, b'not found')
+                raise t.ClashHTTPError(404)
             return self.controller(method, route, body, **kwargs)
 
         self.api.side_effect = unavailable
@@ -493,32 +332,13 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertTrue(picker.initialize())
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current'], 'b': ['fast']})
 
-    def test_first_run_does_not_confirm_owner_assignment_without_success_response(self):
-        self.downloaded = {'a': ['current', 'fast', 'quick'], 'b': ['other']}
-        lost = []
-        def lose_reload(method, route, body=None, **_):
-            self.assertEqual(route, '/configs?force=false')
-            lost.append(body)
-            raise TimeoutError()
-
-        self.api.side_effect = lose_reload
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            picker.initialize()
-        self.assertNotIn('selected_nodes', json.loads(self.policy.read_bytes()))
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            picker.initialize()
-        self.assertEqual(len(lost), 2)
-        self.assertEqual(self.active['live'], ['current', 'fast'])
-        self.api.side_effect = self.controller
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.requests, ['/configs?force=false'])
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current', 'fast']})
-
-    def test_upgrade_with_saved_selection_cleans_pin_and_switches_once(self):
+    def test_sync_after_upgrade_with_saved_selection_cleans_pin_and_switches_once(self):
         self.legacy({'selected_nodes': {'a': ['fast'], 'b': ['other']}})
         (self.root / 'profiles/a.yaml').write_text('proxies: [')
         self.downloaded = {'a': ['fast'], 'b': ['other']}
-        self.assertTrue(picker.initialize())
+        self.assertFalse(picker.initialize())
+        self.assertEqual(self.fetch.call_count, 0)
+        picker.synchronize()
         self.assertEqual(self.active['entry'], 'fast')
         self.assertFalse(any(n['name'] == 'current' for n in self.reload['proxies']))
         self.assertNotIn('pinned_entry', json.loads(self.policy.read_text()))
@@ -540,8 +360,11 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.config.write_bytes(update.dump(config))
         (self.root / 'profiles/a.yaml').write_text('proxies: [')
         self.downloaded = {'b': ['other']}
+        before = self.files()
         with self.assertRaisesRegex(RuntimeError, '下载或解析失败'):
-            picker.initialize()
+            picker.synchronize()
+        self.assertEqual(self.fetch.call_count, 2)
+        self.assertEqual(self.files(), before)
         (self.base / 'chain-results.json').write_text(json.dumps(
             {'results': {'other': {'chain_delay': 10, 'owner': 'b'}}}))
         if core := os.environ.get('LINKBOX_TEST_CORE'):
@@ -555,7 +378,6 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                          [{'name': t.ENTRY, 'now': 'other'}])
         saved = json.loads(self.policy.read_bytes())
         self.assertEqual(saved['selected_nodes'], {'a': ['fast'], 'b': ['other']})
-        self.assertNotIn('pending_update', saved)
 
     def test_other_group_keeps_static_reference_and_entry_uses_owner_once(self):
         config = yaml.safe_load(self.config.read_bytes())
@@ -655,13 +477,12 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 self.assertEqual(gui.change('same', 'current', mode)['state']['entry'], 'same')
         self.assertEqual(self.requests, [ENTRY_ROUTE, ENTRY_ROUTE])
 
-    def test_save_confirms_with_identical_names_loaded_by_include_all(self):
+    def test_save_and_switch_with_identical_names_loaded_by_include_all(self):
         config = yaml.safe_load(self.config.read_bytes())
         config['proxy-providers'] = {'b': {'type': 'inline', 'payload': [node('current'), node('fast')]}}
         config['proxy-groups'].append({'name': 'secondary', 'type': 'select', 'include-all': True})
         self.config.write_bytes(update.dump(config))
         self.apply({'a': ['current', 'fast'], 'b': []})
-        self.assertNotIn('reload_unconfirmed', json.loads(self.policy.read_bytes()))
         with (patch.object(gui, 'snapshot', side_effect=lambda: {**self.active, 'nodes': self.active['live']}),
               patch.object(t, 'persist_selection')):
             self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
@@ -707,165 +528,6 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.active, active)
         self.assertEqual(self.reload['proxy-groups'][0]['use'], ['a'])
 
-    def test_refresh_confirms_applied_same_name_owner_move(self):
-        self.write_profile('b', ['current', 'fast'])
-        self.apply({'a': ['current', 'fast'], 'b': []})
-
-        def lose_response(method, route, body=None, **kwargs):
-            result = self.controller(method, route, body, **kwargs)
-            if route == '/configs?force=false':
-                raise ConnectionResetError(errno.ECONNRESET, 'response lost')
-            return result
-
-        self.api.side_effect = lose_response
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': [], 'b': ['current', 'fast']})
-        policy = json.loads(self.policy.read_bytes())
-        self.assertEqual(policy['selected_nodes'], {'a': ['current', 'fast']})
-        self.assertEqual(policy['pending_update']['selection'], {'b': ['current', 'fast']})
-        self.assertEqual(self.reload['proxy-groups'][0]['use'], ['b'])
-        self.api.side_effect = self.controller
-        self.requests.clear()
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.requests, [])
-        saved = json.loads(self.policy.read_bytes())
-        self.assertEqual(saved['selected_nodes'], {'b': ['current', 'fast']})
-        self.assertNotIn('pending_update', saved)
-
-    def test_unacknowledged_refreshes_retry_without_rewrites_or_backups(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.api.side_effect = TimeoutError()
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
-
-        def identities():
-            result = {}
-            for name in self.files():
-                stat = (self.base / name).stat()
-                result[name] = (stat.st_ino, stat.st_mtime_ns)
-            return result
-
-        before = identities()
-        self.api.reset_mock()
-        for _ in range(2):
-            with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-                picker.initialize()
-            self.assertEqual(identities(), before)
-        self.assertEqual([call.args[1] for call in self.api.call_args_list], ['/configs?force=false'] * 2)
-
-    def crash_after_config(self):
-        self.crash_during_save({'a': ['fast'], 'b': []}, self.config)
-
-    def crash_during_save(self, selection, crash_file):
-        self.crash_during_update(lambda: self.apply(selection), crash_file)
-
-    def crash_during_update(self, operation, crash_file):
-        original_index = self.index.read_bytes()
-        registry = self.base / 'subscriptions.json'
-        original_registry = registry.read_bytes()
-        original_requests = self.requests.copy()
-        atomic = update.atomic
-
-        class Crash(BaseException):
-            pass
-
-        def crash_after_write(path, data):
-            atomic(path, data)
-            if path == crash_file:
-                raise Crash()
-
-        with patch.object(update, 'atomic', side_effect=crash_after_write), self.assertRaises(Crash):
-            operation()
-        self.assertEqual(self.index.read_bytes(), original_index)
-        self.assertEqual(registry.read_bytes(), original_registry)
-        self.assertEqual(self.requests, original_requests)
-
-    def test_restart_recomputes_from_newer_verge_files_after_a_crash(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.requests.clear()
-        self.crash_after_config()
-        index = yaml.safe_load(self.index.read_bytes())
-        index['items'][0]['name'] = 'Renamed in Verge after the crash'
-        self.index.write_bytes(update.dump(index))
-        config = yaml.safe_load(self.config.read_bytes())
-        config['log-level'] = 'warning'
-        self.config.write_bytes(update.dump(config))
-        script = self.root / 'profiles/Script.js'
-        script.write_text('function main(c) { c["log-level"] = "warning"; return c; }\n')
-        (self.root / 'profiles/a.yaml').write_bytes(update.dump({'proxies': [node('fast', 'new.example.invalid')]}))
-        self.validate.reset_mock()
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.requests, ['/configs?force=false'])
-        self.assertEqual(self.active['live'], ['fast'])
-        self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
-                         [{'name': t.ENTRY, 'now': 'fast'}])
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
-        self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['name'],
-                         'Renamed in Verge after the crash')
-        self.assertEqual(yaml.safe_load(self.config.read_bytes())['log-level'], 'warning')
-        self.assertIn('c["log-level"] = "warning"', script.read_text())
-        self.assertEqual(self.reload['proxy-providers']['a']['payload'][0]['server'], 'new.example.invalid')
-        self.validate.assert_called_once()
-        self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
-
-    def test_restart_rolls_back_its_own_writes_if_reload_is_rejected(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.requests.clear()
-        self.crash_after_config()
-        index = yaml.safe_load(self.index.read_bytes())
-        index['items'][0]['name'] = 'Renamed in Verge after the crash'
-        self.index.write_bytes(update.dump(index))
-        previous = self.files()
-        self.api.side_effect = t.ClashHTTPError(400, b'{"message":"rejected"}')
-        with self.assertRaisesRegex(RuntimeError, '文件已回退'):
-            picker.initialize()
-        current = self.files()
-        self.assertEqual({f: d for f, d in current.items() if not f.startswith('backups/')},
-                         {f: d for f, d in previous.items() if not f.startswith('backups/')})
-        self.assertEqual(self.active['live'], ['current', 'fast'])
-        self.api.side_effect = self.controller
-        self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
-
-    def test_refresh_confirms_after_equivalent_config_reserialization(self):
-        self.check_late_reload_after_save(['fast', 'quick'], rewrite=True)
-
-    def test_refresh_keeps_relay_selected_in_verge_after_late_reload(self):
-        self.check_late_reload_after_save(['current', 'fast'], verge_entry='fast')
-
-    def check_late_reload_after_save(self, names, *, rewrite=False, verge_entry=None):
-        pending = []
-        def lose_request(method, route, body=None, **_):
-            if route == '/configs?force=false':
-                pending.append(body)
-                raise TimeoutError()
-            return self.controller(method, route, body)
-        self.api.side_effect = lose_request
-        if verge_entry is not None:
-            self.active['live'].append('external')
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': names, 'b': []})
-        self.assertEqual(len(pending), 1)
-        self.controller('PUT', '/configs?force=false', pending[0])
-        if rewrite:
-            original = self.config.read_bytes()
-            parsed = yaml.safe_load(original)
-            rewritten = yaml.safe_dump(parsed, default_flow_style=True).encode()
-            self.assertNotEqual(original, rewritten)
-            self.assertEqual(yaml.safe_load(rewritten), parsed)
-            self.config.write_bytes(rewritten)
-            self.active['live'].reverse()
-        if verge_entry is not None:
-            self.active['entry'] = verge_entry
-        self.requests.clear()
-        self.api.side_effect = self.controller
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.active['entry'], verge_entry or names[0])
-        self.assertEqual(self.requests, [])
-        saved = json.loads(self.policy.read_bytes())
-        self.assertNotIn('pending_update', saved)
-        self.assertNotIn('reload_unconfirmed', saved)
-
     def test_switch_accepts_same_names_from_another_live_provider(self):
         self.write_profile('a', ['current', 'same'])
         self.write_profile('b', ['current', 'same'])
@@ -890,118 +552,6 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                     self.active['entry'] = 'current'
                     self.assertEqual(gui.change('same', 'current', mode)['state']['entry'], 'same')
         self.assertEqual(self.requests, [ENTRY_ROUTE, ENTRY_ROUTE])
-
-    def test_refresh_reloads_when_request_never_reached_clash(self):
-        self.check_pending_update(reload_applied_late=False)
-
-    def test_refresh_finishes_when_reload_applied_after_polling(self):
-        self.check_pending_update(reload_applied_late=True)
-
-    def check_pending_update(self, reload_applied_late):
-        self.keep_stale_entry = True
-        self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
-        results = self.base / 'chain-results.json'
-        results.write_text(json.dumps({'results': {'fast': {'chain_delay': 10, 'owner': 'a'}}}))
-        pending = []
-
-        def lose_request(method, route, body=None, **_):
-            if route == '/configs?force=false':
-                pending.append(body)
-                raise TimeoutError()
-            return self.controller(method, route, body)
-
-        self.api.side_effect = lose_request
-        with self.assertRaisesRegex(RuntimeError, '尚未确认'):
-            self.apply({'a': ['fast', 'quick'], 'b': []})
-        self.assertEqual(len(pending), 1)
-        if reload_applied_late:
-            self.controller('PUT', '/configs?force=false', pending[0])
-            self.assertEqual(self.active['entry'], 'current')
-        self.requests.clear()
-        results.write_text(json.dumps({'results': {'quick': {'chain_delay': 10, 'owner': 'a'}}}))
-        self.api.side_effect = self.controller
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.active['entry'], 'quick')
-        self.assertEqual(self.requests, [ENTRY_ROUTE] if reload_applied_late else ['/configs?force=false', ENTRY_ROUTE])
-        self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
-                         [{'name': t.ENTRY, 'now': 'quick'}])
-        self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
-
-    def test_refresh_keeps_journal_after_geoip_validation_failure(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.requests.clear()
-        self.crash_after_config()
-        before = self.files()
-        self.validate.side_effect = TimeoutExpired('mihomo', 30)
-        with self.assertRaisesRegex(RuntimeError, '配置校验失败'):
-            picker.initialize()
-        self.assertEqual(self.files(), before)
-
-        self.validate.side_effect = CalledProcessError(1, 'mihomo', stderr=b'GeoIP database download failed')
-        with self.assertRaisesRegex(RuntimeError, '配置校验失败'):
-            picker.initialize()
-        self.assertEqual(self.files(), before)
-        self.assertEqual(self.requests, [])
-        self.validate.side_effect = None
-        self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
-
-    def test_refresh_retries_save_when_present_subscription_temporarily_omits_relay(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.requests.clear()
-        self.crash_during_save({'a': ['fast'], 'b': []}, self.policy)
-        self.write_profile('a', ['current'])
-        before = self.files()
-
-        with self.assertRaisesRegex(RuntimeError, '管理节点'):
-            picker.initialize()
-        self.assertEqual(self.files(), before)
-        self.assertEqual(self.requests, [])
-
-        self.write_profile('a', ['current', 'fast'])
-        self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
-        self.assertEqual(self.active['entry'], 'fast')
-
-    def test_refresh_keeps_journal_when_registry_cannot_be_read(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.requests.clear()
-        self.crash_during_save({'a': [], 'b': ['other']}, self.policy)
-        before = self.files()
-        read_text = Path.read_text
-
-        def unreadable_registry(path, *args, **kwargs):
-            if path == self.base / 'subscriptions.json':
-                raise PermissionError(errno.EACCES, 'fixture registry read failure')
-            return read_text(path, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', unreadable_registry), self.assertRaises(RuntimeError):
-            picker.initialize()
-        self.assertEqual(self.files(), before)
-        self.assertEqual(self.requests, [])
-        self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'b': ['other']})
-
-    def test_refresh_keeps_journal_when_target_profile_cannot_be_read(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        self.requests.clear()
-        self.crash_during_save({'a': [], 'b': ['other']}, self.policy)
-        before = self.files()
-        profile = self.root / 'profiles/b.yaml'
-        read_bytes = Path.read_bytes
-
-        def temporary_failure(path):
-            if path == profile:
-                raise PermissionError(errno.EACCES, 'fixture read failure')
-            return read_bytes(path)
-
-        with patch.object(Path, 'read_bytes', temporary_failure), self.assertRaisesRegex(RuntimeError, '本地缓存暂不可读'):
-            picker.initialize()
-        self.assertEqual(self.files(), before)
-        self.assertEqual(self.requests, [])
-        self.assertTrue(picker.initialize())
-        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'b': ['other']})
-        self.assertEqual(self.active['entry'], 'other')
 
     def test_failed_benchmark_start_preserves_display_history_and_invalidates_ranking(self):
         history = {'results': {'fast': {'owner': 'a', 'delay': 10, 'chain_delay': 20}},
@@ -1032,56 +582,6 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             row, = gui.node_rows({}, {'current': 'a'})
         self.assertEqual((row['delay'], row['chain_delay']), (5, 20))
         self.assertEqual(update.benchmark_results(), {'current': {'chain': None, 'entrance': 5, 'owner': 'a'}})
-
-    def test_switches_follow_disk_membership_before_and_after_late_reload(self):
-        self.apply({'a': ['current', 'fast'], 'b': []})
-        reloads = []
-
-        def timeout(method, route, body=None, **_):
-            if route == '/configs?force=false':
-                reloads.append(body)
-                raise TimeoutError()
-            return self.controller(method, route, body)
-
-        self.api.side_effect = timeout
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
-        self.requests.clear()
-        before = self.policy.read_bytes()
-        with patch.object(t, 'persist_selection'):
-            for guard in (None, {}):
-                with self.assertRaisesRegex(RuntimeError, t.ENTRY_NOT_APPLIED):
-                    gui.change('fast', 'current', guard)
-            self.assertEqual(self.requests, [])
-            self.controller('PUT', '/configs?force=false', reloads[0])
-            self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
-        self.assertEqual(len(reloads), 1)
-        self.assertEqual(self.policy.read_bytes(), before)
-
-    def test_initialization_replans_after_a_failed_switch(self):
-        self.keep_stale_entry = True
-        self.legacy({'selected_nodes': {'a': ['current', 'fast', 'quick'], 'b': ['other']}})
-        self.downloaded = {'a': ['fast', 'quick'], 'b': ['other']}
-        results = self.base / 'chain-results.json'
-        results.write_text(json.dumps({'results': {'quick': {'chain_delay': 10, 'owner': 'a'}}}))
-        def reject_switch(method, route, body=None, **_):
-            if route == ENTRY_ROUTE:
-                raise RuntimeError('switch failed')
-            return self.controller(method, route, body)
-        self.api.side_effect = reject_switch
-        with self.assertRaisesRegex(RuntimeError, '无法切换'):
-            picker.initialize()
-        self.assertEqual(self.active['entry'], 'current')
-        policy = json.loads(self.policy.read_bytes())
-        self.assertEqual(policy['pending_update'], {
-            'root': str(self.root), 'selection': {'a': ['fast', 'quick'], 'b': ['other']}})
-        results.write_text(json.dumps({'results': {'other': {'chain_delay': 5, 'owner': 'b'}}}))
-        self.api.side_effect = self.controller
-        self.requests.clear()
-        self.assertTrue(picker.initialize())
-        self.assertEqual(self.active['entry'], 'other')
-        self.assertEqual(self.requests, [ENTRY_ROUTE])
-        self.assertFalse(picker.initialize())
 
     def test_interrupted_benchmark_cannot_rank_the_next_reconciliation(self):
         self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
@@ -1128,23 +628,6 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         picker.synchronize()
         self.assertEqual(self.active['entry'], 'fast')
 
-    def test_switch_is_rechecked_after_a_short_delay(self):
-        self.keep_stale_entry = True
-        (self.base / 'chain-results.json').write_text(json.dumps({'results': {'quick': {'chain_delay': 10}}}))
-        reads_after_switch = 0
-        def observe(**_):
-            nonlocal reads_after_switch
-            if ENTRY_ROUTE in self.requests:
-                reads_after_switch += 1
-                if reads_after_switch == 2:
-                    self.active['entry'] = 'fast'
-            return self.active.copy()
-        with patch.object(t, 'relay_state', side_effect=observe):
-            with self.assertRaisesRegex(RuntimeError, '无法切换'):
-                self.apply({'a': ['fast', 'quick'], 'b': []})
-        self.assertEqual(reads_after_switch, 2)
-        self.sleep.assert_called_once_with(.3)
-
     def test_validation_and_external_changes_leave_files_untouched(self):
         before = self.files()
         self.validate.side_effect = update.subprocess.CalledProcessError(1, 'mihomo')
@@ -1156,43 +639,38 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.files(), before)
         self.api.assert_not_called()
 
+    def test_successful_reload_reports_an_external_change_between_selected_entries(self):
+        def reload_and_change_entry(method, route, body=None, **_):
+            self.controller(method, route, body)
+            self.active['entry'] = 'fast'
+
+        self.api.side_effect = reload_and_change_entry
+        with self.assertRaisesRegex(RuntimeError, update.POST_RELOAD_CHANGE):
+            self.apply({'a': ['current', 'fast'], 'b': []})
+        self.assertEqual(self.requests, ['/configs?force=false'])
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['current', 'fast']})
+
     def test_explicit_reload_rejection_restores_files_even_when_readback_is_unavailable(self):
         before = self.files()
         def reject_reload(method, route, body=None, **_):
             self.requests.append(route)
             if method == 'PUT':
-                raise t.ClashHTTPError(400, b'{"message":"rejected"}')
+                raise t.ClashHTTPError(400)
             raise OSError('offline')
         self.api.side_effect = reject_reload
-        with self.assertRaisesRegex(RuntimeError, '文件已回退'):
+        with self.assertRaisesRegex(RuntimeError, '400.*文件已回退'):
             self.apply({'a': ['fast'], 'b': []})
         self.assertEqual(self.requests, ['/configs?force=false'])
         self.assertEqual({k: v for k, v in self.files().items() if not k.startswith('backups/')}, before)
 
-    def test_transport_marks_explicit_http_rejections_only_when_body_is_present(self):
-        # Use the real adapter with a simulated complete HTTP response.
-        for body in (b'{"message":"rejected"}', b''):
-            with (patch('toolbox.http.client.HTTPConnection.request'),
-                  patch('toolbox.http.client.HTTPConnection.getresponse') as response,
-                  patch.object(t, 'api', self.real_api)):
-                response.return_value.status = 400
-                response.return_value.read.return_value = body
-                with self.assertRaisesRegex(RuntimeError, '400') as rejected:
-                    t.api('PUT', '/configs?force=false')
-                self.assertEqual(rejected.exception.rejected, bool(body))
-
-    def test_empty_http_error_response_cannot_trigger_rollback(self):
-        requests = []
-        def reject_without_body(method, route, body=None, **_):
-            if route == '/configs?force=false':
-                requests.append(body)
-                raise t.ClashHTTPError(500, b'')
-            return self.controller(method, route, body)
-        self.api.side_effect = reject_without_body
-        with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-            self.apply({'a': ['quick'], 'b': []})
-        self.assertEqual(len(requests), 1)
-        self.assertTrue(self.policy.exists())
+    def test_transport_rejects_an_http_error_without_reading_the_body(self):
+        with (patch('toolbox.http.client.HTTPConnection.request'),
+              patch('toolbox.http.client.HTTPConnection.getresponse') as response):
+            response.return_value.status = 400
+            with self.assertRaises(t.ClashHTTPError) as rejected:
+                self.real_api('PUT', '/configs?force=false')
+            self.assertTrue(rejected.exception.rejected)
+            response.return_value.read.assert_not_called()
 
     def test_lost_reload_response_keeps_new_files_with_unchanged_group(self):
         self.apply({'a': ['current', 'fast'], 'b': []})
@@ -1205,32 +683,46 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             return result
         self.api.side_effect = lose_response
         self.requests.clear()
-        picker.synchronize()
+        with self.assertRaisesRegex(RuntimeError, '已写入新配置，Clash 未确认，请刷新状态核对'):
+            picker.synchronize()
         self.assertEqual(self.requests, ['/configs?force=false'])
         self.assertEqual(self.active['live'], active_before['live'])
         self.assertEqual(self.active['entry'], active_before['entry'])
-        self.assertNotIn('reload_unconfirmed', json.loads(self.policy.read_bytes()))
         self.assertIn('new', (self.root / 'profiles/a.yaml').read_text())
 
-    def test_unobservable_reload_keeps_new_files_and_requests_refresh(self):
+    def test_lost_save_response_keeps_new_owner_and_allows_a_fresh_update(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.write_profile('b', ['fast', 'other'])
+        self.requests.clear()
         def lose_response(method, route, body=None, **_):
-            self.controller(method, route, body)
-            if route == '/configs?force=false':
-                raise TimeoutError()
+            self.assertEqual(route, '/configs?force=false')
+            self.requests.append(route)
+            raise TimeoutError()
 
-        def lose_reads(**_):
-            if self.reload is not None:
-                raise RuntimeError('offline')
+        def observe(**_):
+            self.assertEqual(self.requests, [])
             return self.active.copy()
 
         self.api.side_effect = lose_response
-        with patch.object(t, 'relay_state', side_effect=lose_reads):
-            with self.assertRaisesRegex(RuntimeError, update.RELOAD_UNCERTAIN):
-                self.apply({'a': ['quick'], 'b': []})
-        self.assertEqual(self.active['entry'], 'quick')
-        policy = json.loads(self.policy.read_text())
-        self.assertNotIn('selected_nodes', policy)
-        self.assertEqual(policy['pending_update']['selection'], {'a': ['quick']})
+        with patch.object(t, 'relay_state', side_effect=observe):
+            with self.assertRaisesRegex(RuntimeError, '已写入新配置，Clash 未确认，请刷新状态核对'):
+                self.apply({'a': [], 'b': ['fast', 'other']})
+        self.assertEqual(self.requests, ['/configs?force=false'])
+        self.assertEqual(json.loads(self.policy.read_text()),
+                         {'selected_nodes': {'b': ['fast', 'other']}, 'provider_labels': {'a': 'A', 'b': 'B'}})
+        self.assertEqual(yaml.safe_load(self.config.read_text())['proxy-groups'][0]['use'], ['b'])
+        self.assertEqual(self.active['entry'], 'current')
+
+        self.api.side_effect = self.controller
+        self.requests.clear()
+        self.assertFalse(picker.initialize())
+        self.assertEqual(self.requests, [])
+        self.downloaded = {'a': ['current', 'fast'], 'b': ['other']}
+        picker.synchronize()
+        self.assertEqual(self.requests, ['/configs?force=false'])
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'b': ['other']})
+        self.apply({'a': ['current'], 'b': []})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['current']})
 
     def test_switch_retries_once_after_fresh_read_and_keeps_applied_config(self):
         self.keep_stale_entry = True
@@ -1250,6 +742,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 self.api.side_effect = flaky_switch
                 def observe(**_):
                     calls.append(('GET', 'state'))
+                    if recover and calls[-2:] == [('PUT', ENTRY_ROUTE), ('GET', 'state')] and self.requests.count(ENTRY_ROUTE) == 1:
+                        raise TimeoutError('first switch read-back lost')
                     return self.active.copy()
                 with patch.object(t, 'relay_state', side_effect=observe):
                     if recover:
@@ -1263,73 +757,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 self.assertEqual(self.active['entry'], 'quick' if recover else 'current')
                 policy = json.loads(self.policy.read_text())
                 self.assertEqual(policy['selected_nodes'], {'a': ['fast', 'quick']})
-                self.assertEqual('pending_update' in policy, not recover)
 
-    def test_delayed_reload_is_read_back_without_resending_it(self):
-        self.apply({'a': ['current', 'fast', 'quick'], 'b': []})
-        writes = []
-        reads = 0
-        def delayed_reload(method, route, body=None, **_):
-            if route == '/configs?force=false':
-                writes.append(body)
-                raise TimeoutError()
-            return self.controller(method, route, body)
-
-        def observe(**_):
-            nonlocal reads
-            if writes:
-                reads += 1
-                if reads == 2:
-                    self.controller('PUT', '/configs?force=false', writes[0])
-            return self.active.copy()
-
-        self.api.side_effect = delayed_reload
-        with patch.object(t, 'relay_state', side_effect=observe):
-            self.apply({'a': ['quick'], 'b': []})
-        self.assertEqual(len(writes), 1)
-        self.assertEqual(self.active['entry'], 'quick')
-        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['quick']})
-        self.assertEqual(yaml.safe_load(self.config.read_bytes())['proxy-providers']['a']['filter'], '^quick$')
-
-    def test_upgrade_download_failure_keeps_saved_relays_and_tries_every_source(self):
-        self.legacy({'selected_nodes': {'a': ['fast'], 'b': ['other']}})
-        self.downloaded = {'b': ['other']}
-        before = self.files()
-        with self.assertRaisesRegex(RuntimeError, '订阅下载'):
-            picker.initialize()
-        self.assertEqual(self.fetch.call_count, 2)
-        self.assertEqual(self.files(), before)
-        self.assertEqual(self.requests, [])
-        self.downloaded['a'] = ['fast']
-        self.assertTrue(picker.initialize())
-
-    def test_refresh_retries_initialization_after_files_written_but_reload_unconfirmed(self):
-        self.active['live'].append('external')
-        self.downloaded = {'a': ['current', 'fast'], 'b': ['other']}
-        reloads = []
-        def lose_reload(method, route, body=None, **_):
-            if route == '/configs?force=false':
-                reloads.append(body)
-                raise TimeoutError()
-            return self.controller(method, route, body)
-        self.api.side_effect = lose_reload
-        with self.assertRaisesRegex(RuntimeError, '尚未确认'):
-            picker.initialize()
-        self.assertEqual(json.loads(self.policy.read_text())['pending_update']['selection'],
-                         {'a': ['current', 'fast']})
-        with self.assertRaisesRegex(RuntimeError, '尚未确认'):
-            picker.initialize()
-        self.assertEqual(len(reloads), 2)
-        self.controller('PUT', '/configs?force=false', reloads[0])
-        self.api.side_effect = self.controller
-        with patch('sys.argv', ['gui_backend.py', 'startup', 'chain']), patch.object(
-                gui, 'snapshot', return_value={}), patch('builtins.print') as output:
-            gui.main()
-            self.assertTrue(json.loads(output.call_args.args[0])['initialized'])
-        self.assertFalse(picker.initialize())
-        self.assertEqual(self.requests, ['/configs?force=false'])
-
-    def test_no_live_match_requires_picker_without_retrying_on_refresh(self):
+    def test_no_live_match_offers_the_picker_and_retries_until_a_selection_exists(self):
         self.downloaded = {'a': ['new'], 'b': ['other']}
         with self.assertRaisesRegex(RuntimeError, '管理节点'):
             picker.initialize()
@@ -1338,7 +767,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             gui.main()
         with self.assertRaisesRegex(RuntimeError, '管理节点'):
             picker.initialize()
-        self.assertEqual(self.fetch.call_count, 2)
+        self.assertEqual(self.fetch.call_count, 4)
         self.assertEqual(self.requests, [])
         self.assertFalse(self.policy.exists())
         self.apply({'a': ['new'], 'b': []})
@@ -1358,18 +787,3 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.downloaded = {'a': inputs['sources'][0]['nodes'], 'b': ['other']}
         picker.synchronize(inputs['metric'])
         self.assertEqual(self.active['entry'], data['expected']['entry'])
-
-    def test_post_switch_rejects_an_added_entry_member(self):
-        self.keep_stale_entry = True
-        def add_static_member(method, route, body=None, **_):
-            result = self.controller(method, route, body)
-            if route == ENTRY_ROUTE:
-                self.active['live'].append('external')
-            return result
-        self.api.side_effect = add_static_member
-        (self.base / 'chain-results.json').write_text(json.dumps({'results': {'other': {'chain_delay': 20}}}))
-        with self.assertRaisesRegex(RuntimeError, '配置已更新，但无法切换'):
-            self.apply({'a': ['quick'], 'b': ['other']})
-        self.assertEqual(self.requests, ['/configs?force=false', ENTRY_ROUTE])
-        self.assertEqual(json.loads(self.policy.read_text())['pending_update']['selection'],
-                         {'a': ['quick'], 'b': ['other']})

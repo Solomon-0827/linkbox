@@ -14,18 +14,17 @@ import tempfile
 import urllib.parse
 
 from runtime import BASE, CONFIG_DIR
-from reconcile import same_entry_members, selection_owners
+from reconcile import selection_owners
 
 SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
 PROFILES = CONFIG_DIR / 'profiles.yaml'
 EXIT = '美国静态家宽'
 ENTRY = '中转入口'
-ENTRY_NOT_APPLIED = 'Clash 配置尚未生效，请刷新、保存或同步订阅'
 
 class ClashHTTPError(RuntimeError):
-    def __init__(self, status, body):
-        super().__init__(f'Clash API 返回 {status}: {body.decode(errors="replace")[:200]}')
-        self.rejected = 400 <= status < 600 and bool(body)
+    def __init__(self, status):
+        super().__init__(f'Clash API 返回 {status}')
+        self.rejected = 400 <= status < 600
 
 
 class ClashRequestNotSent(OSError):
@@ -50,9 +49,9 @@ def api(method, path, payload=None, *, timeout=6):
     try:
         conn.request(method, path, json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None, {'Content-Type': 'application/json'})
         response = conn.getresponse()
-        body = response.read()
         if response.status >= 300:
-            raise ClashHTTPError(response.status, body)
+            raise ClashHTTPError(response.status)
+        body = response.read()
         return json.loads(body) if body else None
     finally:
         conn.close()
@@ -80,7 +79,7 @@ def switch_lock():
         yield
 
 
-def live_entry_plan(live):
+def unmanaged_entry_owners(live):
     import yaml
     import runtime
     from subscription_update import entry_plan
@@ -89,20 +88,21 @@ def live_entry_plan(live):
     try:
         config = yaml.safe_load((root / 'clash-verge.yaml').read_bytes())
     except (OSError, ValueError, yaml.YAMLError):
-        return None
-    plan = entry_plan(config, root)
-    return plan if plan is not None and same_entry_members(live, plan) else None
-
-
-def same_switch_target(before, after, name):
-    return (after is not None and same_entry_members(before, after)
-            and after[name][0] == before[name][0])
+        return {}
+    plan = entry_plan(config, root) or {}
+    return {name: owner for name, (owner, _) in plan.items() if name in live}
 
 
 def relay_owners(selection, live):
     if selection is not None:
         return selection_owners(selection)
-    return {name: owner for name, (owner, _) in (live_entry_plan(live) or {}).items()}
+    return unmanaged_entry_owners(live)
+
+
+def switch_owners(live):
+    import runtime
+    owners = relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), live)
+    return {name: owner for name, owner in owners.items() if name in live}
 
 
 def provider_nodes(response):
@@ -176,15 +176,13 @@ def switch():
         print('\n当前链式配置与预期不符。为避免改变出口，本工具不会切换。请先在 Clash 恢复全局 → 美国静态家宽。')
         return
     live = p.get(ENTRY, {}).get('all', [])
-    plan = live_entry_plan(live)
-    if plan is None:
-        raise RuntimeError(ENTRY_NOT_APPLIED)
-    nodes = list(plan)
+    owners = switch_owners(live)
+    nodes = list(owners)
     if not nodes:
         raise RuntimeError('中转入口没有可选节点')
     current = p[ENTRY].get('now')
     for i, name in enumerate(nodes, 1):
-        provider = plan[name][0]
+        provider = owners[name]
         print(f'{i:2}. ' + (f'[{provider}] ' if provider else '') + name + ('  ← 当前' if name == current else ''))
     print(' 0. 返回（不切换）')
     raw = input('\n输入节点编号：').strip()
@@ -211,17 +209,15 @@ def switch_entry(current, target):
     fresh_c, fresh_p = state()
     if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current:
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
-    plan = live_entry_plan(fresh_p[ENTRY].get('all', []))
-    if plan is None:
-        raise RuntimeError(ENTRY_NOT_APPLIED)
-    if target not in plan:
+    owners = switch_owners(fresh_p[ENTRY].get('all', []))
+    if target not in owners:
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
-    after_plan = live_entry_plan(after_p[ENTRY].get('all', []))
+    after_owners = switch_owners(after_p[ENTRY].get('all', []))
     if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
             or after_p[EXIT].get('dialer-proxy') != ENTRY or after_c.get('mode') != 'global'
-            or not same_switch_target(plan, after_plan, target)):
+            or target not in after_owners or after_owners[target] != owners[target]):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:

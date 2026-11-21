@@ -1,9 +1,8 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),http=require('node:http'),https=require('node:https'),net=require('node:net');
 const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
-const {sameEntryMembers,selectionOwners}=require('./reconcile.cjs');
+const {selectionOwners}=require('./reconcile.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
-const ENTRY_NOT_APPLIED='Clash 配置尚未生效，请刷新、保存或同步订阅';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function jsonRead(p,fallback={}){try{return JSON.parse(await fs.readFile(p,'utf8'));}catch{return fallback;}}
 async function writeJSON(p,v){await fs.mkdir(path.dirname(p),{recursive:true});const tmp=p+'.tmp';await fs.writeFile(tmp,JSON.stringify(v,null,2),{mode:0o600});await fs.rename(tmp,p);}
@@ -47,9 +46,9 @@ function assessClaude(rows,connections,expectedProxyIP,expectedIP=EXPECTED){
  return {status:bad?'bad':good>0&&good===rows.length&&expectedProxyIP===expectedIP?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
 }
 class ClashHTTPError extends Error {
- constructor(status, hasBody){
+ constructor(status){
   super('Clash 控制接口返回 '+status);
-  this.rejected = status >= 400 && status < 600 && hasBody;
+  this.rejected = status >= 400 && status < 600;
  }
 }
 class ClashRequestNotSent extends Error {}
@@ -89,7 +88,14 @@ class Backend{
  throw Error('无法连接 Clash Verge 本机控制接口。请确认 Clash Verge 正在运行；无需开启局域网控制。');}
  request(endpoint,method,route,body,timeout=6000){return new Promise((resolve,reject)=>{
   const {secret,...opts}=endpoint;const payload=body===undefined?null:JSON.stringify(body);
-  const req=http.request({...opts,method,path:route,headers:{...(secret?{Authorization:'Bearer '+secret}:{}),...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{})}},r=>{let chunks=[],size=0;r.on('data',x=>{size+=x.length;if(size>12e6){req.destroy(Error('响应过大'));return;}chunks.push(x)});r.on('error',reject);r.on('end',()=>{const body=Buffer.concat(chunks).toString();if(r.statusCode>=300)return reject(new ClashHTTPError(r.statusCode, size > 0));try{resolve(body?JSON.parse(body):{});}catch{reject(Error('Clash 返回无效数据'));}})});
+  const req=http.request({...opts,method,path:route,headers:{...(secret?{Authorization:'Bearer '+secret}:{}),...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{})}},r=>{
+   if(r.statusCode>=300){
+    r.on('error',reject);
+    r.resume();
+    reject(new ClashHTTPError(r.statusCode));
+    return;
+   }
+   let chunks=[],size=0;r.on('data',x=>{size+=x.length;if(size>12e6){req.destroy(Error('响应过大'));return;}chunks.push(x)});r.on('error',reject);r.on('end',()=>{const body=Buffer.concat(chunks).toString();try{resolve(body?JSON.parse(body):{});}catch{reject(Error('Clash 返回无效数据'));}})});
   let connected=false;
   req.on('socket',socket=>{
    if(socket.connecting)socket.once('connect',()=>{connected=true;});
@@ -117,12 +123,11 @@ class Backend{
    this.relayState(timeout),this.api('GET','/providers/proxies',undefined,timeout).catch(()=>({})),
    require('./subscriptions.cjs').entryPlan(cfg,this.root).catch(()=>null),
   ]);
-  const entryMatchesDisk=plan!==null&&sameEntryMembers(relay.live,plan.keys());
-  const entryOwners=entryMatchesDisk?Object.fromEntries(Array.from(plan,([name,{owner}])=>[name,owner])):{};
   const owners=selectionOwners(this.nodePolicy.selected_nodes);
-  if(this.nodePolicy.selected_nodes==null&&entryMatchesDisk){
-   for(const [name,{owner}] of plan)owners.set(name,owner);
+  if(this.nodePolicy.selected_nodes==null&&plan){
+   for(const [name,{owner}] of plan)if(relay.live.includes(name))owners.set(name,owner);
   }
+  const entryOwners=Object.fromEntries([...owners].filter(([name])=>relay.live.includes(name)));
   const liveRows=new Map();
   for(const [owner,proxies] of providerNodes(providers)){
    for(const node of proxies){
@@ -135,7 +140,7 @@ class Backend{
     type:liveRows.get(name)?.type??plan?.get(name)?.node?.type,...(result.owner==null||result.owner===owner?result:{})};
   });
   return {...relay,expectedIP:this.expectedIP,nodes,
-   entryMatchesDisk,entryOwners,switchable:entryMatchesDisk?[...plan.keys()]:[],lastTest:this.history.finishedAt,
+   entryOwners,switchable:Object.keys(entryOwners),lastTest:this.history.finishedAt,
    settings:{...benchmarkSettings(this.settings),hourly:this.settings.hourly!==false,configDir:this.root,corePath:this.settings.corePath||''},
    progress:this.progress};
  }
@@ -146,13 +151,12 @@ class Backend{
   try{
    const before=await this.state();
    this.assertChain(before);
-   if(!before.entryMatchesDisk)throw Error(ENTRY_NOT_APPLIED);
    if(before.entry!==previous||!before.switchable.includes(name))throw Error('节点状态已变化，请刷新状态');
    const owner=before.entryOwners[name];
    if(name!==previous)await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name});
    const after=await this.state();
    if(after.entry!==name||after.exit!==EXIT||after.mode!=='global'||after.dialer!==ENTRY||
-    !sameEntryMembers(after.switchable,before.switchable)||after.entryOwners[name]!==owner){
+    !after.switchable.includes(name)||after.entryOwners[name]!==owner){
     throw Error('切换后的状态待核对，请刷新 Clash 状态');
    }
    return after;
@@ -285,18 +289,18 @@ class Backend{
    const currentNetwork=await this.network(),current=await this.state();
    const unchanged=authorized()&&signature(current)===signature(before)&&
     JSON.stringify(currentNetwork)===JSON.stringify(network);
-   if(unchanged&&!current.entryMatchesDisk)throw Error(ENTRY_NOT_APPLIED);
    const fresh=await this.loadNodes().then(result=>({...result,dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP})).catch(()=>null);
    const sameRouting=fresh?.nodes.has(target)&&isDeepStrictEqual(
     [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
     [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);
    if(sameRouting&&unchanged&&current.live.includes(target)){
     const owner=before.nodes.find(row=>row.name===target)?.providerId;
-    if(current.entryOwners[target]!==owner)throw Error('节点归属已变化，请先更新订阅');
+    if(!current.switchable.includes(target)||current.entryOwners[target]!==owner)throw Error('节点归属已变化，请先更新订阅');
     if(!authorized())return this.history;
     await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name:target});
     const after=await this.state();
-    if(signature(after)!==signature({...before,entry:target})||
+    if(after.entry!==target||after.mode!==before.mode||after.tun!==before.tun||
+     after.exit!==before.exit||after.dialer!==before.dialer||
      !after.switchable.includes(target)||after.entryOwners[target]!==owner)throw Error('自动切换后的状态待核对，请刷新 Clash 状态');
     return {...this.history,switchedTo:target};
    }

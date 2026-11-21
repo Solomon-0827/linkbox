@@ -10,7 +10,6 @@ import fcntl
 import os
 import toolbox as t
 import runtime
-from reconcile import selection_owners
 
 def node_rows(p, owners):
     inventory = t.node_inventory(p, owners)
@@ -109,12 +108,10 @@ def change(target,previous,guard=None):
     s=snapshot()
     if s['mode']!='global' or s['exit']!=t.EXIT or s['dialer']!=t.ENTRY:
         raise RuntimeError('当前全局链路与预期不符，已取消。请先在 Clash 恢复全局 → 美国静态家宽。')
-    plan = t.live_entry_plan(s['live'])
-    if plan is None:
-        raise RuntimeError(t.ENTRY_NOT_APPLIED)
-    if s['entry']!=previous or target not in plan:
+    owners = t.switch_owners(s['live'])
+    if s['entry']!=previous or target not in owners:
         raise RuntimeError('节点状态已变化，请刷新后重新选择。')
-    owner = plan[target][0]
+    owner = owners[target]
     if guard is not None:
         import chain_test
         if chain_test.physical_network()!=guard['network'] or chain_test.active_state()[0]!=guard['before']:
@@ -123,16 +120,16 @@ def change(target,previous,guard=None):
         if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,expected,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
                 (t.BASE/'chain-cancel').exists()):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
-        selection = runtime.read_json('node-policy.json').get('selected_nodes')
-        if selection is not None and selection_owners(selection).get(target) != owner:
+        fresh_owners = t.switch_owners(s['live'])
+        if target not in fresh_owners or fresh_owners[target] != owner:
             raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
-    after_plan = t.live_entry_plan(after['live'])
-    if not t.same_switch_target(plan, after_plan, target):
+    after_owners = t.switch_owners(after['live'])
+    if target not in after_owners or after_owners[target] != owner:
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)
@@ -165,22 +162,16 @@ def main():
     elif action=='status': result={'state':snapshot()}
     elif action=='startup':
         import subscription_picker
-        from subscription_update import RECOVERY_HINT
         before = t.relay_state()
         ready = before['mode'] == 'global' and before['exit'] == t.EXIT and before['dialer'] == t.ENTRY
         result = {'startup_checked': ready}
-        if ready or runtime.read_json('node-policy.json').get('pending_update') is not None:
+        if ready:
             try:
                 result['initialized'] = subscription_picker.initialize(sys.argv[2])
                 if result['initialized'] and '--refresh' in sys.argv[3:]:
                     result['message'] = '已刷新 Clash 状态。'
-            except Exception as error:
-                if runtime.read_json('node-policy.json').get('pending_update') is not None:
-                    result['recovery_hint'] = RECOVERY_HINT
-                elif isinstance(error, RuntimeError):
-                    result.update(startup_checked=False, message=str(error))
-                else:
-                    raise
+            except RuntimeError as error:
+                result.update(startup_checked=False, message=str(error))
         result['state'] = snapshot()
     elif action=='subscription-catalog':
         import subscription_picker
