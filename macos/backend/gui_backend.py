@@ -42,16 +42,19 @@ def snapshot(include_nodes=True):
     c,p=t.state()
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
     data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':list(selection_owners(selection)),'live':p.get(t.ENTRY,{}).get('all',[]),'expected_ip':runtime.expected_ip()}
+    data['entry_revision'] = p.get(t.ENTRY, {}).get('testUrl')
     if include_nodes:
         try:data['node_rows']=node_rows(p, selection)
         except Exception as e:data['node_rows_error']=str(e)
     return data
 
 def latency():
+    from chain_test import clear_latest_results, write_json
     lock=open(t.BASE/'latency.lock','a')
     try:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('已有一轮节点测速正在运行，请稍后再试')
+        clear_latest_results()
         before=snapshot(False);_,p=t.state();results={}
         owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
         inventory = t.node_inventory(p, owners)
@@ -88,8 +91,7 @@ def latency():
                 if not pending:break
                 wait(pending,timeout=.2,return_when=FIRST_COMPLETED)
         after=snapshot(False)
-        unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live'])
-        from chain_test import write_json
+        unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live','entry_revision'])
         write_json(t.BASE/'latency-results.json', {
             'finished_at': datetime.datetime.now().astimezone().isoformat(),
             'results': results, 'selection_unchanged': unchanged,
@@ -97,6 +99,7 @@ def latency():
         return {'state':snapshot(),'message':f'入口测速完成：{sum(x["delay"] is not None for x in results.values())}/{len(results)} 本次可达。'+('当前链路未改变。' if unchanged else '检测到外部代理状态变化，请核对。')+' 仅作入口参考，不代表美国完整链路或下载速度。'}
     finally:lock.close()
 
+@t.switch_lock()
 def change(target,previous,guard=None):
     s=snapshot()
     if s['mode']!='global' or s['exit']!=t.EXIT or s['dialer']!=t.ENTRY:
@@ -113,7 +116,8 @@ def change(target,previous,guard=None):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
     owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
     owner = owners.get(target)
-    if not t.entry_member_owned(s['live'], t.proxy_providers(), t.entry_provider_names(), target, owner):
+    use = t.live_entry_providers(s.get('entry_revision'), t.entry_config())
+    if not t.entry_member_owned(s['live'], t.proxy_providers(), use, target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
@@ -121,7 +125,8 @@ def change(target,previous,guard=None):
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
     if (selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner
-            or not t.entry_member_owned(after['live'], t.proxy_providers(), t.entry_provider_names(), target, owner)):
+            or not t.entry_member_owned(after['live'], t.proxy_providers(),
+                                        t.live_entry_providers(after.get('entry_revision'), t.entry_config()), target, owner)):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)

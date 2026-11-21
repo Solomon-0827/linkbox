@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
+const timers = require('node:timers/promises');
 const YAML = require('yaml');
 const {Backend, ClashHTTPError, ENTRY, EXIT} = require('../backend.cjs');
 const sub = require('../subscriptions.cjs');
@@ -13,6 +14,7 @@ const node = (name, server = 'relay.example.invalid') => ({
 });
 const ENTRY_ROUTE = '/proxies/' + encodeURIComponent(ENTRY);
 async function fixture(t) {
+ t.mock.method(timers, 'setTimeout', async () => {});
  const dir = await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-selection-'));
  t.after(() => fs.rm(dir, {recursive: true, force: true}));
  const root = path.join(dir, 'verge'), data = path.join(dir, 'data');
@@ -50,6 +52,11 @@ async function fixture(t) {
   return YAML.stringify({proxies: refreshed[url.split('/').at(-1)].map(n => node(n))});
  };
  b.request = async (_endpoint, method, route, body) => {
+  if (method === 'GET' && route === '/configs') return {mode:state.mode, tun:{enable:state.tun}};
+  if (method === 'GET' && route === '/proxies') return {proxies:{
+   GLOBAL:{now:state.exit}, [EXIT]:{'dialer-proxy':state.dialer},
+   [ENTRY]:{now:state.entry, all:state.live, testUrl:state.entryRevision},
+  }};
   if (method === 'GET' && route === '/providers/proxies') return {providers};
   assert.equal(method, 'PUT');
   requests.push({route, body});
@@ -58,8 +65,9 @@ async function fixture(t) {
    const payload = YAML.parse(body.payload), group = payload['proxy-groups'][0];
    assert.deepEqual(group.proxies, []);
    providers = Object.fromEntries(Object.entries(payload['proxy-providers']).map(([owner, p]) => [
-    owner, {proxies: p.payload, vehicleType: 'Inline', testUrl: p['health-check']?.url},
+    owner, {proxies: p.payload, vehicleType: 'Inline'},
    ]));
+   state.entryRevision = group.url;
    state.live = group.use.flatMap(id => payload['proxy-providers'][id].payload.map(n => n.name));
    if (!state.live.includes(state.entry)) state.entry = state.live[0];
   } else {
@@ -247,6 +255,20 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
  });
 }
 
+test('partial deselection filters a provider shared with another group', async t => {
+ const {b, config, write, apply, requests} = await fixture(t);
+ const secondary = {name:'secondary', type:'select', use:['a'], filter:'^slow$'};
+ config['proxy-groups'].push(secondary);
+ await write('clash-verge.yaml', config);
+ await write('profiles/a.yaml', {proxies:['fast','slow'].map(name => node(name))});
+ await apply({a:['fast','slow'], b:[]});
+ await apply({a:['fast'], b:[]});
+ const payload = YAML.parse(requests.at(-1).body.payload);
+ assert.deepEqual(payload['proxy-groups'][1], secondary);
+ assert.equal(payload['proxy-providers'].a.filter, '^fast$');
+ assert.deepEqual(payload['proxy-providers'].a.payload.map(row => row.name), ['fast']);
+});
+
 test('validation failure and external state change cancel before any reload', async t => {
  const {b, root, apply, state, requests} = await fixture(t);
  const file = path.join(root,'clash-verge.yaml'), original = await fs.readFile(file);
@@ -286,8 +308,7 @@ test('empty HTTP error response cannot trigger rollback', async t => {
   return controller(...args);
  };
  await assert.rejects(apply({a:['quick'],b:[]}), /尚未确认/);
- assert.equal(writes.length, 2);
- assert.deepEqual(writes[0], writes[1]);
+ assert.equal(writes.length, 1);
  assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
 });
 
@@ -342,8 +363,10 @@ test('lost reload response keeps new files even with unchanged group membership'
  };
  requests.length = 0;
  await b.updateSubscriptions();
- assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', '/configs?force=false']);
- assert.deepEqual(state, before);
+ assert.deepEqual(requests.map(r => r.route), ['/configs?force=false']);
+ assert.deepEqual(state.live, before.live);
+ assert.equal(state.entry, before.entry);
+ assert.notEqual(state.entryRevision, before.entryRevision);
  assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /new/);
 });
 
@@ -388,21 +411,20 @@ for(const recover of [true, false]) test('switch retries after reading state, th
  assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick']});
 });
 
-test('late reload after old readback keeps the same files and policy', async t => {
+test('a delayed reload is read back without resending it', async t => {
  const {b, root, state, apply, saved} = await fixture(t);
  const controller = b.request, writes = [];
+ let reads = 0;
  b.request = async (...args) => {
   if (args[2] === '/configs?force=false') {
    writes.push(args);
-   if (writes.length === 2) throw new ClashHTTPError(400, true);
    throw Error('timeout');
   }
+  if (writes.length && args[2] === '/providers/proxies' && ++reads === 2) await controller(...writes[0]);
   return controller(...args);
  };
- await assert.rejects(apply({a:['quick'],b:[]}), /已写入新配置，Clash 尚未确认，请刷新状态核对/);
- assert.equal(writes.length, 2);
- assert.deepEqual(writes[0], writes[1]);
- await controller(...writes[0]);
+ await apply({a:['quick'],b:[]});
+ assert.equal(writes.length, 1);
  assert.equal(state.entry, 'quick');
  assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
  const config = YAML.parse(await fs.readFile(path.join(root,'clash-verge.yaml'),'utf8'));
@@ -426,17 +448,111 @@ test('upgrade download failure keeps saved relays and tries every source', async
 test('initialization retries after files are written but reload is unconfirmed', async t => {
  const {b, refreshWith, saved, requests} = await fixture(t);
  refreshWith({a:['current','fast'],b:['other']});
- const controller = b.request;
+ const controller = b.request, reloads = [];
  b.request = async (...args) => {
-  if (args[2] === '/configs?force=false') throw Error('timeout');
+  if (args[2] === '/configs?force=false') { reloads.push(args); throw Error('timeout'); }
   return controller(...args);
  };
  await assert.rejects(sub.initialize(b), /尚未确认/);
  assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+ await assert.rejects(sub.initialize(b), /请先刷新状态/);
+ assert.equal(reloads.length, 1);
+ await controller(...reloads[0]);
  b.request = controller;
  assert.equal(await sub.initialize(b), true);
  assert.equal(await sub.initialize(b), false);
- assert.equal(requests.length, 1);
+ assert.equal(requests.length, 2);
+});
+
+test('unconfirmed reload blocks switching and reconcile until Refresh confirms it', async t => {
+ const {b, apply, requests, state} = await fixture(t);
+ await apply({a:['current','fast'], b:[]});
+ const controller = b.request, reloads = [];
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') { reloads.push(args); throw Error('timeout'); }
+  return controller(...args);
+ };
+ await assert.rejects(apply({a:['current','fast','quick'], b:[]}), /已写入新配置，Clash 尚未确认，请刷新状态核对/);
+ requests.length = 0;
+ const guard = /配置尚未被 Clash 确认，请先刷新状态/;
+ const observe = b.state;
+ delete b.state;
+ await assert.rejects(b.switchNode('fast','current'), guard);
+ b.settings.autoRelay = true;
+ b.network = async () => ({interface:'fixture'});
+ b.corePath = async () => '/mock';
+ b.testNode = async node => ({delay:node.name === 'current' ? 400 : 100});
+ await assert.rejects(b.benchmark('chain', () => true), guard);
+ b.state = observe;
+ await assert.rejects(apply({a:['fast'], b:[]}), guard);
+ await assert.rejects(sub.initialize(b), guard);
+ assert.equal(requests.length, 0);
+ assert.equal(reloads.length, 1);
+ await controller(...reloads[0]);
+ delete b.state;
+ await assert.rejects(b.switchNode('fast','current'), guard);
+ await sub.initialize(b);
+ await b.switchNode('fast','current');
+ assert.equal(state.entry, 'fast');
+});
+
+test('initialization replans from the latest results after a failed switch', async t => {
+ const {b, legacy, refreshWith, state, saved} = await fixture(t);
+ await legacy({selected_nodes:{a:['current','fast','quick'], b:['other']}});
+ refreshWith({a:['fast','quick'], b:['other']});
+ b.history = {kind:'chain', latestResults:{quick:{owner:'a', chainDelay:10}}};
+ const controller = b.request;
+ b.request = async (...args) => {
+  if (args[2] === ENTRY_ROUTE) throw Error('switch failed');
+  return controller(...args);
+ };
+ await assert.rejects(sub.initialize(b), /无法切换/);
+ assert.equal(state.entry, 'fast');
+ assert.equal((await saved()).initialization_pending, true);
+ b.history = {kind:'chain', latestResults:{other:{owner:'b', chainDelay:5}}};
+ b.request = controller;
+ assert.equal(await sub.initialize(b), true);
+ assert.equal(state.entry, 'other');
+ assert.equal(await sub.initialize(b), false);
+});
+
+for (const kind of ['chain', 'entrance']) test(`an interrupted ${kind} benchmark cannot rank reconciliation after restart`, async t => {
+ const {b, data, root, state, refreshWith, apply} = await fixture(t);
+ await apply({a:['current','fast','quick'], b:[]});
+ b.history = {kind:'chain', latestResults:{quick:{owner:'a', chainDelay:10}}};
+ await fs.writeFile(path.join(data,'results.json'), JSON.stringify(b.history));
+ const read = b.state;
+ let probed = false;
+ b.state = async () => {
+  if (probed) throw Error('controller read failed');
+  return {...await read(), nodes:[{name:'current', providerId:'a'}]};
+ };
+ b.network = async () => ({interface:'fixture'});
+ b.loadNodes = async () => ({nodes:new Map([['current',node('current')]]),exit:node(EXIT)});
+ b.corePath = async () => '/mock';
+ b.testNode = async () => { probed = true; return {status:'done',delay:120}; };
+ await assert.rejects(b.benchmark(kind), /controller read failed/);
+ assert.equal(probed, true);
+ b.state = read;
+ await b.init();
+ b.settings.configDir = root;
+ refreshWith({a:['fast','quick'], b:['other']});
+ await b.updateSubscriptions();
+ assert.equal(state.entry, 'fast');
+});
+
+test('a switch is verified again after a short delay', async t => {
+ const {b, apply, requests, state} = await fixture(t);
+ b.history = {latestResults:{quick:{chainDelay:10}}};
+ let readsAfterSwitch = 0;
+ const read = b.state;
+ b.state = async () => {
+  if (requests.some(request => request.route === ENTRY_ROUTE) && ++readsAfterSwitch === 2) state.entry = 'fast';
+  return read();
+ };
+ await assert.rejects(apply({a:['fast','quick'], b:[]}), /无法切换/);
+ assert.equal(readsAfterSwitch, 2);
+ assert.deepEqual(timers.setTimeout.mock.calls.map(call => call.arguments), [[300]]);
 });
 
 test('no live match requires the picker without retrying initialization', async t => {

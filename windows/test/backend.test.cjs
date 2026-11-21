@@ -149,8 +149,9 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
   await fs.writeFile(path.join(folder, 'node-policy.json'), JSON.stringify({selected_nodes:{a:['current','same']}}));
   const current = {name:'current',server:'current.invalid'}, same = {name:'same',server:'a.invalid'};
   const exit = {name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY};
+  const revision = 'https://www.gstatic.com/generate_204#linkbox-0123456789abcdef0123456789abcdef:a,b';
   b.config = async () => ({proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
-   'proxy-groups':[{name:ENTRY,use:['a','b']}]});
+   'proxy-groups':[{name:ENTRY,use:['a','b'],url:revision}]});
   b.network = async () => ({interface:'Wi-Fi'});
   b.corePath = async () => '/mock';
   b.testNode = async node => ({delay: node.name === 'current' ? 400 : 100});
@@ -162,7 +163,7 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
    }
    if(route === '/configs') return {mode:'global'};
    if(route === '/proxies') return {proxies:{
-    GLOBAL:{now:EXIT}, [ENTRY]:{now:entry,all:['current','same']}, [EXIT]:{'dialer-proxy':ENTRY},
+    GLOBAL:{now:EXIT}, [ENTRY]:{now:entry,all:['current','same'],testUrl:revision}, [EXIT]:{'dialer-proxy':ENTRY},
     secondary:{all:['same'],now:'same'},
    }};
    const providers = {a:{proxies:[current,same]}};
@@ -175,8 +176,8 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
  });
 }
 
-for (const automatic of [false, true]) test(
- `${automatic ? 'automatic' : 'manual'} switch ignores a duplicate loaded by another group`, async t => {
+for (const automatic of [false, true]) for (const wrongGroup of [false, true]) test(
+ `${automatic ? 'automatic' : 'manual'} switch ${wrongGroup ? 'rejects a different live ENTRY provider' : 'ignores a duplicate loaded by another group'}`, async t => {
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-switch-group-'));
  t.after(() => fs.rm(folder, {recursive:true, force:true}));
  const {ENTRY, EXIT} = require('../backend.cjs');
@@ -185,8 +186,9 @@ for (const automatic of [false, true]) test(
  await fs.writeFile(path.join(folder, 'node-policy.json'), JSON.stringify({selected_nodes:{a:['current','same']}}));
  const current = {name:'current',server:'current.invalid'}, same = {name:'same',server:'a.invalid'};
  const exit = {name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY};
+ const revision = owner => 'https://www.gstatic.com/generate_204#linkbox-0123456789abcdef0123456789abcdef:' + owner;
  const config = {proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
-  'proxy-groups':[{name:ENTRY,use:['a']},{name:'secondary',use:['b']}]};
+  'proxy-groups':[{name:ENTRY,use:['a'],url:revision('a')},{name:'secondary',use:[wrongGroup?'a':'b']}]};
  b.config = async () => config;
  b.network = async () => ({interface:'fixture'});
  b.corePath = async () => '/mock';
@@ -196,11 +198,18 @@ for (const automatic of [false, true]) test(
   if (method === 'PUT') {entry = body.name;return;}
   if (route === '/configs') return {mode:'global'};
   if (route === '/proxies') return {proxies:{
-   GLOBAL:{now:EXIT},[ENTRY]:{now:entry,all:['current','same']},[EXIT]:{'dialer-proxy':ENTRY},
+   GLOBAL:{now:EXIT},[ENTRY]:{now:entry,all:['current','same'],testUrl:revision(wrongGroup?'b':'a')},[EXIT]:{'dialer-proxy':ENTRY},
    secondary:{now:'same',all:['same']},
   }};
-  return {providers:{a:{proxies:[current,same]},b:{proxies:[{name:'same',server:'b.invalid'}]}}};
+  return {providers:{a:{proxies:[current,same]},b:{
+   proxies:[...(wrongGroup?[current]:[]),{name:'same',server:'b.invalid'}]}}};
  };
+ if (wrongGroup) {
+  const run = automatic ? () => b.benchmark('chain', () => true) : () => b.switchNode('same','current');
+  await assert.rejects(run, /节点归属/);
+  assert.equal(entry, 'current');
+  return;
+ }
  if (automatic) assert.equal((await b.benchmark('chain', () => true)).switchedTo, 'same');
  else assert.equal((await b.switchNode('same','current')).entry, 'same');
  assert.equal(entry, 'same');

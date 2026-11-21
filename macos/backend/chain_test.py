@@ -31,6 +31,11 @@ def write_json(path, obj):
     tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2));tmp.chmod(0o600);os.replace(tmp,path)
 
 
+def clear_latest_results():
+    for filename in ('chain-results.json', 'latency-results.json'):
+        write_json(t.BASE / filename, {'results': {}})
+
+
 def physical_network():
     result=subprocess.run(['/usr/sbin/scutil'],input='show State:/Network/Global/IPv4\n',capture_output=True,text=True,timeout=5).stdout
     match=re.search(r'PrimaryInterface\s*:\s*(\S+)',result)
@@ -211,6 +216,7 @@ def run(concurrency=runtime.CONCURRENCY):
     with open(t.BASE/'latency.lock','a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('已有一轮测速运行，请等待完成')
+        clear_latest_results()
         cancel=t.BASE/'chain-cancel';cancel.unlink(missing_ok=True)
         parent=os.getppid()
         cancelled=lambda:cancel.exists() or os.getppid()!=parent

@@ -70,8 +70,9 @@ class ParallelTests(unittest.TestCase):
                 api.assert_not_called()
 
     def test_manual_and_auto_switch_verify_owners_before_and_after_put(self):
+        revision = g.t.ENTRY_REVISION_PREFIX + '0123456789abcdef0123456789abcdef:a,b'
         state = {'mode': 'global', 'exit': g.t.EXIT, 'dialer': g.t.ENTRY, 'entry': 'current',
-                 'nodes': ['current', 'same'], 'live': ['current', 'same']}
+                 'nodes': ['current', 'same'], 'live': ['current', 'same'], 'entry_revision': revision}
         nodes = {'current': {'server': 'current.invalid'}, 'same': {'server': 'a.invalid'}}
         exit_node = {'server': '203.0.113.10'}
         network = {'interface': 'en0'}
@@ -101,7 +102,7 @@ class ParallelTests(unittest.TestCase):
                           patch.object(c, 'active_state', return_value=(state, state['nodes'])),
                           patch.object(g.runtime, 'read_json', return_value=selection),
                           patch.object(g.t, 'api', side_effect=api),
-                          patch.object(g.t, 'entry_provider_names', return_value=['a', 'b']),
+                          patch.object(g.t, 'entry_config', return_value={'use': ['a', 'b'], 'url': revision}),
                           patch.object(g.t, 'persist_selection') as persist):
                         with self.assertRaisesRegex(RuntimeError, '归属'):
                             g.change('same', 'current', mode)

@@ -2,7 +2,8 @@
 const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('node:crypto'),YAML=require('yaml'),exec=require('node:util').promisify(require('node:child_process').execFile);
 const {reconcile, selectionOwners}=require('./reconcile.cjs');
 const {isDeepStrictEqual}=require('node:util');
-const {signature: sig, ClashHTTPError, entryMemberOwned}=require('./backend.cjs');
+const timers=require('node:timers/promises');
+const {signature: sig, ClashHTTPError, liveEntryProviders, ENTRY_REVISION_PREFIX, RELOAD_PENDING}=require('./backend.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -125,6 +126,7 @@ function transform(config, managed, replace) {
  if (!group) throw Error('缺少中转入口组');
  group.proxies = [];
  group.use = managed.use;
+ group.url = managed.revision;
  for (const key of ['include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type']) delete group[key];
  updated.dns ||= {};
  for (const key of ['nameserver-policy', 'proxy-server-nameserver-policy']) {
@@ -148,7 +150,7 @@ main=function(config,profileName){
     else delete providers[name];}
   r["proxy-providers"]={...providers,...m.providers};
   const g=groups.find(g=>g.name==="中转入口");
-  if(g){g.proxies=[];g.use=m.use;
+  if(g){g.proxies=[];g.use=m.use;g.url=m.revision;
     for(const k of ["include-all","include-all-proxies","include-all-providers","filter","exclude-filter","exclude-type"])delete g[k];}
   r.dns=r.dns||{};
   for(const k of ["nameserver-policy","proxy-server-nameserver-policy"])r.dns[k]={...(r.dns[k]||{}),...m.dns};
@@ -182,38 +184,55 @@ function legacyPin(original, config, savedName) {
 }
 
 async function proxyProviders(b) {
- return (await b.api('GET', '/providers/proxies')).providers;
+ return (await b.api('GET', '/providers/proxies', undefined, 1000)).providers;
 }
 
 async function observeReload(b) {
- for (let attempt = 0; attempt < 2; attempt++) {
-  try { return [await b.state(), await proxyProviders(b)]; } catch {}
+ try { return [await b.state(1000), await proxyProviders(b)]; } catch { return null; }
+}
+
+function confirmedState(observed, group, selection) {
+ if (!observed) return null;
+ const [after, providers] = observed;
+ const use = liveEntryProviders(after.entryRevision, group);
+ if (use.length && isDeepStrictEqual(after.live, use.flatMap(owner => selection[owner] || [])) &&
+     !providers[ENTRY]?.proxies?.length &&
+     use.every(owner => isDeepStrictEqual(providers[owner]?.proxies?.map(node => node.name), selection[owner]))) {
+  return after;
  }
  return null;
 }
 
-async function selectAfterReload(b, before, desired, desiredOwner, use, selectedDocs, revision, observation) {
- const names = use.flatMap(provider => selectedDocs.get(provider).map(node => node.name));
- const expected = sig({...before, entry: undefined, live: names});
+async function waitForReload(b, group, selection) {
+ const deadline = performance.now() + 10000;
+ for (let attempt = 0; attempt < 6; attempt++) {
+  const after = confirmedState(await observeReload(b), group, selection);
+  if (after) return after;
+  const remaining = deadline - performance.now();
+  if (attempt === 5 || remaining <= 0) break;
+  await timers.setTimeout(Math.min(2000, remaining));
+ }
+ throw Error(RELOAD_UNCERTAIN);
+}
+
+async function selectAfterReload(b, before, desired, group, selection, after) {
  function checkedState(observed, error) {
-  if (!observed) throw Error(error);
-  const [after, providers] = observed;
-  if (sig({...after, entry: undefined}) !== expected || providers[desiredOwner]?.testUrl !== revision ||
-      !entryMemberOwned(after.live, providers, use, desired, desiredOwner) ||
-      use.some(key => !isDeepStrictEqual(providers[key]?.proxies?.map(node => node.name),
-       selectedDocs.get(key).map(node => node.name)))) {
+  if (!observed || ['mode', 'tun', 'exit', 'dialer'].some(key => observed[key] !== before[key])) {
    throw Error(error);
   }
-  return after;
+  return observed;
  }
 
- let after = checkedState(observation, POST_RELOAD_CHANGE);
- for (let attempt = 0; attempt < 2; attempt++) {
-  if (after.entry === desired) return;
+ after = checkedState(after, POST_RELOAD_CHANGE);
+ if (after.entry === desired) return;
+ for (let attempt = 0; attempt < 2 && after.entry !== desired; attempt++) {
   try { await b.api('PUT', ENTRY_ROUTE, {name: desired}); }
   catch { /* Check whether the switch applied before retrying. */ }
-  after = checkedState(await observeReload(b), SWITCH_FAILED);
+  after = checkedState(confirmedState(await observeReload(b), group, selection), SWITCH_FAILED);
  }
+ if (after.entry !== desired) throw Error(SWITCH_FAILED);
+ await timers.setTimeout(300);
+ after = checkedState(confirmedState(await observeReload(b), group, selection), SWITCH_FAILED);
  if (after.entry !== desired) throw Error(SWITCH_FAILED);
 }
 
@@ -230,10 +249,19 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
  b.busy = true;
  try {
   const saved = await policy(b);
+  const policyFile = path.join(b.dataDir, 'node-policy.json');
   let selection = saved.selected_nodes;
   const legacy = ['pinned_entry', 'node_providers', 'verge_sync', 'blocked_providers', 'excluded_nodes']
    .some(key => Object.hasOwn(saved, key));
   const needsInitialization = selection == null || legacy || saved.initialization_pending === true;
+  if (saved.reload_unconfirmed) {
+   if (!initialize) throw Error(RELOAD_PENDING);
+   const config = await b.config();
+   const group = config['proxy-groups']?.find(item => item.name === ENTRY);
+   if (!confirmedState(await observeReload(b), group, selection)) throw Error(RELOAD_PENDING);
+   delete saved.reload_unconfirmed;
+   await atomic(policyFile, JSON.stringify(saved, null, 2));
+  }
   if (initialize && !needsInitialization) return false;
   const before = await b.state();
   b.assertChain(before);
@@ -242,7 +270,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const previewFile = path.join(b.dataDir, PREVIEW), initializationPolicy = hash([b.root, saved]);
   if (initialize && parseProfile(await read(previewFile))?.initialization_policy === initializationPolicy) throw Error(NO_SELECTION);
   const configFile = b.configFile, script = path.join(b.root, 'profiles', 'Script.js');
-  const profiles = path.join(b.root, 'profiles.yaml'), policyFile = path.join(b.dataDir, 'node-policy.json');
+  const profiles = path.join(b.root, 'profiles.yaml');
   const baselines = new Map();
   for (const file of [configFile, script, profiles, policyFile]) baselines.set(file, await read(file));
   const discovered = await discover(b, syncing);
@@ -288,7 +316,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    .map(([name, row]) => [name, {
     chain: history.kind === 'entrance' ? undefined : row?.chainDelay, entrance: row?.entranceDelay, owner: row?.owner,
    }]));
-  const plan = planFor(sources, selection, before, b.settings.metric, results);
+  const planningState = saved.initialization_pending ? {...before, entry: null} : before;
+  const plan = planFor(sources, selection, planningState, b.settings.metric, results);
   if (!plan.candidates.length) {
    if (syncing) await atomic(previewFile, YAML.stringify({
     revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
@@ -303,7 +332,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const registryFile = path.join(b.dataDir, 'subscriptions.json');
   const replace = legacyPin(baselines.get(script), config, saved.pinned_entry);
-  const desired = plan.entry, desiredOwner = selectionOwners(plan.selection).get(desired);
+  const desired = plan.entry;
   const definitions = new Map(), dns = {}, selectedDocs = new Map();
   for (const {source, document} of sources) {
    const owner = source.name;
@@ -325,8 +354,11 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const retired = Object.fromEntries(Object.entries(config['proxy-providers'] || {}).filter(([name, definition]) =>
    !definitions.has(name) && definition.path &&
    path.resolve(b.root, definition.path) === path.join(b.root, 'providers', 'linkbox', name + '.yaml')));
-  const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
+  // Use ENTRY's own testUrl to identify the revision and the providers attached to it.
+  const revision = ENTRY_REVISION_PREFIX + crypto.randomUUID().replaceAll('-', '') + ':' + use.join(',');
+  const managed = {providers: Object.fromEntries(definitions), retired, dns, use, revision};
   const updated = transform(config, managed, replace);
+  const group = updated['proxy-groups'].find(item => item.name === ENTRY);
   updates.set(script, scriptText(baselines.get(script), managed));
   updates.set(configFile, YAML.stringify(updated));
   const index = YAML.parse(baselines.get(profiles).toString());
@@ -337,6 +369,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   };
   const completedPolicy = JSON.stringify(nextPolicy, null, 2);
   if (needsInitialization) nextPolicy.initialization_pending = true;
+  const confirmedPolicy = JSON.stringify(nextPolicy, null, 2);
+  nextPolicy.reload_unconfirmed = true;
   updates.set(policyFile, JSON.stringify(nextPolicy, null, 2));
   updates.set(registryFile, JSON.stringify({sources: sources.map(({source}) => source)}, null, 2));
   const originals = new Map();
@@ -352,9 +386,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    delete definition.url;
    delete definition.path;
   }
-  // A disabled health check exposes a revision in the API without changing relay names or making requests.
-  const revision = 'https://www.gstatic.com/generate_204#linkbox-' + crypto.randomUUID();
-  live['proxy-providers'][desiredOwner]['health-check'].url = revision;
   const payload = YAML.stringify(live);
   const temp = await fs.mkdtemp(path.join(b.root, 'linkbox-validate-'));
   try {
@@ -397,12 +428,10 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
     await rollback(written, originals);
     throw Error('Clash 未更新，文件已回退；请刷新状态后重试');
    }
-   // The first request may still apply, even if the retry is rejected.
-   try { await b.request(b.endpoint, 'PUT', '/configs?force=false', {payload}, 30000); } catch {}
   }
-  const observed = await observeReload(b);
-  if (observed?.[1][desiredOwner]?.testUrl !== revision) throw Error(RELOAD_UNCERTAIN);
-  await selectAfterReload(b, before, desired, desiredOwner, use, selectedDocs, revision, observed);
+  const after = await waitForReload(b, group, plan.selection);
+  await atomic(policyFile, confirmedPolicy);
+  await selectAfterReload(b, before, desired, group, plan.selection, after);
   if (needsInitialization) await atomic(policyFile, completedPolicy);
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};

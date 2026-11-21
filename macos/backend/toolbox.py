@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+from contextlib import contextmanager
 import datetime
+import fcntl
 import http.client
 import json
 import os
@@ -17,6 +19,8 @@ SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
 PROFILES = CONFIG_DIR / 'profiles.yaml'
 EXIT = '美国静态家宽'
 ENTRY = '中转入口'
+ENTRY_REVISION_PREFIX = 'https://www.gstatic.com/generate_204#linkbox-'
+RELOAD_PENDING = '配置尚未被 Clash 确认，请先刷新状态'
 
 class ClashHTTPError(RuntimeError):
     def __init__(self, status, body):
@@ -24,11 +28,11 @@ class ClashHTTPError(RuntimeError):
         self.rejected = 400 <= status < 600 and bool(body)
 
 
-def api(method, path, payload=None):
+def api(method, path, payload=None, *, timeout=6):
     class Connection(http.client.HTTPConnection):
         def connect(self):
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(6)
+            self.sock.settimeout(timeout)
             self.sock.connect(SOCKET)
     conn = Connection('localhost')
     try:
@@ -41,29 +45,55 @@ def api(method, path, payload=None):
     finally:
         conn.close()
 
-def state():
-    conf = api('GET', '/configs')
-    p = api('GET', '/proxies')['proxies']
+def state(**request_options):
+    conf = api('GET', '/configs', **request_options)
+    p = api('GET', '/proxies', **request_options)['proxies']
     return conf, p
 
-def relay_state():
-    config, proxies = state()
+def relay_state(**request_options):
+    config, proxies = state(**request_options)
     group = proxies.get(ENTRY, {})
     return {'mode': config.get('mode'), 'tun': bool(config.get('tun', {}).get('enable')),
             'entry': group.get('now'), 'exit': proxies.get('GLOBAL', {}).get('now'),
-            'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': group.get('all', [])}
+            'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': group.get('all', []),
+            'entry_revision': group.get('testUrl')}
 
 
-def proxy_providers():
-    return api('GET', '/providers/proxies')['providers']
+def proxy_providers(**request_options):
+    return api('GET', '/providers/proxies', **request_options)['providers']
 
 
-def entry_provider_names():
+def entry_config():
     import runtime
     import yaml
     config = yaml.safe_load((runtime.CONFIG_DIR / 'clash-verge.yaml').read_bytes())
-    group = next((g for g in config.get('proxy-groups', []) if g['name'] == ENTRY), {})
-    return group.get('use') or []
+    return next((g for g in config.get('proxy-groups', []) if g['name'] == ENTRY), {})
+
+
+def live_entry_providers(revision, group):
+    # Mihomo exposes the selector's testUrl and member names, but omits its provider list.
+    if not revision or revision != group.get('url') or not revision.startswith(ENTRY_REVISION_PREFIX):
+        return []
+    _, separator, owners = revision[len(ENTRY_REVISION_PREFIX):].partition(':')
+    use = owners.split(',') if separator and owners else []
+    return use if use == group.get('use') else []
+
+
+def require_confirmed_reload():
+    import runtime
+    if runtime.read_json('node-policy.json').get('reload_unconfirmed'):
+        raise RuntimeError(RELOAD_PENDING)
+
+
+@contextmanager
+def switch_lock():
+    with open(BASE / 'latency.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('已有测速或订阅更新正在运行') from None
+        require_confirmed_reload()
+        yield
 
 
 def entry_member_owned(live, providers, use, name, owner):
@@ -130,6 +160,7 @@ def persist_selection(name):
             os.unlink(temporary)
 
 def switch():
+    require_confirmed_reload()
     c, p = show()
     if c.get('mode') != 'global' or p.get('GLOBAL', {}).get('now') != EXIT or p.get(EXIT, {}).get('dialer-proxy') != ENTRY:
         print('\n当前链式配置与预期不符。为避免改变出口，本工具不会切换。请先在 Clash 恢复全局 → 美国静态家宽。')
@@ -160,18 +191,27 @@ def switch():
     if input('确认切换请输入 y；其他输入取消：').strip().lower() != 'y':
         print('已取消。')
         return
+    with switch_lock():
+        switch_entry(current, target, owners[target])
+
+
+def switch_entry(current, target, owner):
     # Recheck immediately before the one live mutation.
     fresh_c, fresh_p = state()
     if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current or target not in fresh_p[ENTRY].get('all', []):
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
-    if not entry_member_owned(fresh_p[ENTRY].get('all', []), proxy_providers(), entry_provider_names(), target, owners[target]):
+    import runtime
+    if selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner:
+        raise RuntimeError('节点归属已变化，请先更新订阅')
+    if not entry_member_owned(fresh_p[ENTRY].get('all', []), proxy_providers(),
+                              live_entry_providers(fresh_p[ENTRY].get('testUrl'), entry_config()), target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
     if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
             or after_p[EXIT].get('dialer-proxy') != ENTRY or after_c.get('mode') != 'global'
             or not entry_member_owned(after_p[ENTRY].get('all', []), proxy_providers(),
-                                      entry_provider_names(), target, owners[target])):
+                                      live_entry_providers(after_p[ENTRY].get('testUrl'), entry_config()), target, owner)):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:

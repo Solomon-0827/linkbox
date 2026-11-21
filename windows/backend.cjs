@@ -3,6 +3,8 @@ const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:
 const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
 const {selectionOwners}=require('./reconcile.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
+const ENTRY_REVISION_PREFIX='https://www.gstatic.com/generate_204#linkbox-';
+const RELOAD_PENDING='配置尚未被 Clash 确认，请先刷新状态';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function jsonRead(p,fallback={}){try{return JSON.parse(await fs.readFile(p,'utf8'));}catch{return fallback;}}
 async function writeJSON(p,v){await fs.mkdir(path.dirname(p),{recursive:true});const tmp=p+'.tmp';await fs.writeFile(tmp,JSON.stringify(v,null,2),{mode:0o600});await fs.rename(tmp,p);}
@@ -25,7 +27,13 @@ function autoCandidate(results,current,metric){
  const currentRow=results[current],baseline=currentRow[key];
  return !valid(currentRow.chainDelay)||(valid(baseline)&&baseline-best[1][key]>=Math.max(20,baseline*.10))?best[0]:null;
 }
-function signature(s){return JSON.stringify([s.mode,s.tun,s.entry,s.exit,s.dialer,s.live]);}
+function signature(s){return JSON.stringify([s.mode,s.tun,s.entry,s.exit,s.dialer,s.live,s.entryRevision]);}
+function liveEntryProviders(revision, group){
+ // Mihomo exposes the selector's testUrl and member names, but omits its provider list.
+ if(!revision||revision!==group?.url||!revision.startsWith(ENTRY_REVISION_PREFIX))return [];
+ const use=revision.slice(ENTRY_REVISION_PREFIX.length).split(':')[1]?.split(',')||[];
+ return isDeepStrictEqual(use,group.use)?use:[];
+}
 function entryOwners(live, providers, use){
  const names = new Set(), ambiguous = new Set();
  for (const name of live) {
@@ -43,9 +51,6 @@ function entryOwners(live, providers, use){
   }
  }
  return new Map([...owners].filter(([name]) => !ambiguous.has(name)));
-}
-function entryMemberOwned(live, providers, use, name, owner){
- return !!owner&&entryOwners(live,providers,use).get(name)===owner;
 }
 function switchable(state,name,owner){
  return !!owner&&state.switchable.includes(name)&&state.nodes.some(row=>row.name===name&&row.providerId===owner);
@@ -106,14 +111,15 @@ class Backend{
  async api(method,route,body,timeout){
   if(method!=='GET'&&!(method==='PUT'&&(route==='/proxies/'+encodeURIComponent(ENTRY)||/^\/providers\/proxies\/[^/?]+$/.test(route))))throw Error('不允许该控制操作');
   if(!this.endpoint)await this.discover();return this.request(this.endpoint,method,route,body,timeout);}
- async state(){
+ async state(timeout){
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
   const cfg=await this.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
   this.expectedIP=this.settings.expectedIP||(net.isIP(configured||'')?configured:'');
-  const [c,p,providers]=await Promise.all([this.api('GET','/configs'),this.api('GET','/proxies'),this.api('GET','/providers/proxies')]);
+  const read=route=>this.api('GET',route,undefined,timeout);
+  const [c,p,providers]=await Promise.all([read('/configs'),read('/proxies'),read('/providers/proxies')]);
   const all=p.proxies||{},g=all[ENTRY]||{},live=g.all||[];
   const owners=selectionOwners(this.nodePolicy.selected_nodes);
-  const use=cfg['proxy-groups']?.find(group=>group.name===ENTRY)?.use||[];
+  const use=liveEntryProviders(g.testUrl,cfg['proxy-groups']?.find(group=>group.name===ENTRY));
   const liveOwners=entryOwners(live,providers.providers||{},use);
   const liveRows=new Map();
   for(const [owner,provider] of Object.entries(providers.providers||{})){
@@ -127,16 +133,20 @@ class Backend{
     type:liveRows.get(name)?.type,...(result.owner==null||result.owner===owner?result:{})};
   });
   return {expectedIP:this.expectedIP,mode:c.mode,tun:!!c.tun?.enable,ipv6:c.ipv6,mixedPort:c['mixed-port']||7897,
-   entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live,nodes,
+   entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live,nodes,entryRevision:g.testUrl,
    switchable:live.filter(name=>liveOwners.has(name)&&liveOwners.get(name)===owners.get(name)),lastTest:this.history.finishedAt,
    settings:{...benchmarkSettings(this.settings),hourly:this.settings.hourly!==false,configDir:this.root,corePath:this.settings.corePath||''},
    progress:this.progress};
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
+ async requireConfirmedReload(){
+  if((await jsonRead(path.join(this.dataDir,'node-policy.json'))).reload_unconfirmed)throw Error(RELOAD_PENDING);
+ }
  async switchNode(name,previous){
   if(this.busy)throw Error('请先停止本轮测速或等待当前操作完成');
   this.busy=true;
   try{
+   await this.requireConfirmedReload();
    const before=await this.state();
    this.assertChain(before);
    if(before.entry!==previous||!before.live.includes(name))throw Error('节点状态已变化，请刷新状态');
@@ -197,7 +207,11 @@ class Backend{
  }catch(e){return {delay:null,status:'failed',kind,error:safeError(e),...(kind==='chain'?{entranceDelay}:{})}}finally{if(child){await this.stopChild(child);this.children.delete(child)}await fs.rm(folder,{recursive:true,force:true}).catch(()=>{});}}
  async benchmark(kind='chain',mayAutoSwitch=null){
  if(this.busy)throw Error('已有操作正在运行');if(!['chain','entrance'].includes(kind))throw Error('无效测速类型');this.busy=true;const abort=new AbortController();this.abort=abort;let reason='';const options=benchmarkSettings(this.settings),revision=this.autoRevision,settingsStable=!this.pendingSettings;
- try{const before=await this.state();this.assertChain(before);const network=await this.network(),{nodes,exit}=await this.loadNodes(),probe={dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP},core=await this.corePath();
+ try{
+ const historyFile=path.join(this.dataDir,'results.json');
+ this.history={...this.history,latestResults:{}};
+ await writeJSON(historyFile,this.history);
+ const before=await this.state();this.assertChain(before);const network=await this.network(),{nodes,exit}=await this.loadNodes(),probe={dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP},core=await this.corePath();
  this.progress={running:true,kind,total:before.nodes.length,completed:0,results:{},active:[]};const emit=()=>this.notify('progress',this.progress);emit();
  let next=0;
  const unchanged=async()=>signature(await this.state())===signature(before)&&
@@ -254,9 +268,10 @@ class Backend{
   clearInterval(guard);this.guard.delete(guard);
   await pendingGuard;
  }
- this.history={finishedAt:new Date().toISOString(),kind,reason:reason||(abort.signal.aborted?'手动停止':''),
+ const completedHistory={finishedAt:new Date().toISOString(),kind,reason:reason||(abort.signal.aborted?'手动停止':''),
   latestResults:this.progress.results,results:{...this.history.results,...this.progress.results}};
- await writeJSON(path.join(this.dataDir,'results.json'),this.history);
+ await writeJSON(historyFile,completedHistory);
+ this.history=completedHistory;
  const authorized=()=>mayAutoSwitch?.()&&settingsStable&&!this.pendingSettings&&options.autoRelay&&this.settings.autoRelay===true&&benchmarkSettings(this.settings).metric===options.metric&&this.settings.hourly!==false&&revision===this.autoRevision&&!abort.signal.aborted;
  if(kind==='chain'&&!this.history.reason&&this.progress.completed===this.progress.total&&authorized()){
   const target=autoCandidate(this.progress.results,before.entry,options.metric);
@@ -267,8 +282,10 @@ class Backend{
     [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
     [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);
    if(sameRouting&&authorized()&&signature(current)===signature(before)&&JSON.stringify(currentNetwork)===JSON.stringify(network)&&current.live.includes(target)){
+    await this.requireConfirmedReload();
     const owner=before.nodes.find(row=>row.name===target)?.providerId;
     if(!switchable(current,target,owner))throw Error('节点归属已变化，请先更新订阅');
+    if(!authorized())return this.history;
     await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name:target});
     const after=await this.state();
     if(signature(after)!==signature({...before,entry:target})||!switchable(after,target,owner))throw Error('自动切换后的状态待核对，请刷新 Clash 状态');
@@ -292,4 +309,4 @@ class Backend{
  const result={time:new Date().toISOString(),expected:this.expectedIP,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,ClashHTTPError,autoCandidate,benchmarkSettings,isolatedConfig,signature,entryMemberOwned,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,ClashHTTPError,autoCandidate,benchmarkSettings,isolatedConfig,signature,liveEntryProviders,ENTRY_REVISION_PREFIX,RELOAD_PENDING,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
