@@ -41,9 +41,10 @@ test('only startup and manual Refresh retry transient initialization failures', 
  const webContents = {mainFrame:{}}, event = {sender:webContents,senderFrame:webContents.mainFrame};
  const electron = {app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
   ipcMain:{handle(_channel,fn){handler=fn;}}};
- const subscriptions = {async initialize(){
+ const subscriptions = {async startup(){
   if (++calls === 1) throw Error('offline');
-  return calls === 2;
+  if (calls === 2) return {changed:false,recoveryHint:'上次订阅更新未完成，可刷新重试，或在管理节点重新保存'};
+  return {changed:true};
  }};
  const fake = {root:'fixture',state:async()=>({
   mode:'global',exit:'美国静态家宽',dialer:'中转入口',entry:'current',nodes:[],settings:{},expectedIP:'203.0.113.10',
@@ -68,7 +69,8 @@ test('only startup and manual Refresh retry transient initialization failures', 
  assert.equal(calls,1);
  assert.equal(select('#notice').textContent,'offline');
  await select('#refresh').onclick();
- assert.equal(select('#notice').textContent,'');
+ assert.equal(select('#notice').textContent,'上次订阅更新未完成，可刷新重试，或在管理节点重新保存');
+ assert.equal(vm.runInContext('startupChecked',context),true);
  assert.equal(calls,2);
  await select('#refresh').onclick();
  assert.equal(calls,3);
@@ -90,7 +92,7 @@ test('choosing the Clash directory initializes and populates the first node list
     nodes:initializations?[{name:'current'}]:[],settings:{},expectedIP:'203.0.113.10'};
   },
  };
- const subscriptions = {async initialize(){initializations++;return true;}};
+ const subscriptions = {async startup(){initializations++;return {changed:true};}};
  const main = vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?subscriptions:
   name==='./backend.cjs'?{safeError:e=>e.message}:require(name),process:{argv:[],platform:'darwin'},__dirname,fake,webContents});
  vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),main);

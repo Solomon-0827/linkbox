@@ -29,7 +29,7 @@ async function fixture(t) {
  t.after(() => fs.rm(dir, {recursive: true, force: true}));
  const root = path.join(dir, 'verge'), data = path.join(dir, 'data');
  await fs.mkdir(path.join(root, 'profiles'), {recursive: true});
- const config = {proxies: [node('current'), {...node(EXIT, '203.0.113.10'), 'dialer-proxy': ENTRY}],
+ const config = {proxies: [node('current'), node('fast'), {...node(EXIT, '203.0.113.10'), 'dialer-proxy': ENTRY}],
   'proxy-groups': [{name: ENTRY, type: 'select', proxies: ['current', 'fast']}]};
  const write = (file, value) => fs.writeFile(path.join(root, file), YAML.stringify(value));
  const items = ['a', 'b'].map(id => ({uid: id, type: 'remote', name: id.toUpperCase(), file: id + '.yaml',
@@ -214,28 +214,36 @@ test('unacknowledged Refreshes retry without rewrites or backups', async t => {
 });
 
 async function crashDuringSave({root, data, state, request}, selected = {a:['fast'], b:[]},
-                               crashFile = path.join(root, 'clash-verge.yaml')) {
+                               crashFile = path.join(root, 'clash-verge.yaml'), downloads = null) {
  const profile = path.join(root,'profiles.yaml'), registry = path.join(data,'subscriptions.json');
  const originalProfile = await fs.readFile(profile), originalRegistry = await fs.readFile(registry);
- const selection = await request(selected);
+ const selection = selected && await request(selected);
  const child = `
   const fs = require('node:fs/promises');
-  const [backendPath, subscriptionsPath, root, data, state, selection, crashFile] = process.argv.slice(1);
+  const [backendPath, subscriptionsPath, root, data, state, selection, crashFile, downloads] = process.argv.slice(1);
   const {Backend} = require(backendPath), sub = require(subscriptionsPath);
   (async () => {
    const b = await new Backend(data).init();
    b.settings.configDir = root;
    b.state = async () => JSON.parse(state);
    b.validateConfig = async () => {};
+   if (downloads !== 'null') {
+    b.textRequest = async url => JSON.stringify({
+     proxies: JSON.parse(downloads)[url.split('/').at(-1)].map(name =>
+      ({name, type:'ss', server:'relay.example.invalid', port:443})),
+    });
+    b.api = async () => ({});
+   }
    const rename = fs.rename;
    fs.rename = async (from,to) => {
     await rename(from,to);
     if (to === crashFile) process.exit(42);
    };
-   await sub.run(b,JSON.parse(selection));
+   if (selection === 'null') await sub.initialize(b);
+   else await sub.run(b, JSON.parse(selection));
   })().catch(error => { console.error(error.message); process.exit(1); });`;
  assert.throws(()=>execFileSync(process.execPath,['-e',child,require.resolve('../backend.cjs'),
-  require.resolve('../subscriptions.cjs'),root,data,JSON.stringify(state),JSON.stringify(selection),crashFile]), {status:42});
+  require.resolve('../subscriptions.cjs'),root,data,JSON.stringify(state),JSON.stringify(selection),crashFile,JSON.stringify(downloads)]), {status:42});
  assert.deepEqual(await fs.readFile(profile),originalProfile);
  assert.deepEqual(await fs.readFile(registry),originalRegistry);
 }
@@ -506,6 +514,18 @@ test('first run falls back when the live provider endpoint fails', async t => {
  assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
 });
 
+test('startup seeds with malformed live provider data', async t => {
+ const {b, config, write, refreshWith, saved, setProviders} = await fixture(t);
+ config['proxy-groups'][0].use = ['a','odd','b'];
+ await write('clash-verge.yaml', config);
+ refreshWith({a:['current','fast'], b:['current','fast']});
+ setProviders({a:null, odd:{proxies:{name:'current'}}, b:{proxies:[null, {}, node('fast')]}});
+ delete b.state;
+
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['fast']});
+});
+
 test('first run falls back for null proxies without losing other owners', async t => {
  const {b, config, write, refreshWith, saved, setProviders} = await fixture(t);
  config['proxy-groups'][0].use = ['a','b'];
@@ -675,38 +695,86 @@ test('empty selection refuses and all vanished can recover in the picker', async
  assert.deepEqual(YAML.parse(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8')).proxies, [node('new')]);
 });
 
-test('a crashed preview Save clears the journal and reopens Manage Nodes', async t => {
+for (const scenario of ['preview Save', 'first-run Sync', 'ordinary Save']) {
+ for (const operation of ['Save', 'Sync']) test(`${scenario} journal does not block switching and a new ${operation}`, async t => {
+  const fx = await fixture(t);
+  const {b, data, policy, state, apply, requests, saved, refreshWith, write} = fx;
+  const fresh = {a:['current','fast'], b:['other']};
+  refreshWith(fresh);
+  let journalSelection;
+  if (scenario === 'first-run Sync') {
+   await write('profiles/a.yaml', {proxies:[node('current')]});
+   await crashDuringSave(fx, null, policy, {...fresh,a:['fast']});
+   journalSelection = {a:['fast']};
+  } else {
+   await apply({a:['current','fast'], b:[]});
+   const pendingName = scenario === 'preview Save' ? 'new' : 'quick';
+   if (scenario === 'preview Save') {
+    refreshWith({...fresh, a:['new']});
+    await assert.rejects(b.updateSubscriptions(), /管理节点/);
+   }
+   await crashDuringSave(fx, {a:[pendingName], b:[]}, policy);
+   journalSelection = {a:[pendingName]};
+   if (scenario === 'ordinary Save') await write('profiles/a.yaml', {proxies:fresh.a.map(name => node(name))});
+  }
+  const before = await fixtureFiles(data);
+  assert.deepEqual((await saved()).pending_update.selection, journalSelection);
+  requests.length = 0;
+  const validate = b.validateConfig;
+  if (scenario === 'preview Save') b.validateConfig = async () => { throw Error('fixture'); };
+  await assert.rejects(sub.initialize(b), /管理节点|配置校验失败/);
+  assert.deepEqual(requests, []);
+  assert.deepEqual(await fixtureFiles(data), before);
+
+  const observe = b.state;
+  delete b.state;
+  assert.equal((await b.switchNode('fast','current')).entry, 'fast');
+  state.entry = 'current';
+  b.settings.autoRelay = true;
+  b.network = async () => ({interface:'fixture'});
+  b.corePath = async () => '/mock';
+  b.testNode = async relay => ({delay:relay.name === 'current' ? 400 : 100});
+  assert.equal((await b.benchmark('chain', () => true)).switchedTo, 'fast');
+  assert.deepEqual(requests.map(({route}) => route), [ENTRY_ROUTE, ENTRY_ROUTE]);
+  assert.deepEqual(await fs.readFile(policy), before[policy]);
+
+  b.state = observe;
+  assert.deepEqual(await sub.startup(b), {changed:false, recoveryHint:'上次订阅更新未完成，可刷新重试，或在管理节点重新保存'});
+  b.validateConfig = validate;
+  const journals = [], controller = b.request;
+  b.request = async (...args) => {
+   if (args[2] === '/configs?force=false') journals.push((await saved()).pending_update);
+   return controller(...args);
+  };
+  if (operation === 'Save') {
+   const name = scenario === 'preview Save' ? 'new' : 'current';
+   await apply({a:[name], b:[]});
+   assert.deepEqual((await saved()).selected_nodes, {a:[name]});
+  } else {
+   refreshWith(fresh);
+   await b.updateSubscriptions();
+   assert.deepEqual((await saved()).selected_nodes, {a:['current','fast']});
+  }
+  const final = await saved();
+  assert.deepEqual(journals, [{root:fx.root, selection:final.selected_nodes}]);
+  assert.equal(final.pending_update, undefined);
+ });
+}
+
+test('Refresh recovers a preview Save with its downloaded cache', async t => {
  const fx = await fixture(t);
- const {b, data, policy, apply, requests, saved, refreshWith, state} = fx;
+ const {b, root, apply, refreshWith, state, saved} = fx;
  await apply({a:['current','fast'], b:[]});
- const savedBefore = await saved();
  refreshWith({a:['new'], b:['other']});
  await assert.rejects(b.updateSubscriptions(), /管理节点/);
- await crashDuringSave(fx, {a:['new'], b:[]}, policy);
- const before = await fixtureFiles(data);
- requests.length = 0;
- await assert.rejects(sub.initialize(b), /管理节点/);
- assert.deepEqual(await fixtureFiles(data), before);
- const journal = (await saved()).pending_update;
- assert.deepEqual(journal.selection, {a:['new']});
- assert.ok(journal.preview_id);
+ await crashDuringSave(fx, {a:['new'], b:[]}, fx.policy);
 
- const preview = path.join(data, 'subscription-preview.yaml');
- await fs.unlink(preview);
- delete before[preview];
- before[policy] = Buffer.from(JSON.stringify(savedBefore, null, 2));
- await assert.rejects(sub.initialize(b), /管理节点/);
- assert.deepEqual(await saved(), savedBefore);
- assert.deepEqual(await fixtureFiles(data), before);
- assert.deepEqual(requests, []);
- assert.equal(await sub.initialize(b), false);
- const observe = b.state;
- delete b.state;
- assert.equal((await b.switchNode('fast','current')).entry, 'fast');
- b.state = observe;
- await assert.rejects(b.updateSubscriptions(), /管理节点/);
- await apply({a:['new'], b:[]});
+ assert.equal(await sub.initialize(b), true);
  assert.equal(state.entry, 'new');
+ const policy = await saved();
+ assert.deepEqual(policy.selected_nodes, {a:['new']});
+ assert.equal(policy.pending_update, undefined);
+ assert.deepEqual(YAML.parse(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8')).proxies, [node('new')]);
 });
 
 test('other group keeps its static reference and ENTRY uses the selected owner once', async t => {
@@ -992,8 +1060,8 @@ for (const late of [false, true]) test(`Refresh finishes an existing user's pend
  assert.equal(await sub.initialize(b), false);
 });
 
-test('unconfirmed reload blocks switching and reconcile until Refresh confirms it', async t => {
- const {b, apply, requests, state} = await fixture(t);
+test('switches follow disk membership before and after a late reload', async t => {
+ const {b, apply, policy, requests, state} = await fixture(t);
  await apply({a:['current','fast'], b:[]});
  const controller = b.request, reloads = [];
  b.request = async (...args) => {
@@ -1002,28 +1070,21 @@ test('unconfirmed reload blocks switching and reconcile until Refresh confirms i
  };
  await assert.rejects(apply({a:['current','fast','quick'], b:[]}), /已写入新配置，Clash 尚未确认，请刷新状态核对/);
  requests.length = 0;
- const guard = /配置尚未被 Clash 确认，请先刷新状态/;
- const observe = b.state;
+ const before = await fs.readFile(policy);
+ const mismatch = /Clash 配置尚未生效，请刷新、保存或同步订阅/;
  delete b.state;
- await assert.rejects(b.switchNode('fast','current'), guard);
+ await assert.rejects(b.switchNode('fast','current'), mismatch);
  b.settings.autoRelay = true;
  b.network = async () => ({interface:'fixture'});
  b.corePath = async () => '/mock';
  b.testNode = async node => ({delay:node.name === 'current' ? 400 : 100});
- await assert.rejects(b.benchmark('chain', () => true), guard);
- b.state = observe;
- await assert.rejects(apply({a:['fast'], b:[]}), guard);
- await assert.rejects(b.updateSubscriptions(), guard);
- await assert.rejects(sub.initialize(b), /尚未确认/);
- assert.equal(requests.length, 0);
- assert.equal(reloads.length, 2);
+ await assert.rejects(b.benchmark('chain', () => true), mismatch);
+ assert.deepEqual(requests, []);
+ assert.equal(reloads.length, 1);
  await controller(...reloads[0]);
- delete b.state;
- await assert.rejects(b.switchNode('fast','current'), guard);
- b.request = controller;
- await sub.initialize(b);
- await b.switchNode('fast','current');
+ assert.equal((await b.benchmark('chain', () => true)).switchedTo, 'fast');
  assert.equal(state.entry, 'fast');
+ assert.deepEqual(await fs.readFile(policy), before);
 });
 
 test('initialization replans from the latest results after a failed switch', async t => {

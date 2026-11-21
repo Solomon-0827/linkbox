@@ -3,9 +3,10 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
 const {reconcile, sameEntryMembers, selectionOwners}=require('./reconcile.cjs');
 const {isDeepStrictEqual}=require('node:util');
 const timers=require('node:timers/promises');
-const {signature: sig, ClashHTTPError, requestNotSent, RELOAD_PENDING}=require('./backend.cjs');
+const {signature: sig, ClashHTTPError, requestNotSent, providerNodes}=require('./backend.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
+const RECOVERY_HINT='上次订阅更新未完成，可刷新重试，或在管理节点重新保存';
 const INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改';
 const VALIDATION_FAILED = '配置校验失败，未改动当前代理';
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
@@ -13,6 +14,7 @@ const digest=raw=>raw && crypto.createHash('sha256').update(raw).digest('hex');
 async function read(p){try{return await fs.readFile(p)}catch(e){if(e.code==='ENOENT')return null;throw e}}
 async function doc(p){const r=await read(p);return r?YAML.parse(r.toString())||{}:{}}
 async function policy(b){return doc(path.join(b.dataDir,'node-policy.json'))}
+function committedPolicy({pending_update, reload_unconfirmed, ...saved}) {return saved;}
 function parseProfile(raw){
  try { return raw ? YAML.parse(raw.toString()) : null; }
  catch (error) { if (!(error instanceof YAML.YAMLParseError)) throw error; return null; }
@@ -64,7 +66,7 @@ async function discover(b, forUpdate = false, recovering = false) {
   throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
  }
  const revisions = sources.map(({source, raw}) => [source, digest(raw)]);
- const revision = hash([b.root, revisions, await policy(b)]);
+ const revision = hash([b.root, revisions, committedPolicy(await policy(b))]);
  if (forUpdate) return {sources: sources.map(({source}) => ({source})), fingerprint: revision};
  const rawPreview = await read(path.join(b.dataDir, PREVIEW));
  const preview = parseProfile(rawPreview);
@@ -98,16 +100,16 @@ async function entrySeedOwners(b, config, sources) {
  const owners = new Map();
  if (!use.length) return owners;
  let liveProviders;
- try { liveProviders = (await b.api('GET', '/providers/proxies'))?.providers; }
+ try { liveProviders = providerNodes(await b.api('GET', '/providers/proxies')); }
  catch { return owners; }
- if (!liveProviders || typeof liveProviders !== 'object' || Array.isArray(liveProviders)) return owners;
  const providers = config['proxy-providers'] || {};
  for (const name of use) {
-  const proxies = Object.hasOwn(liveProviders, name) ? liveProviders[name]?.proxies : undefined;
-  if (!Array.isArray(proxies) || proxies.some(node => typeof node?.name !== 'string' || !node.name)) continue;
-  const definition = Object.hasOwn(providers, name) ? providers[name] : {};
-  const source = definition.url ? byURL.get(sourceKey(definition.url)) : byID.get(name);
-  for (const {name: relay} of proxies) {
+  const url = Object.hasOwn(providers, name) ? providers[name]?.url : undefined;
+  if (url != null && typeof url !== 'string') continue;
+  let source;
+  try { source = url ? byURL.get(sourceKey(url)) : byID.get(name); }
+  catch { continue; }
+  for (const {name: relay} of liveProviders.get(name) || []) {
    if (!owners.has(relay)) owners.set(relay, source?.name ?? null);
   }
  }
@@ -317,24 +319,44 @@ function managedCache(root, owner, definition) {
  return definition.path && path.resolve(root, definition.path) === path.join(root, 'providers', 'linkbox', owner + '.yaml');
 }
 
+async function providerPayload(definition, root, readCache, filtered) {
+ let {payload} = definition;
+ if (definition.path) payload = parseProfile(await readCache(path.resolve(root, definition.path)))?.proxies;
+ if (!Array.isArray(payload)) throw Error('代理缓存不完整，未修改');
+ if (!filtered) return payload;
+ const accepts = nameFilter(definition);
+ return payload.filter(node => accepts(node.name));
+}
+
+async function entryPlan(config, root) {
+ const entry = config['proxy-groups']?.find(group => group.name === ENTRY);
+ if (!entry) throw Error('缺少中转入口组');
+ const staticNodes = new Map(config.proxies.map(node => [node.name, node]));
+ const members = new Map((entry.proxies || []).map(name => [name, {owner:null, node:staticNodes.get(name)}]));
+ for (const owner of entry.use || []) {
+  const providers = config['proxy-providers'] || {};
+  if (!Object.hasOwn(providers, owner)) throw Error('代理缓存不完整，未修改');
+  for (const node of await providerPayload(providers[owner], root, read, true)) {
+   if (!members.has(node.name)) members.set(node.name, {owner, node});
+  }
+ }
+ return members;
+}
+
 async function reloadPayload(config, root, updates, baselines) {
  // The service cannot read LinkBox's user-owned provider cache files.
  const live = structuredClone(config);
  const entry = live['proxy-groups'].find(group => group.name === ENTRY);
  const use = new Set(entry.use || []), members = new Set(entry.proxies || []);
+ const readCache = async file => {
+  if (!updates.has(file) && !baselines.has(file)) baselines.set(file, await read(file));
+  return updates.get(file) ?? baselines.get(file);
+ };
  for (const [owner, definition] of Object.entries(live['proxy-providers'])) {
   const managed = managedCache(root, owner, definition);
   if (!managed && !use.has(owner)) continue;
-  let {payload} = definition;
-  if (definition.path) {
-   const file = path.resolve(root, definition.path);
-   if (!updates.has(file) && !baselines.has(file)) baselines.set(file, await read(file));
-   payload = parseProfile(updates.get(file) ?? baselines.get(file))?.proxies;
-  }
-  if (!Array.isArray(payload)) throw Error('代理缓存不完整，未修改');
+  const payload = await providerPayload(definition, root, readCache, use.has(owner));
   if (use.has(owner)) {
-   const accepts = nameFilter(definition);
-   payload = payload.filter(node => accepts(node.name));
    for (const node of payload) members.add(node.name);
   }
   if (managed) {
@@ -367,8 +389,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    .some(key => Object.hasOwn(saved, key));
   const needsInitialization = selection == null || legacy || saved.initialization_pending === true;
   const pending = saved.pending_update;
-  const recovering = pending != null || saved.reload_unconfirmed;
-  if (recovering && !initialize) throw Error(RELOAD_PENDING);
+  const recovering = initialize && pending != null;
   if (initialize && !needsInitialization && !recovering) return false;
   const before = await b.state();
   b.assertChain(before);
@@ -380,7 +401,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    selection = pending?.selection ?? selection;
   }
   const syncing = !recovering && request === null && removal === null;
-  const previewFile = path.join(b.dataDir, PREVIEW), initializationPolicy = hash([b.root, saved]);
+  const previewFile = path.join(b.dataDir, PREVIEW), initializationPolicy = hash([b.root, committedPolicy(saved)]);
   if (initialize && !recovering && parseProfile(await read(previewFile))?.initialization_policy === initializationPolicy) throw Error(NO_SELECTION);
   const configFile = b.configFile, script = path.join(b.root, 'profiles', 'Script.js');
   const profiles = path.join(b.root, 'profiles.yaml');
@@ -421,7 +442,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    if (sig(await b.state()) !== sig(before) ||
        (await discover(b, true)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   }
-  if (syncing || (request !== null && discovered.previewId)) {
+  if (syncing || (discovered.previewId && (request !== null || recovering))) {
    for (const {source, document} of sources) {
     updates.set(path.join(b.root, 'profiles', source.profile_file), YAML.stringify(document));
    }
@@ -444,17 +465,6 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
      revision: discovered.fingerprint, documents: Object.fromEntries(sources.map(({source, document}) => [source.name, document])),
      ...(needsInitialization ? {initialization_policy: initializationPolicy} : {}),
     }));
-   } else if (recovering && pending?.preview_id) {
-    if (!config['proxy-groups']?.some(group => group.name === ENTRY)) throw Error('缺少中转入口组');
-    if ((await discover(b, false, true)).fingerprint !== discovered.fingerprint ||
-        !isDeepStrictEqual(await policy(b), saved)) throw Error(EXTERNAL_CHANGE);
-    for (const [file, raw] of baselines) {
-     if (!equal(raw, await read(file))) throw Error(EXTERNAL_CHANGE);
-    }
-    if (digest(await read(previewFile)) !== pending.preview_id) {
-     const {pending_update, reload_unconfirmed, ...lastSaved} = saved;
-     await atomic(policyFile, JSON.stringify(lastSaved, null, 2));
-    }
    }
    throw Error(NO_SELECTION);
   }
@@ -546,10 +556,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const written = [];
   if (!recovering) {
-   const {pending_update, reload_unconfirmed, initialization_pending, ...lastSaved} = saved;
    const journal = {root: b.root, selection: plan.selection};
-   if (request !== null && discovered.previewId) journal.preview_id = discovered.previewId;
-   await atomic(policyFile, JSON.stringify({...lastSaved, pending_update: journal}, null, 2));
+   await atomic(policyFile, JSON.stringify({...committedPolicy(saved), pending_update: journal}, null, 2));
    written.push(policyFile);
   }
   try {
@@ -596,9 +604,19 @@ async function initialize(b) {
  return run(b, null, {initialize: true});
 }
 
+async function startup(b, ready = true) {
+ if (!ready && (await policy(b)).pending_update == null) return {changed: false};
+ try {
+  return {changed: await initialize(b)};
+ } catch (error) {
+  if ((await policy(b)).pending_update == null) throw error;
+  return {changed: false, recoveryHint: RECOVERY_HINT};
+ }
+}
+
 async function remove(b, request) {
  if (!request || typeof request !== 'object') throw Error('请选择要移除的节点');
  return run(b, null, {removal: request});
 }
 
-module.exports = {discover, catalog, run, remove, initialize, validateSelection, sourceKey};
+module.exports = {discover, catalog, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan};

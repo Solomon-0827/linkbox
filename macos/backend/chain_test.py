@@ -55,7 +55,7 @@ def physical_network():
 def active_state():
     state = t.relay_state()
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
-    return state, list(selection_owners(selection))
+    return state, list(t.relay_owners(selection, state['live']))
 
 
 def load_nodes():
@@ -63,8 +63,12 @@ def load_nodes():
     conf = yaml.safe_load((CONFIG_DIR / 'clash-verge.yaml').read_text())
     DNS_POLICY = {k: v for k, v in conf.get('dns', {}).get('proxy-server-nameserver-policy', {}).items()
                   if not k.startswith(('geosite:', 'rule-set:'))}
-    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+    selection = runtime.read_json('node-policy.json').get('selected_nodes')
+    owners = selection_owners(selection)
     nodes = {}
+    if selection is None:
+        from subscription_update import entry_plan
+        nodes = {name: node for name, (_, node) in (entry_plan(conf, CONFIG_DIR) or {}).items() if node is not None}
     providers = conf.get('proxy-providers', {})
     for owner in dict.fromkeys(owners.values()):
         provider = providers.get(owner, {})
@@ -230,7 +234,7 @@ def run(concurrency=runtime.CONCURRENCY):
         parent=os.getppid()
         cancelled=lambda:cancel.exists() or os.getppid()!=parent
         before,names=active_state();network=physical_network();nodes,exit_node,expected=load_nodes();dns_policy=DNS_POLICY
-        owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+        owners = t.relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), before.get('live', []))
         if before['mode']!='global' or before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链式配置与预期不符，未开始测试')
         results={};run_id=secrets.token_hex(8);progress=t.BASE/'chain-progress.json'
         running=[]

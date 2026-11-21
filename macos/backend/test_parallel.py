@@ -47,7 +47,7 @@ class ParallelTests(unittest.TestCase):
     def test_change_discards_pending(self):self.exercise('change')
 
     def test_benchmark_handles_malformed_provider_cache_per_relay(self):
-        state = {'mode': 'global', 'exit': c.t.EXIT, 'dialer': c.t.ENTRY, 'entry': 'healthy'}
+        state = {'mode': 'global', 'exit': c.t.EXIT, 'dialer': c.t.ENTRY, 'entry': 'healthy', 'live': ['healthy']}
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             (base / 'clash-verge.yaml').write_text(yaml.safe_dump({
@@ -93,12 +93,12 @@ class ParallelTests(unittest.TestCase):
         network={'interface':'en0'}
         guard={'network':network,'before':state,'routing_fingerprint':c.routing_fingerprint(original,exit_node,'203.0.113.10',c.DNS_POLICY,'a','b')}
         for fresh,physical in [(original,{'interface':'en1'}),({**original,'b':{'server':'new.invalid'}},network)]:
-            with patch.object(g,'snapshot',return_value=state),patch.object(c,'load_nodes',return_value=(fresh,exit_node,'203.0.113.10')),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
+            with patch.object(g,'snapshot',return_value=state),patch.object(g.t,'live_entry_plan',return_value={'a': ('a', None), 'b': ('a', None)}),patch.object(c,'load_nodes',return_value=(fresh,exit_node,'203.0.113.10')),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
                 with self.assertRaisesRegex(RuntimeError,'未自动切换'):
                     g.change('b','a',guard)
                 api.assert_not_called()
 
-    def test_manual_and_auto_switch_verify_owners_before_and_after_put(self):
+    def test_manual_and_auto_switch_verify_disk_membership_before_and_after_put(self):
         state = {'mode': 'global', 'exit': g.t.EXIT, 'dialer': g.t.ENTRY, 'entry': 'current',
                  'nodes': ['current', 'same'], 'live': ['current', 'same']}
         nodes = {'current': {'server': 'current.invalid'}, 'same': {'server': 'a.invalid'}}
@@ -107,11 +107,20 @@ class ParallelTests(unittest.TestCase):
         guard = {'network': network, 'before': state, 'routing_fingerprint': c.routing_fingerprint(
             nodes, exit_node, '203.0.113.10', c.DNS_POLICY, 'current', 'same')}
         selection = {'selected_nodes': {'a': ['current', 'same']}}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.check_switch_membership(Path(tmp), state, nodes, exit_node, network, guard, selection)
+
+    def check_switch_membership(self, base, state, nodes, exit_node, network, guard, selection):
+        (base / 'clash-verge.yaml').write_text(yaml.safe_dump({
+            'proxies': [], 'proxy-groups': [{'name': g.t.ENTRY, 'use': ['a']}],
+            'proxy-providers': {'a': {'payload': [{**node, 'name': name} for name, node in nodes.items()]}},
+        }))
         for mode in (None, guard):
             for changed_after_put in (False, True):
                 with self.subTest(automatic=mode is not None, changed_after_put=changed_after_put):
                     active = state.copy()
-                    saved = selection if changed_after_put else {'selected_nodes': {'a': ['current', 'same', 'external']}}
+                    if not changed_after_put:
+                        active['live'] = ['current', 'same', 'external']
                     writes = []
 
                     def api(method, route, payload=None):
@@ -123,10 +132,11 @@ class ParallelTests(unittest.TestCase):
                           patch.object(c, 'load_nodes', return_value=(nodes, exit_node, '203.0.113.10')),
                           patch.object(c, 'physical_network', return_value=network),
                           patch.object(c, 'active_state', return_value=(state, state['nodes'])),
-                          patch.object(g.runtime, 'read_json', return_value=saved),
+                          patch.object(g.runtime, 'CONFIG_DIR', base),
+                          patch.object(g.runtime, 'read_json', return_value=selection),
                           patch.object(g.t, 'api', side_effect=api),
                           patch.object(g.t, 'persist_selection') as persist):
-                        with self.assertRaisesRegex(RuntimeError, '归属'):
+                        with self.assertRaisesRegex(RuntimeError, '待核对' if changed_after_put else g.t.ENTRY_NOT_APPLIED):
                             g.change('same', 'current', mode)
                         persist.assert_not_called()
                     self.assertEqual(writes, ['same'] if changed_after_put else [])

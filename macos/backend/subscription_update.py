@@ -40,6 +40,7 @@ def fetch(url):
 
 
 NO_SELECTION = '订阅里已没有你勾选的节点，请先在管理节点里勾选'
+RECOVERY_HINT = '上次订阅更新未完成，可刷新重试，或在管理节点重新保存'
 INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改'
 VALIDATION_FAILED = '配置校验失败，未改动当前代理'
 EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新'
@@ -78,22 +79,19 @@ def entry_seed_owners(config, sources):
         response = t.api('GET', '/providers/proxies')
     except Exception:
         return {}
-    live_providers = response.get('providers') if isinstance(response, dict) else None
-    if not isinstance(live_providers, dict):
-        return {}
     providers = config.get('proxy-providers') or {}
     owners = {}
+    live_providers = t.provider_nodes(response)
     for name in use:
-        provider = live_providers.get(name)
-        proxies = provider.get('proxies') if isinstance(provider, dict) else None
-        if not isinstance(proxies, list) or any(
-                not isinstance(node, dict) or not isinstance(node.get('name'), str) or not node['name']
-                for node in proxies):
+        definition = providers.get(name)
+        url = definition.get('url') if isinstance(definition, dict) else None
+        if url is not None and not isinstance(url, str):
             continue
-        definition = providers.get(name, {})
-        url = definition.get('url')
-        source = by_url.get(source_key(url)) if url else available.get(name)
-        for node in proxies:
+        try:
+            source = by_url.get(source_key(url)) if url else available.get(name)
+        except ValueError:
+            continue
+        for node in live_providers.get(name, []):
             owners.setdefault(node['name'], source['name'] if source else None)
     return owners
 
@@ -270,29 +268,51 @@ def managed_cache(root, owner, definition):
     return bool(source) and (root / source).resolve() == (root / 'providers/linkbox' / (owner + '.yaml')).resolve()
 
 
+def provider_payload(definition, root, read_cache, *, filtered):
+    payload = definition.get('payload')
+    if source := definition.get('path'):
+        data = yaml.safe_load(read_cache(root / source) or b'')
+        payload = data.get('proxies') if isinstance(data, dict) else None
+    if not isinstance(payload, list):
+        raise RuntimeError('代理缓存不完整，未修改')
+    if filtered:
+        accepts = name_filter(definition)
+        payload = [node for node in payload if accepts(node['name'])]
+    return payload
+
+
+def entry_plan(config, root):
+    try:
+        entry = next(g for g in config.get('proxy-groups', []) if g['name'] == t.ENTRY)
+        static_nodes = {node['name']: node for node in config.get('proxies', [])}
+        members = {name: (None, static_nodes.get(name)) for name in entry.get('proxies') or []}
+        for owner in entry.get('use') or []:
+            definition = config['proxy-providers'][owner]
+            for node in provider_payload(definition, root, read, filtered=True):
+                members.setdefault(node['name'], (owner, node))
+        return members
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, StopIteration, RuntimeError, re.error, yaml.YAMLError):
+        return None
+
+
 def reload_payload(config, root, updates, baselines):
     # The service cannot read LinkBox's user-owned provider cache files.
     live = copy.deepcopy(config)
     entry = next(g for g in live['proxy-groups'] if g['name'] == t.ENTRY)
     use = set(entry.get('use') or [])
     members = set(entry.get('proxies') or [])
+
+    def read_cache(path):
+        if path not in updates and path not in baselines:
+            baselines[path] = read(path)
+        return updates.get(path, baselines.get(path))
+
     for owner, definition in live['proxy-providers'].items():
         managed = managed_cache(root, owner, definition)
         if not managed and owner not in use:
             continue
-        payload = definition.get('payload')
-        if source := definition.get('path'):
-            path = root / source
-            if path not in updates and path not in baselines:
-                baselines[path] = read(path)
-            raw = updates.get(path, baselines.get(path))
-            data = yaml.safe_load(raw) if raw is not None else None
-            payload = data.get('proxies') if isinstance(data, dict) else None
-        if not isinstance(payload, list):
-            raise RuntimeError('代理缓存不完整，未修改')
+        payload = provider_payload(definition, root, read_cache, filtered=owner in use)
         if owner in use:
-            accepts = name_filter(definition)
-            payload = [node for node in payload if accepts(node['name'])]
             members.update(node['name'] for node in payload)
         if managed:
             definition.pop('url', None)
@@ -340,9 +360,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         needs_initialization = selection is None or legacy or policy.get('initialization_pending') is True
         root = runtime.CONFIG_DIR
         pending = policy.get('pending_update')
-        recovering = pending is not None or policy.get('reload_unconfirmed')
-        if recovering and not initialize:
-            raise RuntimeError(t.RELOAD_PENDING)
+        recovering = initialize and pending is not None
         if initialize and not (needs_initialization or recovering):
             return False
         before = t.relay_state()
@@ -354,7 +372,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             selection = pending.get('selection', selection)
         syncing = not recovering and request is None and removal is None
         preview_file = runtime.BASE / picker.PREVIEW
-        initialization_policy = picker.fingerprint([str(root), policy])
+        initialization_policy = picker.fingerprint([str(root), picker.committed_policy(policy)])
         if initialize and not recovering and picker.document(read(preview_file)).get('initialization_policy') == initialization_policy:
             raise RuntimeError(NO_SELECTION)
         config_file, script, profiles = root / 'clash-verge.yaml', root / 'profiles/Script.js', root / 'profiles.yaml'
@@ -390,7 +408,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             sources = refreshed
             if t.relay_state() != before or picker.discover(for_update=True)[1] != fingerprint:
                 raise RuntimeError(EXTERNAL_CHANGE)
-        if syncing or (request is not None and preview_id):
+        if syncing or (preview_id and (request is not None or recovering)):
             updates.update({root / 'profiles' / source['profile_file']: dump(doc) for source, doc in sources})
         try:
             config = yaml.safe_load(baselines[config_file] or b'')
@@ -412,15 +430,6 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 if needs_initialization:
                     preview_data['initialization_policy'] = initialization_policy
                 atomic(preview_file, dump(preview_data))
-            elif recovering and pending.get('preview_id'):
-                if not any(group['name'] == t.ENTRY for group in config.get('proxy-groups', [])):
-                    raise RuntimeError('缺少中转入口组')
-                if (picker.discover(recovering=True)[1] != fingerprint or runtime.read_json(policy_file.name) != policy
-                        or any(read(path) != raw for path, raw in baselines.items())):
-                    raise RuntimeError(EXTERNAL_CHANGE)
-                if picker.digest(read(preview_file)) != pending['preview_id']:
-                    atomic(policy_file, policy_bytes({key: value for key, value in policy.items()
-                                                      if key not in ('pending_update', 'reload_unconfirmed')}))
             raise RuntimeError(NO_SELECTION)
 
         replacement = legacy_pin(baselines[script], config, policy.get('pinned_entry'))
@@ -503,11 +512,8 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 (backup / (str(i) + '-' + path.name)).write_bytes(originals[path])
         written = []
         if not recovering:
-            last_saved = {key: value for key, value in policy.items()
-                          if key not in ('pending_update', 'reload_unconfirmed', 'initialization_pending')}
+            last_saved = picker.committed_policy(policy)
             journal = {'root': str(root), 'selection': plan['selection']}
-            if request is not None and preview_id:
-                journal['preview_id'] = preview_id
             atomic(policy_file, policy_bytes({**last_saved, 'pending_update': journal}))
             written.append(policy_file)
         try:

@@ -12,8 +12,7 @@ import toolbox as t
 import runtime
 from reconcile import selection_owners
 
-def node_rows(p, selection):
-    owners = selection_owners(selection)
+def node_rows(p, owners):
     inventory = t.node_inventory(p, owners)
     records = [runtime.read_json(file) for file in ('latency-results.json', 'chain-results.json')]
 
@@ -27,12 +26,14 @@ def node_rows(p, selection):
     rows=[]
     for name, provider in owners.items():
         node, _ = inventory.get(name, ({}, None))
-        history=node.get('history',[])
-        last=history[-1] if history else {}
+        history=node.get('history')
+        last=history[-1] if isinstance(history, list) and history and isinstance(history[-1], dict) else {}
+        delay=last.get('delay')
+        delay=delay if type(delay) in (int, float) and delay > 0 else None
         # Prefer this tool's explicitly measured baseline; label its timestamp in the UI.
-        row={'name':name,'provider':runtime.provider_label(provider),
-             'delay':last.get('delay') or None,'time':last.get('time',''),
-             'status':'历史可达' if last.get('delay',0)>0 else '未验证',
+        row={'name':name,'provider':runtime.provider_label(provider) or 'Clash',
+             'delay':delay,'time':last.get('time',''),
+             'status':'历史可达' if delay else '未验证',
              'source':'Clash 历史健康检查','error':''}
         for record in records:
             saved = record.get('results', {}).get(name, {})
@@ -44,9 +45,11 @@ def node_rows(p, selection):
 def snapshot(include_nodes=True):
     c,p=t.state()
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
-    data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':list(selection_owners(selection)),'live':p.get(t.ENTRY,{}).get('all',[]),'expected_ip':runtime.expected_ip()}
+    live=p.get(t.ENTRY,{}).get('all',[])
+    owners=t.relay_owners(selection, live)
+    data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':list(owners),'live':live,'expected_ip':runtime.expected_ip()}
     if include_nodes:
-        try:data['node_rows']=node_rows(p, selection)
+        try:data['node_rows']=node_rows(p, owners)
         except Exception as e:data['node_rows_error']=str(e)
     return data
 
@@ -58,7 +61,7 @@ def latency():
         except BlockingIOError:raise RuntimeError('已有一轮节点测速正在运行，请稍后再试')
         clear_latest_results()
         before=snapshot(False);_,p=t.state();results={}
-        owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+        owners = t.relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), before.get('live', []))
         inventory = t.node_inventory(p, owners)
         query=urllib.parse.urlencode({'url':'https://www.gstatic.com/generate_204','timeout':3000,'expected':'204'})
         def measure(name):
@@ -106,8 +109,12 @@ def change(target,previous,guard=None):
     s=snapshot()
     if s['mode']!='global' or s['exit']!=t.EXIT or s['dialer']!=t.ENTRY:
         raise RuntimeError('当前全局链路与预期不符，已取消。请先在 Clash 恢复全局 → 美国静态家宽。')
-    if s['entry']!=previous or target not in s['nodes'] or target not in s['live']:
+    plan = t.live_entry_plan(s['live'])
+    if plan is None:
+        raise RuntimeError(t.ENTRY_NOT_APPLIED)
+    if s['entry']!=previous or target not in plan:
         raise RuntimeError('节点状态已变化，请刷新后重新选择。')
+    owner = plan[target][0]
     if guard is not None:
         import chain_test
         if chain_test.physical_network()!=guard['network'] or chain_test.active_state()[0]!=guard['before']:
@@ -116,17 +123,16 @@ def change(target,previous,guard=None):
         if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,expected,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
                 (t.BASE/'chain-cancel').exists()):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
-    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
-    owner = owners.get(target)
-    if not t.entry_member_owned(s['live'], owners, target, owner):
-        raise RuntimeError('节点归属已变化，请先更新订阅')
+        selection = runtime.read_json('node-policy.json').get('selected_nodes')
+        if selection is not None and selection_owners(selection).get(target) != owner:
+            raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
-    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
-    if not t.entry_member_owned(after['live'], owners, target, owner):
+    after_plan = t.live_entry_plan(after['live'])
+    if not t.same_switch_target(plan, after_plan, target):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)
@@ -159,17 +165,22 @@ def main():
     elif action=='status': result={'state':snapshot()}
     elif action=='startup':
         import subscription_picker
+        from subscription_update import RECOVERY_HINT
         before = t.relay_state()
         ready = before['mode'] == 'global' and before['exit'] == t.EXIT and before['dialer'] == t.ENTRY
         result = {'startup_checked': ready}
-        if ready:
+        if ready or runtime.read_json('node-policy.json').get('pending_update') is not None:
             try:
                 result['initialized'] = subscription_picker.initialize(sys.argv[2])
                 if result['initialized'] and '--refresh' in sys.argv[3:]:
                     result['message'] = '已刷新 Clash 状态。'
-            except RuntimeError as error:
-                result['startup_checked'] = False
-                result['message'] = str(error)
+            except Exception as error:
+                if runtime.read_json('node-policy.json').get('pending_update') is not None:
+                    result['recovery_hint'] = RECOVERY_HINT
+                elif isinstance(error, RuntimeError):
+                    result.update(startup_checked=False, message=str(error))
+                else:
+                    raise
         result['state'] = snapshot()
     elif action=='subscription-catalog':
         import subscription_picker

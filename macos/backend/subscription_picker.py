@@ -21,6 +21,11 @@ def digest(raw):
     return None if raw is None else hashlib.sha256(raw).hexdigest()
 
 
+def committed_policy(policy):
+    return {key: value for key, value in policy.items()
+            if key not in ('pending_update', 'reload_unconfirmed')}
+
+
 def document(raw):
     try:
         value = yaml.safe_load(raw) if raw is not None else None
@@ -86,7 +91,7 @@ def discover(for_update=False, *, recovering=False):
     if len({s['name'] for s, _ in sources}) != len(sources):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, digest(raw)] for source, raw in sources]
-    revision = fingerprint([str(root), revisions, runtime.read_json('node-policy.json')])
+    revision = fingerprint([str(root), revisions, committed_policy(runtime.read_json('node-policy.json'))])
     if for_update:
         return [(source, None) for source, _ in sources], revision, None
     raw_preview = update.read(runtime.BASE / PREVIEW)

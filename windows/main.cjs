@@ -46,17 +46,18 @@ const demoNodes=['日本 JP V1-3','香港 HK 01','新加坡 SG 02','日本 JP V1
 let initialization,startupChecked=false,initializedSelection=false;
 async function startupState(){
  const state=await backend.state();
- if(quitting||state.mode!=='global'||state.exit!=='美国静态家宽'||state.dialer!=='中转入口')return state;
- initialization ||= subscriptions.initialize(backend).then(changed=>({changed}))
+ if(quitting)return state;
+ const ready=state.mode==='global'&&state.exit==='美国静态家宽'&&state.dialer==='中转入口';
+ initialization ||= subscriptions.startup(backend,ready)
   .catch(error=>({changed:false,selectionError:safeError(error)}));
  const pending=initialization;
- const {changed,selectionError}=await pending;
+ const {changed,selectionError,recoveryHint}=await pending;
  if(initialization===pending){
   initialization=null;
-  startupChecked=!selectionError;
+  startupChecked=ready&&!selectionError;
   initializedSelection||=changed;
  }
- return {...(changed?await backend.state():state),selectionError};
+ return {...(changed||recoveryHint?await backend.state():state),selectionError,recoveryHint};
 }
 ipcMain.handle('linkbox',async(event,action,data)=>{
  if(event.sender!==win?.webContents||event.senderFrame!==win.webContents.mainFrame)throw Error('不允许的调用来源');

@@ -4,7 +4,7 @@ test('isolated configuration never enables live control, TUN or mutates inputs',
 test('IPv6 incomplete probes must never pass',()=>{assert.equal(ipv6Assessment([],[{connected:false},{connected:false}]).status,'ok');assert.equal(ipv6Assessment([],[{},{}]).status,'warn');assert.equal(ipv6Assessment([],[{connected:true},{connected:false}]).status,'warn');assert.equal(ipv6Assessment(['2001:db8::1'],[{connected:false},{connected:false}]).status,'warn');});
 test('Claude connections require exact endpoint evidence and verified proxy exit',()=>{const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1',OwningProcess:123}],cons=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽','GLOBAL']}];assert.equal(assessClaude(rows,cons,EXPECTED).status,'ok');assert.equal(assessClaude(rows,cons,'203.0.113.11').status,'warn');assert.equal(assessClaude([],[],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[...cons,...cons],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[{...cons[0],chains:['DIRECT']}],EXPECTED).status,'bad');});
 test('live API rejects reloads, connection closes, route patches and deletions',async()=>{const b=new Backend('/tmp');for(const [method,url]of [['PUT','/configs'],['PATCH','/configs'],['DELETE','/connections'],['PUT','/proxies/GLOBAL'],['POST','/restart']])await assert.rejects(b.api(method,url));});
-test('switch validates stale state before writes and writes only entrance',async()=>{const b=new Backend('/tmp'),state={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a',providerId:'a'},{name:'b',providerId:'a'}],live:['a','b'],switchable:['a','b']};let wrote=[];b.state=async()=>state;b.api=async(m,u,p)=>{wrote.push([m,u,p]);state.entry=p.name};await assert.rejects(b.switchNode('b','stale'));assert.equal(wrote.length,0);await b.switchNode('b','a');assert.deepEqual(wrote,[['PUT','/proxies/'+encodeURIComponent('中转入口'),{name:'b'}]]);});
+test('switch validates stale state before writes and writes only entrance',async()=>{const b=new Backend('/tmp'),state={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a',providerId:'a'},{name:'b',providerId:'a'}],live:['a','b'],switchable:['a','b'],entryMatchesDisk:true,entryOwners:{a:'a',b:'a'}};let wrote=[];b.state=async()=>state;b.api=async(m,u,p)=>{wrote.push([m,u,p]);state.entry=p.name};await assert.rejects(b.switchNode('b','stale'));assert.equal(wrote.length,0);await b.switchNode('b','a');assert.deepEqual(wrote,[['PUT','/proxies/'+encodeURIComponent('中转入口'),{name:'b'}]]);});
 test('local HTTP API distinguishes a rejection with a body from an empty HTTP error', async () => {
  const server = http.createServer((req, res) => {
   assert.equal(req.headers.authorization, 'Bearer local-test');
@@ -44,7 +44,7 @@ test('isolated probes retain provider DNS and never enable TUN',()=>{const polic
 test('dynamic benchmark limits concurrency and only an opted-in scheduled run changes the relay',async t=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-'));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  const b=await new Backend(folder).init(),names=['current','entrance','chain','failed'];let entry='current',active=0,peak=0,writes=[];
- b.state=async()=>({mode:'global',tun:true,entry,exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names});
+ b.state=async()=>({mode:'global',tun:true,entry,exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names,entryMatchesDisk:true,entryOwners:Object.fromEntries(names.map(name=>[name,'a']))});
  b.network=async()=>({interface:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(names.map(name=>[name,{name}])),exit:{}});b.corePath=async()=>'/mock';
  b.api=async(method,route,body)=>{writes.push([method,route,body.name]);entry=body.name};
  b.testNode=async node=>{active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,8));active--;
@@ -64,7 +64,7 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
 test('automatic relay checks settings commits and fresh subscription definitions before writing',async t=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-race-'));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  const b=await new Backend(folder).init(),names=['current','candidate'];let endpoint='tested.invalid',loaded=0,writes=0;
- b.state=async()=>({mode:'global',tun:true,entry:'current',exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names});
+ b.state=async()=>({mode:'global',tun:true,entry:'current',exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names,entryMatchesDisk:true,entryOwners:Object.fromEntries(names.map(name=>[name,'a']))});
  b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>{loaded++;return {nodes:new Map(names.map(name=>[name,{name,server:endpoint}])),exit:{}}};b.corePath=async()=>'/mock';
  b.api=async()=>{writes++;};const result=node=>({delay:node.name==='current'?200:50,entranceDelay:50,kind:'chain'});
  await b.saveSettings({autoRelay:true});
@@ -213,7 +213,7 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
    return {providers:{a:{proxies:[current,same]}}};
   };
   const run = automatic ? () => b.benchmark('chain', () => true) : () => b.switchNode('same','current');
-  await assert.rejects(run, changedAfterPut ? /待核对/ : /归属/);
+  await assert.rejects(run, changedAfterPut ? /待核对/ : /Clash 配置尚未生效，请刷新、保存或同步订阅/);
   assert.deepEqual(writes, changedAfterPut ? ['same'] : []);
  });
 }
