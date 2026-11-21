@@ -1,0 +1,41 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "b",
+        "nodes": [
+          "same",
+          "first"
+        ]
+      }
+    ],
+    "selection": {
+      "a": [
+        "same"
+      ],
+      "b": [
+        "first"
+      ]
+    },
+    "live": [
+      "same"
+    ],
+    "current": "same",
+    "metric": "chain",
+    "results": {}
+  },
+  "expected": {
+    "selection": {
+      "b": [
+        "first"
+      ]
+    },
+    "candidates": [
+      {
+        "name": "first",
+        "owner": "b"
+      }
+    ],
+    "entry": "first"
+  }
+}

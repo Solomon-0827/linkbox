@@ -165,6 +165,8 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     var warnings:[String:String]=[:]
     var activeSource:String=""
     private var fingerprint=""
+    private var currentEntry=""
+    private var duplicates:[String:[NSButton]]=[:]
     private var initialChecks=Set<Int>()
     private var currentChecks=Set<Int>()
     private var updateButton:SoftButton!
@@ -189,7 +191,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
             let b=SoftButton(title:title,target:self,action:action);b.isBordered=false;b.frame=frame;view.addSubview(b);return b
         }
         text("选择加入列表的节点",NSRect(x:24,y:18,width:650,height:28),19,ink)
-        text("左侧选择订阅，右侧勾选节点 · 保存后生效 · 当前入口自动保留",NSRect(x:24,y:52,width:770,height:22))
+        text("左侧选择订阅，右侧勾选节点 · 保存后生效",NSRect(x:24,y:52,width:770,height:22))
         toolbarButtons=[
             button("全部选中",#selector(selectAll),NSRect(x:24,y:86,width:88,height:30)),
             button("全部取消",#selector(clearAll),NSRect(x:122,y:86,width:88,height:30))
@@ -215,7 +217,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         let previousSource=activeSource
         var changes=[String:[String:Bool]]()
         for (id, buttons) in groups {
-            for button in buttons where !currentChecks.contains(button.tag) {
+            for button in buttons {
                 let checked=button.state == .on
                 if checked != initialChecks.contains(button.tag), let name=nodeNames[button.tag] {
                     changes[id,default:[:]][name]=checked
@@ -223,8 +225,9 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
             }
         }
         checks.removeAll();groups.removeAll();sourceIDs.removeAll();sourceNames.removeAll()
-        nodeNames.removeAll();warnings.removeAll();initialChecks.removeAll();currentChecks.removeAll()
+        nodeNames.removeAll();warnings.removeAll();initialChecks.removeAll();currentChecks.removeAll();duplicates.removeAll()
         fingerprint=catalog["fingerprint"] as? String ?? ""
+        currentEntry=catalog["current"] as? String ?? ""
         catalogCurrent=true
         for source in catalog["sources"] as? [[String:Any]] ?? [] {
             guard let id=source["id"] as? String else { continue }
@@ -233,13 +236,19 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
                 guard let name=node["name"] as? String else { continue }
                 let current=node["current"] as? Bool ?? false
                 let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)));b.tag=checks.count
-                let selected=(node["selected"] as? Bool ?? false) || current
+                let selected=node["selected"] as? Bool ?? false
                 if selected { initialChecks.insert(b.tag) }
                 if current { currentChecks.insert(b.tag) }
-                b.state=(current || (changes[id]?[name] ?? selected)) ? .on : .off
-                b.isEnabled = !updating && !current
-                b.setAccessibilityLabel(name+(current ? "，当前入口，自动保留" : ""))
+                b.state=(changes[id]?[name] == false || !selected) ? .off : .on
+                b.isEnabled = !updating
+                b.setAccessibilityLabel(name+(current ? "，当前入口" : ""))
                 checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name
+                duplicates[name,default:[]].append(b)
+            }
+        }
+        for id in sourceIDs {
+            for button in groups[id] ?? [] where changes[id]?[nodeNames[button.tag] ?? ""] == true {
+                choose(button)
             }
         }
         activeSource=sourceIDs.contains(previousSource) ? previousSource : sourceIDs.first ?? ""
@@ -255,8 +264,8 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         updateButton.isEnabled = !value
         updateButton.spinning=value
         for button in toolbarButtons { button.isEnabled = !value }
-        saveButton.isEnabled = !value && catalogCurrent
-        for button in checks { button.isEnabled = !value && !currentChecks.contains(button.tag) }
+        saveButton.isEnabled = !value && catalogCurrent && !sourceIDs.isEmpty
+        for button in checks { button.isEnabled = !value }
         updateGroupCheck()
     }
     @objc private func updateAll() {
@@ -284,7 +293,8 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         var y:CGFloat=44
         for b in items {
             let current=currentChecks.contains(b.tag)
-            let value=(nodeNames[b.tag] ?? "")+(current ? "  · 当前入口" : "")
+            let name=nodeNames[b.tag] ?? ""
+            let value=name+(current ? "  · 当前入口" : "")+((duplicates[name]?.count ?? 0) > 1 ? "  · 另一订阅有同名节点" : "")
             let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=current ? accent : ink
             let measured=(value as NSString).boundingRect(with:NSSize(width:476,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:NSFont.systemFont(ofSize:12)])
             let height=max(CGFloat(40),ceil(measured.height)+20)
@@ -314,18 +324,35 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         summary.stringValue="已选 \(checks.filter{$0.state == .on}.count) / \(checks.count) 个节点 · \(groups.count) 个订阅"
         sourceTable.reloadData(forRowIndexes:IndexSet(integersIn:0..<sourceIDs.count),columnIndexes:IndexSet(integer:0))
     }
-    func set(_ items:[NSButton],_ state:NSControl.StateValue) { for b in items where b.isEnabled { b.state=state };updateCounts() }
-    @objc func toggled(_ sender:NSButton) { updateCounts() }
-    @objc func selectAll() { set(checks,.on) }
+    private func choose(_ button:NSButton) {
+        for other in duplicates[nodeNames[button.tag] ?? ""] ?? [] where other !== button {
+            other.state = .off
+        }
+        button.state = .on
+    }
+    func set(_ items:[NSButton],_ state:NSControl.StateValue) {
+        for button in items where button.isEnabled {
+            if state == .on { choose(button) } else { button.state = .off }
+        }
+        updateCounts()
+    }
+    @objc func toggled(_ sender:NSButton) {
+        if sender.state == .on { choose(sender) }
+        updateCounts()
+    }
+    @objc func selectAll() {
+        for button in checks {
+            if !(duplicates[nodeNames[button.tag] ?? ""] ?? []).contains(where:{$0.state == .on}) { choose(button) }
+        }
+        updateCounts()
+    }
     @objc func clearAll() { set(checks,.off) }
-    @objc func selectGroup() { set(groups[activeSource] ?? [],.on) }
-    @objc func clearGroup() { set(groups[activeSource] ?? [],.off) }
     @objc func cancel() { if !updating { onCancel() } }
     @objc func save() {
         guard !updating,catalogCurrent else { return }
         var selected=[String:[String]]()
         for id in sourceIDs { selected[id]=(groups[id] ?? []).filter{$0.state == .on}.compactMap{nodeNames[$0.tag]} }
-        onSave(["fingerprint":fingerprint,"selected":selected])
+        onSave(["fingerprint":fingerprint,"current":currentEntry,"selected":selected])
     }
 }
 
@@ -458,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var busy = false
     var controls: [NSControl] = []
     var nodePicker:SubscriptionPicker?
+    var startupChecked=false
     var manageButton:NSButton!
     var updateButton: NSButton!
     var refreshButton: NSButton!
@@ -589,9 +617,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let quitItem=NSMenuItem(title:"退出链路盒子",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"");quitItem.target=NSApp;trayMenu.addItem(quitItem)
         tray.menu=trayMenu;statusItem=tray
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        invoke(["status"],message:"正在读取 Clash 状态…") { _ in
+        invoke(["startup",autoMetric],message:"正在读取 Clash 状态…") { result in
+            self.startupChecked=result["startup_checked"] as? Bool ?? false
             self.refreshOnline()
-            self.startAutomaticTest()
+            if result["initialized"] as? Bool != true { self.startAutomaticTest() }
         }
         configureAutoTests()
     }
@@ -604,7 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         hourlyTestTimer=timer;RunLoop.main.add(timer,forMode:.common)
     }
     func startAutomaticTest() {
-        guard autoTestsEnabled,!busy,nodePicker == nil,!editingNodes,!autoSettingsOpen,window.attachedSheet == nil else { return }
+        guard autoTestsEnabled,!nodeRows.isEmpty,!busy,nodePicker == nil,!editingNodes,!autoSettingsOpen,window.attachedSheet == nil else { return }
         beginTest("chain",automatic:true)
     }
     @objc func toggleAutoTests() {
@@ -684,7 +713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc func removeSelectedNodes() {
         guard !busy,editingNodes,!selectedNodes.isEmpty,let data=try? JSONSerialization.data(withJSONObject:["names":Array(selectedNodes),"entry":current]) else { return }
-        invoke(["remove-list-nodes"],message:"正在更新节点列表…",input:data) { _ in self.selectedNodes.removeAll();self.updateEditingControls() }
+        invoke(["remove-list-nodes",autoMetric],message:"正在更新节点列表…",input:data) { _ in self.selectedNodes.removeAll();self.updateEditingControls() }
     }
     func showFastestNodes() {
         guard !nodeRows.isEmpty else { return }
@@ -725,7 +754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     }
                     if let state = result["state"] as? [String:Any] { self.render(state) }
                     self.setBusy(false,result["message"] as? String ?? "状态已更新。没有修改代理配置。")
-                    if args.first == "chain" || args.first == "latency" || args.first == "status" { self.showFastestNodes() }
+                    if args.first == "chain" || args.first == "latency" || args.first == "status" || args.first == "startup" { self.showFastestNodes() }
                     complete(result)
                 }
             } catch {
@@ -859,8 +888,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             guard let catalog=result["catalog"] as? [String:Any] else { return }
             let picker=SubscriptionPicker(catalog:catalog,save:{ [weak self] selection in
                 guard let self=self,let picker=self.nodePicker,let data=try? JSONSerialization.data(withJSONObject:selection) else { return }
-                self.window.endSheet(picker.panel);self.nodePicker=nil
-                self.invoke(["save-node-selection"],message:"正在保存节点选择…",input:data) { _ in self.showFastestNodes() }
+                picker.setUpdating(true,message:"正在保存节点选择…")
+                let previous=self.current
+                self.invoke(["save-node-selection",self.autoMetric],message:"正在保存节点选择…",input:data,failed:{ error in
+                    picker.setUpdating(false,message:error)
+                }) { _ in
+                    self.window.endSheet(picker.panel);self.nodePicker=nil
+                    self.showFastestNodes()
+                    if self.current != previous { self.refreshOnline() }
+                }
             },cancel:{ [weak self] in
                 guard let self=self,let picker=self.nodePicker else { return }
                 self.window.endSheet(picker.panel);self.nodePicker=nil
@@ -873,7 +909,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func updatePickerSubscriptions(_ picker:SubscriptionPicker) {
         guard !busy,nodePicker === picker else { return }
         picker.setUpdating(true,message:"正在更新全部订阅…")
-        invoke(["update-subscriptions"],message:"正在更新全部订阅…",failed:{ error in
+        invoke(["update-subscriptions",autoMetric],message:"正在更新全部订阅…",failed:{ error in
             picker.setUpdating(false,message:error)
         }) { result in
             self.showFastestNodes()
@@ -896,7 +932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc func updateSubscriptions() {
         guard !busy,!editingNodes else { return }
         (updateButton as? SoftButton)?.spinning=true
-        invoke(["update-subscriptions"],message:"正在更新全部订阅…") { _ in
+        invoke(["update-subscriptions",autoMetric],message:"正在更新全部订阅…") { _ in
             self.refreshOnline()
             self.showFastestNodes()
         }
@@ -906,7 +942,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resetOnline()
         refreshingOnline=["status"]
         (refreshButton as? SoftButton)?.spinning=true
-        invoke(["status"],message:"正在刷新状态…") { _ in self.refreshOnline() }
+        invoke(startupChecked ? ["status"] : ["startup",autoMetric],message:"正在刷新状态…") { result in
+            if let checked=result["startup_checked"] as? Bool { self.startupChecked=checked }
+            self.refreshOnline()
+        }
     }
     func finishRefresh(_ part:String) {
         refreshingOnline.remove(part)
@@ -941,7 +980,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resetOnline()
         refreshingOnline=["coffee","ip"]
         let id=generation
-        coffee=CoffeeReader(base:base) { [weak self] result,finished in
+        coffee=CoffeeReader { [weak self] result,finished in
             guard let self=self,self.generation==id else { return }
             self.renderCoffee(result,finished:finished)
             if finished { self.finishRefresh("coffee") }
@@ -1017,7 +1056,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 final class CoffeeReader: NSObject, WKNavigationDelegate {
-    let base:URL
     var web:WKWebView?
     var timer:Timer?
     var rounds=0
@@ -1025,7 +1063,7 @@ final class CoffeeReader: NSObject, WKNavigationDelegate {
     var extracting=false
     var last:[String:Any]=[:]
     let callback:([String:Any],Bool)->Void
-    init(base:URL,callback:@escaping ([String:Any],Bool)->Void) { self.base=base;self.callback=callback }
+    init(callback:@escaping ([String:Any],Bool)->Void) { self.callback=callback }
     func start() {
         let config=WKWebViewConfiguration();config.websiteDataStore = .nonPersistent()
         let view=WKWebView(frame:NSRect(x:0,y:0,width:1024,height:768),configuration:config)
@@ -1038,7 +1076,8 @@ final class CoffeeReader: NSObject, WKNavigationDelegate {
         rounds += 1
         if rounds>=30 { finish(last); return }
         guard !extracting,let view=web else { return }
-        guard let script=try? String(contentsOf:base.appendingPathComponent("coffee-extract.js"),encoding:.utf8) else { finish(["error":"缺少页面字段解析文件"]);return }
+        guard let url=Bundle.main.url(forResource:"coffee-extract",withExtension:"js"),
+              let script=try? String(contentsOf:url,encoding:.utf8) else { finish(["error":"缺少页面字段解析文件"]);return }
         extracting=true
         view.evaluateJavaScript(script) { [weak self] value,error in
             guard let self=self,!self.done else { return }

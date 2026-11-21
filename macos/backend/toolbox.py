@@ -11,6 +11,7 @@ import tempfile
 import urllib.parse
 
 from runtime import BASE, CONFIG_DIR
+from reconcile import selection_owners
 
 SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
 PROFILES = CONFIG_DIR / 'profiles.yaml'
@@ -39,19 +40,25 @@ def state():
     p = api('GET', '/proxies')['proxies']
     return conf, p
 
-def node_inventory(proxies):
-    result={name:(value,value.get('provider-name') or None) for name,value in proxies.items()}
-    providers=api('GET','/providers/proxies').get('providers',{})
-    for provider,data in providers.items():
-        for value in data.get('proxies',[]):
-            result[value['name']]=(result.get(value['name'],(value,None))[0],provider)
+def relay_state():
+    config, proxies = state()
+    group = proxies.get(ENTRY, {})
+    return {'mode': config.get('mode'), 'tun': bool(config.get('tun', {}).get('enable')),
+            'entry': group.get('now'), 'exit': proxies.get('GLOBAL', {}).get('now'),
+            'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': group.get('all', [])}
+
+
+def node_inventory(proxies, owners):
+    result = {name: (value, value.get('provider-name')) for name, value in proxies.items()
+              if name not in owners}
+    providers = api('GET', '/providers/proxies').get('providers', {})
+    for provider, data in providers.items():
+        for value in data.get('proxies', []):
+            name = value['name']
+            if name not in owners or owners[name] == provider:
+                result.setdefault(name, (value, provider))
     return result
 
-def candidate_names(proxies):
-    import runtime
-    inventory=node_inventory(proxies)
-    return [name for name in proxies.get(ENTRY,{}).get('all',[])
-            if runtime.allowed(name,inventory.get(name,({},None))[1])]
 
 def show():
     c, p = state()
@@ -98,12 +105,15 @@ def switch():
     if c.get('mode') != 'global' or p.get('GLOBAL', {}).get('now') != EXIT or p.get(EXIT, {}).get('dialer-proxy') != ENTRY:
         print('\n当前链式配置与预期不符。为避免改变出口，本工具不会切换。请先在 Clash 恢复全局 → 美国静态家宽。')
         return
-    nodes = p.get(ENTRY, {}).get('all', [])
+    import runtime
+    live = p.get(ENTRY, {}).get('all', [])
+    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+    nodes = [name for name in owners if name in live]
     if not nodes:
         raise RuntimeError('中转入口没有可选节点')
     current = p[ENTRY].get('now')
     for i, name in enumerate(nodes, 1):
-        provider = 'NekoCat' if name.startswith('[') else 'mmti'
+        provider = owners[name]
         print(f'{i:2}. [{provider}] {name}' + ('  ← 当前' if name == current else ''))
     print(' 0. 返回（不切换）')
     raw = input('\n输入节点编号：').strip()
@@ -125,6 +135,8 @@ def switch():
     fresh_c, fresh_p = state()
     if fresh_c.get('mode') != 'global' or fresh_p['GLOBAL'].get('now') != EXIT or fresh_p[EXIT].get('dialer-proxy') != ENTRY or fresh_p[ENTRY].get('now') != current or target not in fresh_p[ENTRY].get('all', []):
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
+    if target not in node_inventory(fresh_p, owners):
+        raise RuntimeError('节点归属已变化，请先更新订阅')
     api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
     after_c, after_p = state()
     if after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT or after_c.get('mode') != 'global':

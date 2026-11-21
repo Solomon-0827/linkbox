@@ -18,10 +18,10 @@ import time
 import yaml
 import toolbox as t
 import runtime
+from reconcile import selection_owners
 
 CORE = '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo'
 CONFIG_DIR = runtime.CONFIG_DIR
-EXPECTED = runtime.expected_ip()
 DNS_POLICY = {}
 TARGET = 'https://www.cloudflare.com/cdn-cgi/trace'
 
@@ -44,28 +44,37 @@ def physical_network():
 
 
 def active_state():
-    c,p=t.state()
-    return {'mode':c.get('mode'),'tun':c.get('tun',{}).get('enable'),
-            'entry':p.get(t.ENTRY,{}).get('now'),'exit':p.get('GLOBAL',{}).get('now'),
-            'dialer':p.get(t.EXIT,{}).get('dialer-proxy')},t.candidate_names(p)
+    state = t.relay_state()
+    selection = runtime.read_json('node-policy.json').get('selected_nodes')
+    return state, list(selection_owners(selection))
 
 
 def load_nodes():
     global DNS_POLICY
-    conf=yaml.safe_load((CONFIG_DIR/'clash-verge.yaml').read_text())
-    DNS_POLICY={k:v for k,v in conf.get('dns',{}).get('proxy-server-nameserver-policy',{}).items() if not k.startswith(('geosite:','rule-set:'))}
-    nodes={x['name']:x for x in conf.get('proxies',[])}
-    for provider in conf.get('proxy-providers',{}).values():
+    conf = yaml.safe_load((CONFIG_DIR / 'clash-verge.yaml').read_text())
+    DNS_POLICY = {k: v for k, v in conf.get('dns', {}).get('proxy-server-nameserver-policy', {}).items()
+                  if not k.startswith(('geosite:', 'rule-set:'))}
+    owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+    nodes = {n['name']: n for n in conf.get('proxies', []) if n['name'] not in owners}
+    for owner, provider in conf.get('proxy-providers', {}).items():
         if provider.get('path'):
-            p=Path(provider['path']);p=p if p.is_absolute() else CONFIG_DIR/p
-            data=yaml.safe_load(p.read_text())
-        else:data={'proxies':provider.get('payload',[])}
-        for node in data.get('proxies',[]):
-            if node['name']!=runtime.read_json('node-policy.json').get('pinned_entry'):nodes[node['name']]=node
-    exit_node=nodes.get(t.EXIT)
-    if not exit_node:raise RuntimeError('找不到美国静态出口配置')
-    if exit_node.get('server')!=EXPECTED:raise RuntimeError('美国出口服务器已变化，请先更新预期出口，未开始测试')
-    return nodes,exit_node
+            file = CONFIG_DIR / provider['path']
+            if not file.exists():
+                continue
+            data = yaml.safe_load(file.read_text()) or {}
+        else:
+            data = {'proxies': provider.get('payload', [])}
+        for node in data.get('proxies', []):
+            name = node['name']
+            if name not in owners or owners[name] == owner:
+                nodes.setdefault(name, node)
+    exit_node = next((n for n in conf.get('proxies', []) if n['name'] == t.EXIT), None)
+    expected = runtime.expected_ip(conf)
+    if not exit_node or not expected:
+        raise RuntimeError('找不到固定出口配置或有效的预期出口 IP')
+    if exit_node.get('dialer-proxy') != t.ENTRY:
+        raise RuntimeError('固定出口的链式上游已变化，未开始测试')
+    return nodes, exit_node, expected
 
 
 def isolated_config(entry, exit_node, port, interface):
@@ -93,7 +102,7 @@ def stop_owned(process):
         except subprocess.TimeoutExpired:process.kill();process.wait(timeout=2)
 
 
-def trace(port, cancelled):
+def trace(port, cancelled, expected):
     command=['/usr/bin/curl','--silent','--show-error','--proxy',f'http://127.0.0.1:{port}',
              '--noproxy','','--connect-timeout','8','--max-time','12','--max-filesize','16384',
              '--write-out','\n__TIMING__%{http_code} %{time_total} %{time_starttransfer}',TARGET]
@@ -109,7 +118,7 @@ def trace(port, cancelled):
         text=stdout.decode(errors='replace');body,stats=text.rsplit('\n__TIMING__',1)
         code,total,ttfb=stats.split();values=dict(x.split('=',1) for x in body.splitlines() if '=' in x)
         if code!='200' or not values.get('ip'):raise RuntimeError('测试站返回无效结果')
-        if values['ip']!=EXPECTED:raise RuntimeError('出口不符：'+values['ip'])
+        if values['ip']!=expected:raise RuntimeError('出口不符：'+values['ip'])
         return {'ms':round(float(total)*1000),'ttfb_ms':round(float(ttfb)*1000),'ip':values['ip']}
     finally:stop_owned(p)
 
@@ -134,7 +143,7 @@ def entrance_delay(port,cancelled):
     finally:stop_owned(process)
 
 
-def test_node(node, exit_node, network, cancelled):
+def test_node(node, exit_node, network, cancelled, expected):
     # Unique private directory and one non-TUN child; secrets removed in finally.
     with tempfile.TemporaryDirectory(prefix='proxy-chain-') as tmp:
         folder=Path(tmp);folder.chmod(0o700)
@@ -160,7 +169,7 @@ def test_node(node, exit_node, network, cancelled):
             samples=[];errors=[]
             for index in range(3):
                 if cancelled():break
-                try:samples.append(trace(port,cancelled))
+                try:samples.append(trace(port,cancelled,expected))
                 except RuntimeError as error:errors.append(str(error))
                 if errors and not samples:break  # avoid repeatedly probing a failing path
                 time.sleep(.25)
@@ -168,8 +177,8 @@ def test_node(node, exit_node, network, cancelled):
         finally:stop_owned(p)
 
 
-def routing_fingerprint(nodes, exit_node, dns_policy, current, target):
-    data=[nodes.get(current),nodes[target],exit_node,dns_policy,EXPECTED]
+def routing_fingerprint(nodes, exit_node, expected, dns_policy, current, target):
+    data=[nodes.get(current),nodes[target],exit_node,dns_policy,expected]
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
@@ -205,8 +214,9 @@ def run(concurrency=runtime.CONCURRENCY):
         cancel=t.BASE/'chain-cancel';cancel.unlink(missing_ok=True)
         parent=os.getppid()
         cancelled=lambda:cancel.exists() or os.getppid()!=parent
-        before,names=active_state();network=physical_network();nodes,exit_node=load_nodes();dns_policy=DNS_POLICY
-        if before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链式配置与预期不符，未开始测试')
+        before,names=active_state();network=physical_network();nodes,exit_node,expected=load_nodes();dns_policy=DNS_POLICY
+        owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
+        if before['mode']!='global' or before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链式配置与预期不符，未开始测试')
         results={};run_id=secrets.token_hex(8);progress=t.BASE/'chain-progress.json'
         running=[]
         def publish(index,name,message):
@@ -219,10 +229,10 @@ def run(concurrency=runtime.CONCURRENCY):
         def measure(name):
             row={'chain_time':dt.datetime.now().astimezone().isoformat(timespec='seconds'),
                  'chain_delay':None,'chain_status':'未验证','chain_samples':[], 'chain_error':'',
-                 'chain_interface':network['interface'],'chain_target':TARGET,'chain_ip':None,'delay':None}
+                 'owner':owners.get(name), 'chain_interface':network['interface'],'chain_target':TARGET,'chain_ip':None,'delay':None}
             try:
                 if name not in nodes:raise RuntimeError('本地缓存缺少节点凭据，请在 Clash 更新订阅后再试')
-                samples,errors,entrance=test_node(nodes[name],exit_node,network,cancelled)
+                samples,errors,entrance=test_node(nodes[name],exit_node,network,cancelled,expected)
                 row.update(entrance)
                 row['chain_samples']=samples;row['chain_error']='；'.join(errors)
                 if samples:row['chain_ip']=samples[0]['ip']
@@ -255,7 +265,7 @@ def run(concurrency=runtime.CONCURRENCY):
                 stop.set()
                 for future in pending:future.cancel()
         after,_=active_state();unchanged=after==before
-        record={'finished_at':dt.datetime.now().astimezone().isoformat(),'started_at':started,'network':network,'expected_ip':EXPECTED,'results':results,
+        record={'finished_at':dt.datetime.now().astimezone().isoformat(),'started_at':started,'network':network,'expected_ip':expected,'results':results,
                 'before':before,'after':after,'selection_unchanged':unchanged,'reason':reason}
         write_json(t.BASE/'chain-results.json',record)
         directory=t.BASE/'chain-reports';directory.mkdir(exist_ok=True)
@@ -264,4 +274,4 @@ def run(concurrency=runtime.CONCURRENCY):
         message=(reason+'。' if reason else '')+f'全链路测速完成：{good}/{len(results)} 条获得有效延迟；'+('当前链路未改变。' if unchanged else '检测到外部链路变化。')+'已清理临时测试进程。'
         running=[]
         publish(len(results),'',message)
-        return message,record,(nodes,exit_node,dns_policy)
+        return message,record,(nodes,exit_node,expected,dns_policy)

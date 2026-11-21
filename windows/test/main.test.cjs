@@ -18,3 +18,40 @@ test('dynamic scheduler replaces its previous timer and skips while the UI is bu
  vm.runInContext('uiActive=false',context);await intervals[1].fn();assert.deepEqual(calls,[['chain',true]]);assert.equal(notifications[0][0],'automatic');
  vm.runInContext('backend.settings.hourly=false;scheduleAuto()',context);assert.deepEqual(cleared,[1,2]);assert.equal(intervals.length,2);
 });
+
+test('every renderer action crosses the real preload allowlist and has a main IPC handler', async () => {
+ const renderer=fs.readFileSync(require.resolve('../renderer.js'),'utf8')
+  .replace('function call(a,d)', 'function invokeAction(a,d)').replace('window.linkbox.call(a,d)', 'bridge(a,d)');
+ const calls=[...renderer.matchAll(/(?:window\.linkbox\.call|(?<![.\w])call)\(\s*([^,()]+)\s*(?=[,)])/g)].map(match=>match[1].trim());
+ assert.ok(calls.length>0);
+ assert.ok(calls.every(arg=>/^'\w+'$/.test(arg)), 'Renderer actions must be statically enumerable');
+ const actions=new Set(calls.map(arg=>arg.slice(1,-1)));
+ assert.ok(actions.has('benchmarkSettings'));
+ const webContents={mainFrame:{}};
+ let mainHandler, bridge;
+ const electron={
+  app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},
+  ipcMain:{handle(_channel,callback){mainHandler=callback;}},
+  ipcRenderer:{invoke(channel,action,data){
+   assert.equal(channel,'linkbox');
+   return mainHandler({sender:webContents,senderFrame:webContents.mainFrame},action,data);
+  }},
+  contextBridge:{exposeInMainWorld(_name,value){bridge=value;}},
+  clipboard:{writeText(){}},dialog:{showSaveDialog:async()=>({canceled:true}),showOpenDialog:async()=>({canceled:true})},
+  shell:{openExternal:async()=>{},openPath:async()=>{}},
+ };
+ const stub=async()=>({});
+ const backend={settings:{hourly:false},state:stub,ipInfo:stub,switchNode:stub,benchmark:stub,cancel:stub,
+  updateSubscriptions:stub,networkCheck:stub,saveSettings:stub};
+ const context=vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?
+  {catalog:stub,run:stub,remove:stub}:name==='./backend.cjs'?{safeError:e=>e.message,benchmarkSettings:()=>({})}:require(name),
+  process:{argv:[],platform:'darwin'},__dirname,backendStub:backend,webContents,clearInterval});
+ vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),context);
+ vm.runInContext('backend=backendStub;win={webContents};coffee=async()=>({})',context);
+ vm.runInContext(fs.readFileSync(require.resolve('../preload.cjs'),'utf8'),context);
+ const payloads={copyIP:{ip:'203.0.113.10'},switch:{name:'selected',previous:'current'},settings:{hourly:false},downloadReport:{},saveSelection:{}};
+ for(const action of actions){
+  const response=await bridge.call(action,payloads[action]);
+  assert.equal(response.ok,true,`${action}: ${response.error||''}`);
+ }
+});

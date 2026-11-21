@@ -1,8 +1,9 @@
-"""Refresh local subscription sources while retaining the selected live entrance."""
+"""Validate and apply a subscription reconciliation plan."""
 import copy,datetime,fcntl,json,os,re,subprocess,tempfile,urllib.request,urllib.parse
 from pathlib import Path
 import yaml
 import runtime
+from reconcile import selection_owners
 import toolbox as t
 import chain_test as c
 
@@ -33,97 +34,249 @@ def fetch(url):
         for n in doc['proxies']:
             if not isinstance(n,dict) or not all(n.get(k) for k in ['name','type','server','port']) or n['name'] in names:raise ValueError()
             names.add(n['name'])
-        return doc
+        return {**doc, 'proxies': [n for n in doc['proxies'] if n['name'] not in (t.ENTRY, t.EXIT, 'DIRECT', 'REJECT') and not NOTICE.search(n['name'])]}
     except Exception:raise RuntimeError('订阅下载或解析失败；未改动当前配置') from None
 
-def run(prepared=None, selection=None, sources_override=None, verify=None, additional_updates=None, verge_sync=False):
-    os.umask(0o077)
-    with open(t.BASE/'latency.lock','a') as lock:
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:raise RuntimeError('已有测速或订阅更新正在运行')
-        if verify:verify()
-        before,_=c.active_state()
-        if before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链路不符，未修改')
-        path=c.CONFIG_DIR/'clash-verge.yaml';original_config=path.read_bytes();conf=yaml.safe_load(original_config)
-        registry=runtime.read_json('subscriptions.json').get('sources',[]) if sources_override is None else sources_override
-        policy=runtime.read_json('node-policy.json')
-        selected=selection if selection is not None else policy.get('selected_nodes')
-        blocked={x.lower() for x in policy.get('blocked_providers',[])}
-        if not registry and sources_override is None:
-            registry=[{'name':name,'url':p.get('url')} for name,p in conf.get('proxy-providers',{}).items() if p.get('type')=='http']
-        sources=[x for x in registry if selected is not None or x.get('name','').lower() not in blocked]
-        if not sources and selected is None:raise RuntimeError('没有可更新的订阅；请按 README 设置本机 subscriptions.json')
-        if len({x['name'] for x in sources})!=len(sources):raise RuntimeError('订阅名称重复')
-        old_nodes,_=c.load_nodes();pin=copy.deepcopy(old_nodes.get(before['entry']))
-        if not pin:raise RuntimeError('无法保留当前入口；未修改')
-        updates=dict(additional_updates or {});definitions={};mapping={};dns={};excluded=policy.get('excluded_nodes',{})
-        for source in sources:
-            name=source['name']
-            if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}',name):raise RuntimeError('订阅名称请使用英文字母、数字或短横线')
-            doc=prepared[name] if prepared and name in prepared else fetch(source['url'])
-            cache=c.CONFIG_DIR/'providers/linkbox'/(name+'.yaml')
-            updates[cache]=dump(doc)
-            bad=([pin['name']] if selected is not None else list(excluded.get(name,[]))+list(excluded.get('*',[]))+[pin['name']])
-            pattern=NOTICE.pattern+'|'+('|'.join('^'+re.escape(n)+'$' for n in bad))
-            definitions[name]={'type':'http','url':source['url'],'path':str(cache),'interval':86400,'health-check':{'enable':False},'exclude-filter':pattern}
-            if selected is not None:
-                keep=selected.get(name,[])
-                definitions[name]['filter']='(?:'+'|'.join('^'+re.escape(n)+'$' for n in keep)+')' if keep else '^$'
-            for n in doc['proxies']:
-                if selected is None or n['name'] in selected.get(name,[]):mapping[n['name']]=name
-            for k,v in doc.get('dns',{}).get('nameserver-policy',{}).items():
-                if not k.startswith(('geosite:','rule-set:')):dns[k]=v
-        managed={'providers':definitions,'pin':pin,'dns':dns}
-        updated=copy.deepcopy(conf);updated.setdefault('proxy-providers',{}).update(definitions)
-        updated['proxies']=[n for n in updated.get('proxies',[]) if n['name']!=pin['name']]+[pin]
-        group=next((g for g in updated.get('proxy-groups',[]) if g['name']==t.ENTRY),None)
-        if group is None:raise RuntimeError('缺少中转入口组')
-        group['proxies']=[pin['name']];group['use']=list(definitions)
-        for k in ['include-all','include-all-proxies','include-all-providers']:group.pop(k,None)
-        updated.setdefault('dns',{}).setdefault('nameserver-policy',{}).update(dns)
-        updated['dns'].setdefault('proxy-server-nameserver-policy',{}).update(dns)
-        # Persist the same transformation when Clash Verge regenerates its active profile.
-        script=c.CONFIG_DIR/'profiles/Script.js';existing=script.read_text() if script.exists() else 'function main(config) { return config; }'
-        wrapper='\n'+MARK+'\nconst linkboxPreviousMain=main;\nmain=function(config,profileName){const r=linkboxPreviousMain(config,profileName);const m='+json.dumps(managed,ensure_ascii=False)+';r["proxy-providers"]={...(r["proxy-providers"]||{}),...m.providers};r.proxies=(r.proxies||[]).filter(p=>p.name!==m.pin.name);r.proxies.push(m.pin);const g=(r["proxy-groups"]||[]).find(g=>g.name==="中转入口");if(g){g.proxies=[m.pin.name];g.use=Object.keys(m.providers);delete g["include-all"];delete g["include-all-proxies"];delete g["include-all-providers"];}r.dns=r.dns||{};r.dns["nameserver-policy"]={...(r.dns["nameserver-policy"]||{}),...m.dns};r.dns["proxy-server-nameserver-policy"]={...(r.dns["proxy-server-nameserver-policy"]||{}),...m.dns};return r;};\n'
-        updates[script]=(existing.split(MARK)[0].rstrip()+wrapper).encode();updates[path]=dump(updated)
-        if verge_sync:policy['verge_sync']=True
-        if selection is not None:
-            policy['selected_nodes']=selection
-            policy['provider_labels']={s['name']:s.get('display_name',s['name']) for s in registry}
-            updates[runtime.BASE/'subscriptions.json']=json.dumps({'sources':registry},ensure_ascii=False,indent=2).encode()
-        policy.setdefault('node_providers',{}).update(mapping);policy['pinned_entry']=pin['name'];updates[runtime.BASE/'node-policy.json']=json.dumps(policy,ensure_ascii=False,indent=2).encode()
-        originals={p:p.read_bytes() if p.exists() else None for p in updates}
-        # Validation uses isolated copies of provider caches; no live files are changed.
-        with tempfile.TemporaryDirectory(prefix='linkbox-update-',dir=c.CONFIG_DIR) as folder:
-            folder=Path(folder);check=copy.deepcopy(updated)
-            for i,(name,definition) in enumerate(definitions.items()):
-                q=folder/(str(i)+'.yaml');q.write_bytes(updates[Path(definition['path'])]);check['proxy-providers'][name]={**definition,'type':'file','path':str(q)};check['proxy-providers'][name].pop('url',None)
-            f=folder/'config.yaml';f.write_bytes(dump(check))
-            result=subprocess.run([c.CORE,'-t','-d',str(c.CONFIG_DIR),'-f',str(f)],capture_output=True,timeout=30)
-            if result.returncode:raise RuntimeError('配置校验失败；未改动当前代理')
-        if verify:verify()
-        if c.active_state()[0]!=before or any((p.read_bytes() if p.exists() else None)!=data for p,data in originals.items()):raise RuntimeError('配置或节点已被其他操作改变，已取消更新')
-        backup=runtime.BASE/'backups'/('update-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'));backup.mkdir(parents=True)
-        for i,(p,data) in enumerate(originals.items()):
-            if data is not None:(backup/(str(i)+'-'+p.name)).write_bytes(data)
-        written=[]
+
+NO_SELECTION = '订阅里已没有你勾选的节点，请先在管理节点里勾选'
+EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新'
+POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash'
+
+
+def read(path):
+    return path.read_bytes() if path.exists() else None
+
+
+def transform(config, managed):
+    updated = copy.deepcopy(config)
+    providers = updated.get('proxy-providers', {})
+    updated['proxy-providers'] = {name: definition for name, definition in providers.items()
+                                  if name not in managed['retired']}
+    updated['proxy-providers'].update(managed['providers'])
+    updated['proxies'] = [n for n in updated.get('proxies', []) if n['name'] not in managed['replace']]
+    group = next((g for g in updated.get('proxy-groups', []) if g['name'] == t.ENTRY), None)
+    if group is None:
+        raise RuntimeError('缺少中转入口组')
+    group['proxies'] = []
+    group['use'] = list(managed['providers'])
+    for key in ('include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type'):
+        group.pop(key, None)
+    for key in ('nameserver-policy', 'proxy-server-nameserver-policy'):
+        updated.setdefault('dns', {}).setdefault(key, {}).update(managed['dns'])
+    return updated
+
+
+def script_text(original, managed):
+    base = original.decode() if original else 'function main(config) { return config; }'
+    return (base.split(MARK)[0].rstrip() + '\n' + MARK + '\n'
+            'const linkboxPreviousMain=main;\n'
+            'main=function(config,profileName){\n'
+            '  const r=linkboxPreviousMain(config,profileName);\n'
+            f'  const m={json.dumps(managed, ensure_ascii=False)};\n'
+            '  const providers=r["proxy-providers"]||{};\n'
+            '  for(const name of m.retired)delete providers[name];\n'
+            '  r["proxy-providers"]={...providers,...m.providers};\n'
+            '  r.proxies=(r.proxies||[]).filter(p=>!m.replace.includes(p.name));\n'
+            '  const g=(r["proxy-groups"]||[]).find(g=>g.name==="中转入口");\n'
+            '  if(g){g.proxies=[];g.use=Object.keys(m.providers);\n'
+            '    for(const k of ["include-all","include-all-proxies","include-all-providers","filter","exclude-filter","exclude-type"])delete g[k];}\n'
+            '  r.dns=r.dns||{};\n'
+            '  for(const k of ["nameserver-policy","proxy-server-nameserver-policy"])r.dns[k]={...(r.dns[k]||{}),...m.dns};\n'
+            '  return r;\n'
+            '};\n').encode()
+
+
+def update_selector(index, name):
+    profile = next((item for item in index.get('items', [])
+                    if index.get('current') and item.get('uid') == index['current']), None)
+    if profile is None:
+        return False
+    choices = profile.setdefault('selected', [])
+    choice = next((item for item in choices if item.get('name') == t.ENTRY), None)
+    if choice is None:
+        choices.append({'name': t.ENTRY, 'now': name})
+    elif choice.get('now') != name:
+        choice['now'] = name
+    else:
+        return False
+    return True
+
+
+def select_after_reload(before, plan):
+    after = t.relay_state()
+    desired = plan['entry']
+    names = {row['name'] for row in plan['candidates']}
+    expected = {**before, 'entry': desired}
+    expected.pop('live')
+    def matches(state):
+        return (len(state['live']) == len(names) and set(state['live']) == names
+                and all(state[k] == v for k, v in expected.items()))
+    if matches(after):
+        return
+    # A reload can fall back to the first member when the previous entry disappears.
+    if not after['live'] or after['entry'] not in (before['entry'], after['live'][0]) or not matches({**after, 'entry': desired}):
+        raise RuntimeError(POST_RELOAD_CHANGE)
+    t.api('PUT', '/proxies/' + urllib.parse.quote(t.ENTRY, safe=''), {'name': desired})
+    if not matches(t.relay_state()):
+        raise RuntimeError('切换后的状态待核对，请刷新 Clash 状态')
+
+
+def benchmark_results():
+    chain = runtime.read_json('chain-results.json')
+    entrance = runtime.read_json('latency-results.json')
+    recent = chain
+    if entrance.get('finished_at'):
         try:
-            for p,data in updates.items():atomic(p,data);written.append(p)
-            # Service-mode cores cannot read user-owned paths. Inline provider
-            # snapshots for this reload; persistent HTTP definitions stay on disk.
-            live=copy.deepcopy(updated)
-            for name,definition in live.get('proxy-providers',{}).items():
-                source_path=definition.get('path')
-                if source_path:
-                    q=Path(source_path);q=q if q.is_absolute() else c.CONFIG_DIR/q
-                    doc=yaml.safe_load(q.read_bytes())
-                    definition.pop('path',None);definition.pop('url',None)
-                    definition['type']='inline';definition['payload']=compact(doc['proxies'])
-            t.api('PUT','/configs?force=false',{'payload':dump(live).decode()})
+            if not chain.get('finished_at') or datetime.datetime.fromisoformat(
+                    entrance['finished_at']) > datetime.datetime.fromisoformat(chain['finished_at']):
+                recent = entrance
+        except (TypeError, ValueError):
+            pass
+    if recent.get('reason') or recent.get('selection_unchanged') is False:
+        return {}
+    return {name: {'chain': row.get('chain_delay'), 'entrance': row.get('delay'), 'owner': row.get('owner')}
+            for name, row in recent.get('results', {}).items()}
+
+
+def run(metric='chain', *, request=None, removal=None, initialize=False):
+    import subscription_picker as picker
+    os.umask(0o077)
+    with open(t.BASE / 'latency.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('已有测速或订阅更新正在运行') from None
+        policy = runtime.read_json('node-policy.json')
+        selection = policy.get('selected_nodes')
+        if initialize and selection is not None:
+            return False
+        before = t.relay_state()
+        if before['mode'] != 'global' or before['exit'] != t.EXIT or before['dialer'] != t.ENTRY:
+            raise RuntimeError('当前链路不符，未修改')
+        syncing = request is None and removal is None
+        root = runtime.CONFIG_DIR
+        config_file, script, profiles = root / 'clash-verge.yaml', root / 'profiles/Script.js', root / 'profiles.yaml'
+        policy_file = runtime.BASE / 'node-policy.json'
+        baselines = {path: read(path) for path in (config_file, script, profiles, policy_file)}
+        sources, fingerprint = picker.discover(for_update=syncing)
+        if request is not None:
+            selection = picker.validate_selection(sources, fingerprint, request)
+            if request['current'] != before['entry']:
+                raise RuntimeError(EXTERNAL_CHANGE)
+        if removal is not None:
+            names = removal.get('names')
+            if (not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names)
+                    or removal.get('entry') != before['entry'] or before['entry'] in names
+                    or not set(names) <= selection_owners(selection).keys()):
+                raise RuntimeError('节点已变化；当前节点不能移除')
+            selection = {owner: [n for n in items if n not in names] for owner, items in selection.items()}
+        updates = {}
+        if syncing:
+            sources = [(source, fetch(source['url'])) for source, _ in sources]
+            updates.update({root / 'profiles' / source['profile_file']: dump(doc) for source, doc in sources})
+            if t.relay_state() != before:
+                raise RuntimeError(EXTERNAL_CHANGE)
+        plan = picker.plan(sources, selection, before, metric, benchmark_results())
+        if not plan['candidates']:
+            if initialize:
+                return False
+            raise RuntimeError(NO_SELECTION)
+
+        config = yaml.safe_load(baselines[config_file])
+        exit_node = next((n for n in config.get('proxies', []) if n['name'] == t.EXIT), {})
+        if exit_node.get('dialer-proxy') != t.ENTRY:
+            raise RuntimeError('固定出口的链式上游已变化，未修改')
+        retired = [name for name, definition in config.get('proxy-providers', {}).items()
+                   if definition.get('path') and root / definition['path'] == root / 'providers/linkbox' / (name + '.yaml')]
+        replacement = [row['name'] for row in plan['candidates']]
+        # Remove the static copy written by releases that used a pin.
+        if policy.get('pinned_entry') and MARK.encode() in (baselines[script] or b''):
+            replacement.append(policy['pinned_entry'])
+        definitions, dns, selected_docs = {}, {}, {}
+        for source, doc in sources:
+            owner = source['name']
+            keep = plan['selection'].get(owner)
+            if not keep:
+                continue
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}', owner):
+                raise RuntimeError('订阅标识需使用字母、数字或短横线')
+            cache = root / 'providers/linkbox' / (owner + '.yaml')
+            updates[cache] = dump(doc)
+            pattern = '|'.join('^' + re.sub(r'([.\x2a+?^${}()|\[\]\\])', r'\\\1', name) + '$' for name in keep)
+            definitions[owner] = {'type': 'http', 'url': source['url'], 'path': str(cache), 'interval': 86400,
+                                  'health-check': {'enable': False}, 'filter': pattern}
+            selected_docs[owner] = [n for n in doc['proxies'] if n['name'] in keep]
+            dns.update({k: v for k, v in ((doc.get('dns') or {}).get('nameserver-policy') or {}).items()
+                        if not k.startswith(('geosite:', 'rule-set:'))})
+        managed = {'providers': definitions, 'replace': replacement, 'retired': retired, 'dns': dns}
+        updated = transform(config, managed)
+        updates[script] = script_text(baselines[script], managed)
+        updates[config_file] = dump(updated)
+        index = yaml.safe_load(baselines[profiles])
+        if update_selector(index, plan['entry']):
+            updates[profiles] = dump(index)
+        registry = [s for s, _ in sources]
+        saved = {'selected_nodes': plan['selection'],
+                 'provider_labels': {s['name']: s['display_name'] for s in registry}}
+        updates[policy_file] = json.dumps(saved, ensure_ascii=False, indent=2).encode()
+        updates[runtime.BASE / 'subscriptions.json'] = json.dumps({'sources': registry}, ensure_ascii=False, indent=2).encode()
+        originals = {path: baselines[path] if path in baselines else read(path) for path in updates}
+
+        # The service reload uses inline snapshots because it cannot read user-owned paths.
+        live = copy.deepcopy(updated)
+        for name, definition in live['proxy-providers'].items():
+            source_path = definition.get('path')
+            if not source_path:
+                continue
+            payload = selected_docs.get(name)
+            if payload is None:
+                data = yaml.safe_load((root / source_path).read_bytes())
+                payload = data.get('proxies')
+                if not isinstance(payload, list):
+                    raise RuntimeError('代理缓存不完整，未修改')
+            definition.pop('path')
+            definition.pop('url', None)
+            definition.update(type='inline', payload=compact(payload))
+        try:
+            with tempfile.TemporaryDirectory(prefix='linkbox-update-', dir=root) as folder:
+                file = Path(folder) / 'config.yaml'
+                file.write_bytes(dump(live))
+                subprocess.run([c.CORE, '-t', '-d', str(root), '-f', str(file)],
+                               capture_output=True, timeout=30, check=True)
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError('配置校验失败，未改动当前代理') from None
+        if (picker.discover(for_update=syncing)[1] != fingerprint or t.relay_state() != before
+                or any(read(p) != raw for p, raw in (originals | baselines).items())):
+            raise RuntimeError(EXTERNAL_CHANGE)
+
+        backup = runtime.BASE / 'backups' / ('update-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+        backup.mkdir(parents=True)
+        for i, (path, raw) in enumerate(originals.items()):
+            if raw is not None and path != policy_file:
+                (backup / (str(i) + '-' + path.name)).write_bytes(raw)
+        written = []
+        try:
+            for path, data in updates.items():
+                atomic(path, data)
+                written.append(path)
         except Exception:
-            for p in reversed(written):
-                if originals[p] is None:p.unlink(missing_ok=True)
-                else:atomic(p,originals[p])
-            raise RuntimeError('更新未确认；文件已回退，请刷新状态核对。未切换节点或关闭连接。') from None
-        if c.active_state()[0]!=before:raise RuntimeError('更新后检测到外部选择变化，请核对；未继续修改')
-        return {'message': '已同步 Clash Verge：失效节点已移除，新增节点请在管理节点中勾选；当前入口保留。' if verge_sync else '已更新 '+ '、'.join(definitions)+'；筛选规则和当前节点保持不变。'}
+            rollback(written, originals)
+            raise
+        try:
+            t.api('PUT', '/configs?force=false', {'payload': dump(live).decode()})
+        except Exception:
+            rollback(written, originals)
+            raise RuntimeError('更新未确认；文件已回退，请刷新状态核对') from None
+        select_after_reload(before, plan)
+        if initialize:
+            return True
+        message = '已同步 Clash Verge 订阅。' if syncing else '已保存节点选择。'
+        return {'message': message}
+
+
+def rollback(written, originals):
+    for path in reversed(written):
+        if originals[path] is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic(path, originals[path])

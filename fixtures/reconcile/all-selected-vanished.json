@@ -1,0 +1,35 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "new"
+        ]
+      }
+    ],
+    "selection": {
+      "a": [
+        "gone"
+      ],
+      "b": [
+        "deleted"
+      ]
+    },
+    "live": [
+      "gone"
+    ],
+    "current": "gone",
+    "metric": "chain",
+    "results": {
+      "new": {
+        "chain": 1
+      }
+    }
+  },
+  "expected": {
+    "selection": {},
+    "candidates": [],
+    "entry": null
+  }
+}

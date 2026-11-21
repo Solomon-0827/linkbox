@@ -1,0 +1,50 @@
+{
+  "inputs": {
+    "sources": [
+      {
+        "id": "a",
+        "nodes": [
+          "selected",
+          "outside",
+          "current"
+        ]
+      }
+    ],
+    "selection": {
+      "a": [
+        "current",
+        "selected"
+      ]
+    },
+    "live": [
+      "current",
+      "outside"
+    ],
+    "current": "current",
+    "metric": "chain",
+    "results": {
+      "selected": {
+        "chain": 1
+      }
+    }
+  },
+  "expected": {
+    "selection": {
+      "a": [
+        "selected",
+        "current"
+      ]
+    },
+    "candidates": [
+      {
+        "name": "selected",
+        "owner": "a"
+      },
+      {
+        "name": "current",
+        "owner": "a"
+      }
+    ],
+    "entry": "current"
+  }
+}

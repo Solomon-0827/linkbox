@@ -14,7 +14,7 @@ function renderRows(){if(!state)return;const q=$('#search').value.trim().toLower
  const testingNode=running&&progress.active?.includes(n.name),pending=running&&!progress.results?.[n.name]&&!testingNode,phase=testingNode?'testing':pending?'pending':n.status||'pending';const status=document.createElement('td'),pill=document.createElement('span');status.className='status-cell';pill.className='state '+phase;pill.textContent=phase==='testing'?'检测中':phase==='done'?'已完成':phase==='failed'?'未连通':'待检测';status.append(pill);tr.append(rank,name,provider,cell(n.entranceDelay),cell(n.chainDelay??(n.kind==='chain'?n.delay:null),true),status);tr.ondblclick=()=>{if(!editing)switchNode(n.name)};tr.onkeydown=e=>{if(e.key==='Enter'&&!editing)switchNode(n.name)};fragment.append(tr);}
  $('#nodeRows').replaceChildren(fragment);$('#empty').hidden=nodes.length>0;$('#chain').classList.toggle('spinning',!!running);$('#chain').title=running?'停止本轮测速':'全链路测速（含入口延迟）';$('#chain').setAttribute('aria-label',running?'停止本轮测速':'全链路测速');$('#chain').disabled=editing;$('#update').disabled=running||editing||updating;$('#manage').disabled=running||editing;$('#edit').disabled=running;renderFooter();}
 function renderFooter(){text('#testCount',progress.running?`· ${progress.completed||0}/${progress.total||0} · 全链路`:`· ${state?.nodes.length||0} 个节点 · 全链路`);$('#mode').hidden=editing;$('#deleteNodes').hidden=!editing;$('#deleteNodes').disabled=!selected.size;text('#deleteNodes',`移除所选${selected.size?'（'+selected.size+'）':''}`)}
-async function refresh(skipInfo=false,generation=null){try{const old=state?.entry,next=await call('state');if(generation!==null&&generation!==refreshGeneration)return false;state=next;progress=state.progress||{};render();if(!skipInfo&&old&&old!==state.entry)refreshInfo();return true}catch(e){text('#connection','未连接 Clash');$('#settingsButton').classList.add('off');text('#relay','请先启动 Clash Verge');say(e.message);return false}}
+async function refresh(skipInfo=false,generation=null){try{const old=state?.entry,next=await call('state');if(generation!==null&&generation!==refreshGeneration)return false;state=next;progress=state.progress||{};render();if(state.selectionError&&!old)say(state.selectionError);if(!skipInfo&&old&&old!==state.entry)refreshInfo();return true}catch(e){text('#connection','未连接 Clash');$('#settingsButton').classList.add('off');text('#relay','请先启动 Clash Verge');say(e.message);return false}}
 async function refreshInfo(generation=++refreshGeneration){if(generation!==refreshGeneration)return;$('#refresh').classList.add('spinning');await Promise.allSettled([
  call('ip').then(v=>{if(generation!==refreshGeneration)return;text('#exitIP',v.ip);text('#geo',[v.country,v.region,v.city].filter(Boolean).join(' / '));text('#isp',`AS${v.asn||'—'} · ${v.isp||'—'}`);if(v.ip!==E)say('出口不是预期美国静态家宽，请核对 GLOBAL 选择。')}).catch(e=>{if(generation===refreshGeneration){text('#exitIP','未验证');text('#geo',e.message)}}),
  call('coffee').then(v=>{if(generation!==refreshGeneration)return;const same=v.ip===E;text('#score',v.score&&same?v.score+' / 100':'未验证');text('#property',Object.entries(v.props||{}).find(([k])=>/类型|属性|usage|type/i.test(k))?.[1]||'类型待验证');const verdict=rows=>Object.entries(rows||{}).find(([k,v])=>/泄漏|泄露|结论|状态|结果/.test(k)&&v)?.[1]||'未验证';text('#dnsResult','DNS · '+verdict(v.dns));text('#udpResult','UDP · '+verdict(v.udp));text('#scoreNote',same?'Net.Coffee':'出口未匹配');text('#updatedTime',new Date(v.time).toLocaleTimeString('zh-CN',{hour12:false}));text('#updatedNote',same?'检测已完成':'待核对出口')}).catch(()=>{if(generation===refreshGeneration){text('#score','未验证');text('#property','暂未取得');text('#updatedNote','Net.Coffee 暂不可用')}})
@@ -66,10 +66,15 @@ $('#autoSettingsForm').onsubmit=async event=>{
 };
 function renderProviders(){const names=['all',...new Set(state.nodes.map(n=>n.provider))];if(!names.includes(filter))filter='all';$('.segments').replaceChildren(...names.map(name=>{const b=document.createElement('button');b.textContent=name==='all'?'全部':name;b.className=name===filter?'selected':'';b.onclick=()=>{filter=name;renderProviders();renderRows()};return b}))}
 $('#settingsButton').onclick=()=>{$('#settings').showModal();activity()};document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$('#'+b.dataset.close).close());document.querySelectorAll('dialog').forEach(d=>d.addEventListener('close',activity));
-for(const [id,action]of [['chooseCore','chooseCore'],['chooseConfig','chooseConfig'],['coffeeSource','source'],['importFolder','importFolder'],['choosePolicy','choosePolicy']])$('#'+id).onclick=async()=>{try{$('#networkMenu').hidden=true;await call(action);if(id.startsWith('choose'))await refresh()}catch(e){say(e.message)}};
+for (const [id, action] of Object.entries({
+ chooseCore: () => call('chooseCore'), chooseConfig: () => call('chooseConfig'),
+ coffeeSource: () => call('source'), importFolder: () => call('importFolder'),
+})) {
+ $('#'+id).onclick=async()=>{try{$('#networkMenu').hidden=true;await action();if(id.startsWith('choose'))await refresh()}catch(e){say(e.message)}};
+}
 $('#networkMenuButton').onclick=()=>{$('#networkMenu').hidden=!$('#networkMenu').hidden};document.addEventListener('click',e=>{if(!e.target.closest('.network-menu'))$('#networkMenu').hidden=true});document.addEventListener('keydown',e=>{if(e.key==='Escape')$('#networkMenu').hidden=true});$('#search').oninput=renderRows;
 $('#edit').onclick=()=>{editing=!editing;selected.clear();setIcon($('#edit'),editing?'check':'settings');$('#edit').title=editing?'完成编辑':'编辑节点列表';$('#edit').setAttribute('aria-label',$('#edit').title);activity();renderRows()};
-$('#deleteNodes').onclick=async()=>{try{const r=await call('removeNodes',{names:[...selected]});selected.clear();say(r.message);await refresh()}catch(e){say(e.message)}};
+$('#deleteNodes').onclick=async()=>{try{const r=await call('removeNodes',{names:[...selected],entry:state.entry});selected.clear();say(r.message);await refresh()}catch(e){say(e.message)}};
 function setPickerBusy(value){
  pickerBusy=value;
  $('#picker .picker-columns').inert=value;
@@ -78,18 +83,27 @@ function setPickerBusy(value){
  }
  $('#saveSelection').disabled=value||!pickerCatalogCurrent||!pickerData?.sources.length;
 }
+function choosePickerNode(sources, node) {
+ for (const other of sources.flatMap(source => source.nodes)) {
+  if (other.name === node.name) other.selected = other === node;
+ }
+}
 async function loadPicker(){
  const fresh=await call('catalog');
  const changes=new Map((pickerData?.sources||[]).map(source=>[
-  source.id,new Map(source.nodes.filter(node=>!node.current&&node.selected!==node.initialSelected)
+  source.id,new Map(source.nodes.filter(node=>node.selected!==node.initialSelected)
       .map(node=>[node.name,node.selected]))
  ]));
+ const explicit=[];
  for(const source of fresh.sources){
   for(const node of source.nodes){
    node.initialSelected=node.selected;
-   if(!node.current)node.selected=changes.get(source.id)?.get(node.name)??node.selected;
+   const changed=changes.get(source.id)?.get(node.name);
+   if(changed===false)node.selected=false;
+   if(changed===true)explicit.push(node);
   }
  }
+ for(const node of explicit)choosePickerNode(fresh.sources,node);
  pickerData=fresh;
  if(!fresh.sources.some(source=>source.id===pickerSource))pickerSource=fresh.sources[0]?.id||'';
  pickerCatalogCurrent=true;
@@ -116,9 +130,52 @@ $('#manage').onclick=async()=>{
   setPickerBusy(false);
  }
 };
-function renderPicker(){if(!pickerData)return;const all=pickerData.sources.flatMap(s=>s.nodes),chosen=all.filter(n=>n.selected||n.current).length;text('#selectionCount',`已选 ${chosen} / ${all.length} 个节点`);$('#sources').replaceChildren(...pickerData.sources.map(s=>{const b=document.createElement('button'),name=document.createElement('span'),count=document.createElement('small');name.textContent=s.name;count.textContent=s.nodes.filter(n=>n.selected||n.current).length+'/'+s.nodes.length;b.append(name,count);b.className=s.id===pickerSource?'active':'';b.onclick=()=>{pickerSource=s.id;renderPicker()};return b}));const s=pickerData.sources.find(x=>x.id===pickerSource),nodes=s?.nodes||[],checked=nodes.filter(n=>n.selected||n.current).length;$('#groupAll').checked=nodes.length>0&&checked===nodes.length;$('#groupAll').indeterminate=checked>0&&checked<nodes.length;$('#groupAll').disabled=!nodes.length; text('#groupCount',checked+' / '+nodes.length);$('#sourceNodes').replaceChildren(...nodes.map(n=>{const row=document.createElement('label'),c=document.createElement('input'),name=document.createElement('span'),note=document.createElement('small');row.className='source-node';c.type='checkbox';c.checked=n.selected||n.current;c.disabled=n.current;c.onchange=()=>{n.selected=c.checked;renderPicker()};name.textContent=n.name;note.textContent=n.current?'当前连接':n.type;row.append(c,name,note);return row}));if(s?.warning){const p=document.createElement('p');p.className='empty';p.textContent=s.warning;$('#sourceNodes').append(p)}}
-$('#groupAll').onchange=()=>{for(const n of pickerData?.sources.find(s=>s.id===pickerSource)?.nodes||[])if(!n.current)n.selected=$('#groupAll').checked;renderPicker()};for(const [id,value]of [['selectAll',true],['clearAll',false]])$('#'+id).onclick=()=>{for(const n of pickerData?.sources.flatMap(s=>s.nodes)||[])if(!n.current)n.selected=value;renderPicker()};
-$('#saveSelection').onclick=async()=>{if(pickerSaving||pickerBusy||!pickerCatalogCurrent||!pickerData)return;pickerSaving=true;setPickerBusy(true);try{const r=await call('saveSelection',{fingerprint:pickerData.fingerprint,selected:Object.fromEntries(pickerData.sources.map(s=>[s.id,s.nodes.filter(n=>n.selected||n.current).map(n=>n.name)]))});$('#picker').close();say(r.message);await refresh()}catch(e){text('#pickerNotice',e.message)}finally{pickerSaving=false;setPickerBusy(false)}};
+function renderPicker(){
+ if(!pickerData)return;
+ const all=pickerData.sources.flatMap(s=>s.nodes);
+ const counts=new Map();
+ for(const n of all)counts.set(n.name,(counts.get(n.name)||0)+1);
+ const chosen=all.filter(n=>n.selected).length;
+ text('#selectionCount',`已选 ${chosen} / ${all.length} 个节点`);
+ $('#sources').replaceChildren(...pickerData.sources.map(s=>{
+  const b=document.createElement('button'),name=document.createElement('span'),count=document.createElement('small');
+  name.textContent=s.name;count.textContent=s.nodes.filter(n=>n.selected).length+'/'+s.nodes.length;
+  b.append(name,count);b.className=s.id===pickerSource?'active':'';
+  b.onclick=()=>{pickerSource=s.id;renderPicker()};return b;
+ }));
+ const s=pickerData.sources.find(x=>x.id===pickerSource),nodes=s?.nodes||[],checked=nodes.filter(n=>n.selected).length;
+ $('#groupAll').checked=nodes.length>0&&checked===nodes.length;$('#groupAll').indeterminate=checked>0&&checked<nodes.length;
+ $('#groupAll').disabled=!nodes.length;text('#groupCount',checked+' / '+nodes.length);
+ $('#sourceNodes').replaceChildren(...nodes.map(n=>{
+  const row=document.createElement('label'),c=document.createElement('input'),name=document.createElement('span'),note=document.createElement('small');
+  row.className='source-node';c.type='checkbox';c.checked=n.selected;
+  c.onchange=()=>{if(c.checked)choosePickerNode(pickerData.sources,n);else n.selected=false;renderPicker()};
+  name.textContent=n.name;
+  note.textContent=[n.current?'当前入口':n.type,counts.get(n.name)>1?'另一订阅有同名节点':''].filter(Boolean).join(' · ');
+  row.append(c,name,note);return row;
+ }));
+ if(s?.warning){const p=document.createElement('p');p.className='empty';p.textContent=s.warning;$('#sourceNodes').append(p)}
+}
+$('#groupAll').onchange=()=>{
+ for(const node of pickerData?.sources.find(s=>s.id===pickerSource)?.nodes||[]){
+  if($('#groupAll').checked)choosePickerNode(pickerData.sources,node);
+  else node.selected=false;
+ }
+ renderPicker();
+};
+$('#selectAll').onclick=()=>{
+ const all=pickerData?.sources.flatMap(s=>s.nodes)||[];
+ const names=new Set(all.filter(n=>n.selected).map(n=>n.name));
+ for(const node of all){
+  if(!names.has(node.name)){node.selected=true;names.add(node.name);}
+ }
+ renderPicker();
+};
+$('#clearAll').onclick=()=>{
+ for(const node of pickerData?.sources.flatMap(s=>s.nodes)||[])node.selected=false;
+ renderPicker();
+};
+$('#saveSelection').onclick=async()=>{if(pickerSaving||pickerBusy||!pickerCatalogCurrent||!pickerData)return;pickerSaving=true;setPickerBusy(true);try{const r=await call('saveSelection',{fingerprint:pickerData.fingerprint,current:pickerData.current,selected:Object.fromEntries(pickerData.sources.map(s=>[s.id,s.nodes.filter(n=>n.selected).map(n=>n.name)]))});$('#picker').close();say(r.message);await refresh()}catch(e){text('#pickerNotice',e.message)}finally{pickerSaving=false;setPickerBusy(false)}};
 window.linkbox.onProgress(v=>{const finished=progress.running&&!v.running;progress=v;renderRows();if(finished){$('#tableWrap').scrollTop=0;refresh()}});window.linkbox.onAutomatic(async v=>{if(v.error){await refresh();say('自动测速：'+v.error)}else{await refresh();if(v.switchedTo){say('已自动切换至 '+v.switchedTo);refreshInfo();}}});
 async function fetchIP(url,trace=false){const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),10000);try{const r=await fetch(url,{signal:ac.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const raw=await r.text();let ip=trace?raw.split('\n').find(x=>x.startsWith('ip='))?.slice(3):JSON.parse(raw).ip;if(!ip)throw Error('未返回地址');return {ip};}catch(e){return {error:e.name==='AbortError'?'请求超时':'浏览器请求失败或跨域限制'}}finally{clearTimeout(timer)}}
 function rtc(){return new Promise(resolve=>{let pc,timer,done=false;const ips=new Set();const end=error=>{if(done)return;done=true;clearTimeout(timer);pc?.close();resolve({ips:[...ips],error});};try{pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]});timer=setTimeout(()=>end('采样结束'),10000);pc.onicecandidate=e=>{if(!e.candidate){end();return;}const ip=e.candidate.address||e.candidate.candidate.split(' ')[4];if(!ip||ip.endsWith('.local'))return;const v4=/^\d+\.\d+\.\d+\.\d+$/.test(ip),v6=ip.includes(':');if((v4&&!/^(10\.|127\.|0\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip))||(v6&&!/^(fe[89ab]|f[cd]|::)/i.test(ip)))ips.add(ip);};pc.createDataChannel('network-check');pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>end('未验证'));}catch{end('浏览器不支持')}})}

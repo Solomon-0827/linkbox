@@ -4,14 +4,20 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT/'dist';BUILD=ROOT/'build/macos';APP=OUT/'链路盒子.app'
 if sys.platform!='darwin':raise SystemExit('Build the Mac package on macOS.')
+resources = [ROOT/'assets/ProxyToolbox.icns', ROOT/'windows/coffee-extract.js']
+check_page = ROOT/'macos/backend/check.html'
+for resource in [*resources, check_page]:
+    if not resource.is_file():
+        raise SystemExit(f'Missing required app resource: {resource.relative_to(ROOT)}')
 OUT.mkdir(exist_ok=True);BUILD.mkdir(parents=True,exist_ok=True)
-subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--onedir','--name','linkbox-backend','--distpath',str(BUILD/'backend'),'--workpath',str(BUILD/'work'),'--specpath',str(BUILD),'--add-data',str(ROOT/'macos/backend/check.html')+':.','--collect-data','certifi','--hidden-import','subscription_update','--hidden-import','subscription_picker',str(ROOT/'macos/backend/gui_backend.py')],check=True)
+subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--onedir','--name','linkbox-backend','--distpath',str(BUILD/'backend'),'--workpath',str(BUILD/'work'),'--specpath',str(BUILD),'--add-data',str(check_page)+':.','--collect-data','certifi','--hidden-import','subscription_update','--hidden-import','subscription_picker',str(ROOT/'macos/backend/gui_backend.py')],check=True)
 if APP.exists():shutil.rmtree(APP)
 contents=APP/'Contents';(contents/'MacOS').mkdir(parents=True);(contents/'Resources').mkdir()
 shutil.copytree(BUILD/'backend/linkbox-backend',contents/'Resources/backend')
-shutil.copy2(ROOT/'assets/ProxyToolbox.icns',contents/'Resources/ProxyToolbox.icns')
+for resource in resources:
+    shutil.copy2(resource,contents/'Resources'/resource.name)
 subprocess.run(['xcrun','swiftc','-O','-target','arm64-apple-macosx13.0','-framework','AppKit','-framework','WebKit',str(ROOT/'macos/Toolbox.swift'),'-o',str(contents/'MacOS/ProxyToolbox')],check=True)
-info={'CFBundleDisplayName':'链路盒子','CFBundleExecutable':'ProxyToolbox','CFBundleIconFile':'ProxyToolbox.icns','CFBundleIdentifier':'local.solomon.proxytoolbox','CFBundleName':'链路盒子','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.2.5','CFBundleVersion':'125','LSMinimumSystemVersion':'13.0','NSHighResolutionCapable':True,'NSRequiresAquaSystemAppearance':True}
+info={'CFBundleDisplayName':'链路盒子','CFBundleExecutable':'ProxyToolbox','CFBundleIconFile':'ProxyToolbox.icns','CFBundleIdentifier':'local.solomon.proxytoolbox','CFBundleName':'链路盒子','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.3.0','CFBundleVersion':'130','LSMinimumSystemVersion':'13.0','NSHighResolutionCapable':True,'NSRequiresAquaSystemAppearance':True}
 (contents/'Info.plist').write_bytes(plistlib.dumps(info))
 shutil.copytree(ROOT/'examples',contents/'Resources/examples')
 subprocess.run(['codesign','--force','--deep','--sign','-',str(APP)],check=True)
