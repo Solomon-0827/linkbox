@@ -175,24 +175,54 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.config.write_bytes(update.dump(config))
         self.providers = {'native': {'proxies': [node('native-relay')]}}
         names = ['current', 'fast', 'native-relay']
-        for saved in (False, True):
-            with self.subTest(saved=saved):
-                if saved:
-                    self.policy.write_text(json.dumps({'selected_nodes': {'a': ['current']}}))
-                self.active.update(entry='current', live=names)
-                with self.subTest(operation='list'):
-                    self.assertEqual([row['name'] for row in gui.snapshot()['node_rows']], names)
-                with (self.subTest(operation='benchmark'),
-                    patch.object(update.c, 'CONFIG_DIR', self.root),
-                    patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
-                    patch.object(update.c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe,
-                ):
-                    _, report, _ = update.c.run(1)
-                    self.assertEqual([call.args[0]['name'] for call in probe.call_args_list], ['current', 'fast'])
-                    self.assertEqual(set(report['results']), set(names))
-                with self.subTest(operation='switch'), patch.object(t, 'persist_selection'):
-                    self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
-                    self.assertEqual(gui.change('native-relay', 'fast')['state']['entry'], 'native-relay')
+        self.active.update(live=names)
+        with self.subTest(operation='list'):
+            self.assertEqual([row['name'] for row in gui.snapshot()['node_rows']], names)
+        with (self.subTest(operation='benchmark'),
+              patch.object(update.c, 'CONFIG_DIR', self.root),
+              patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
+              patch.object(update.c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe):
+            _, report, _ = update.c.run(1)
+            self.assertEqual([call.args[0]['name'] for call in probe.call_args_list], ['current', 'fast'])
+            self.assertEqual(set(report['results']), set(names))
+        with self.subTest(operation='switch'), patch.object(t, 'persist_selection'):
+            self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
+            self.assertEqual(gui.change('native-relay', 'fast')['state']['entry'], 'native-relay')
+
+    def test_saved_selection_controls_relays_with_reused_inline_provider(self):
+        config = yaml.safe_load(self.config.read_bytes())
+        config['proxy-providers'] = {'a': {'type': 'inline', 'payload': [node('current'), node('fast')]}}
+        self.config.write_bytes(update.dump(config))
+        self.policy.write_text(json.dumps({'selected_nodes': {'a': ['current']}}))
+        (self.root / 'profiles/a.yaml').write_text('proxies: [')
+
+        self.apply({'a': [], 'b': []})
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['current']})
+        self.assertEqual(self.reload['proxy-providers']['a'], config['proxy-providers']['a'])
+        self.assertEqual(self.active['live'], ['current', 'fast'])
+
+        with self.subTest(operation='list'):
+            self.assertEqual([row['name'] for row in gui.snapshot()['node_rows']], ['current'])
+
+        def probe(relay, *_):
+            delay = 10 if relay['name'] == 'fast' else 100
+            return ([{'ms': delay, 'ip': '203.0.113.10'}] * 3, [], {})
+
+        with (patch.object(update.c, 'CONFIG_DIR', self.root),
+              patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
+              patch.object(update.c, 'test_node', side_effect=probe) as measure):
+            _, report, (nodes, *_) = update.c.run(1)
+        with self.subTest(operation='benchmark'):
+            self.assertEqual(set(nodes), {'current'})
+            self.assertEqual([call.args[0]['name'] for call in measure.call_args_list], ['current'])
+            self.assertEqual(set(report['results']), {'current'})
+            self.assertEqual(report['results']['current']['owner'], 'a')
+        with self.subTest(operation='auto-switch'):
+            self.assertIsNone(update.c.auto_candidate(report, 'chain'))
+        with self.subTest(operation='manual switch'):
+            with self.assertRaisesRegex(RuntimeError, '节点状态已变化'):
+                gui.change('fast', 'current')
+        self.assertEqual(self.requests, ['/configs?force=false'])
 
     def test_sync_uses_saved_selection_and_deletes_vanished_nodes_and_sources(self):
         self.apply({'a': ['current', 'fast', 'quick'], 'b': ['other']})
@@ -270,7 +300,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(json.loads(self.policy.read_bytes()), {
             'selected_nodes': {'a': ['current', 'fast']}, 'provider_labels': {'a': 'A', 'b': 'B'}})
         self.assertFalse(any((self.base / 'backups').rglob('*node-policy.json')))
-        self.assertFalse(any(n['name'] == 'current' for n in self.reload['proxies']))
+        self.assertIn(node('current'), self.reload['proxies'])
+        self.assertEqual(self.active['live'], ['current', 'fast'])
 
     def assert_verge_profile_keeps_downloaded_chain(self, apply_download):
         example = Path(__file__).resolve().parents[2] / 'examples/chain.example.yaml'
@@ -425,7 +456,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertTrue(picker.initialize())
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['current'], 'b': ['fast']})
 
-    def test_sync_after_upgrade_with_saved_selection_cleans_pin_and_switches_once(self):
+    def test_sync_after_upgrade_keeps_pin_and_switches_once(self):
         self.legacy({'selected_nodes': {'a': ['fast'], 'b': ['other']}})
         (self.root / 'profiles/a.yaml').write_text('proxies: [')
         self.downloaded = {'a': ['fast'], 'b': ['other']}
@@ -433,7 +464,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.fetch.call_count, 0)
         picker.synchronize()
         self.assertEqual(self.active['entry'], 'fast')
-        self.assertFalse(any(n['name'] == 'current' for n in self.reload['proxies']))
+        self.assertIn(node('current'), self.reload['proxies'])
+        self.assertEqual(self.active['live'], ['fast', 'other'])
         self.assertNotIn('pinned_entry', json.loads(self.policy.read_text()))
         self.assertFalse(picker.initialize())
         self.assertEqual(self.requests.count('/configs?force=false'), 1)
@@ -466,7 +498,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.active['live'], ['fast', 'other'])
         self.assertEqual(self.active['entry'], 'other')
         self.assertEqual(self.requests, ['/configs?force=false', ENTRY_ROUTE])
-        self.assertFalse(any(n['name'] == 'current' for n in self.reload['proxies']))
+        self.assertIn(node('current'), self.reload['proxies'])
         self.assertEqual(yaml.safe_load(self.index.read_bytes())['items'][0]['selected'],
                          [{'name': t.ENTRY, 'now': 'other'}])
         saved = json.loads(self.policy.read_bytes())
@@ -498,7 +530,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.active['live'], ['current'])
         self.assertEqual([n['name'] for n in self.providers['a']['proxies']], ['current'])
 
-    def test_legacy_pin_kept_by_filtered_include_all_groups(self):
+    def test_legacy_pin_survives_include_all_group_filters(self):
         original = yaml.safe_load(self.config.read_bytes())
         for flag in ('include-all-proxies', 'include-all'):
             for accepts_pin in (True, False):
@@ -512,23 +544,27 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                     self.active.update(live=['current', 'fast'], entry='current')
                     self.apply({'a': ['fast'], 'b': []})
                     self.assertEqual(self.reload['proxy-groups'][1], secondary)
-                    self.assertEqual('current' in [n['name'] for n in self.reload['proxies']], accepts_pin)
+                    self.assertIn(node('current'), self.reload['proxies'])
                     self.assertEqual(self.active['live'], ['fast'])
 
     def test_legacy_pin_survives_save_and_verge_regeneration(self):
         original = yaml.safe_load(self.config.read_bytes())
+        regex_rule = 'DOMAIN-REGEX,^foo{1,3}$,current'
         for reference in ('selector', 'include-all-proxies', 'MATCH,current', 'DOMAIN,example.invalid,current',
                           'IP-CIDR,203.0.113.0/24,current,no-resolve',
-                          'AND,((DOMAIN,example.invalid),(NETWORK,TCP)),current'):
+                          'AND,((DOMAIN,example.invalid),(NETWORK,TCP)),current',
+                          regex_rule, 'regex and selector', 'unreferenced'):
             with self.subTest(reference=reference):
                 self.legacy({'selected_nodes': {'a': ['current', 'fast']}})
                 profile = {**original, 'proxies': original['proxies'][1:],
                            'proxy-groups': [dict(original['proxy-groups'][0])]}
-                if reference == 'selector':
+                if reference in ('selector', 'regex and selector'):
                     profile['proxy-groups'].append({'name': 'secondary', 'type': 'select', 'proxies': ['current']})
                 elif reference == 'include-all-proxies':
                     profile['proxy-groups'].append({'name': 'secondary', 'type': 'select', reference: True})
-                else:
+                if reference == 'regex and selector':
+                    profile['rules'] = [regex_rule]
+                elif ',' in reference:
                     profile['rules'] = [reference]
                 self.config.write_bytes(update.dump({**profile, 'proxies': original['proxies']}))
                 self.active.update(live=['current', 'fast'], entry='current')

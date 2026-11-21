@@ -119,12 +119,12 @@ class Backend{
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
   const cfg=await this.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
   this.expectedIP=this.settings.expectedIP||(net.isIP(configured||'')?configured:'');
-  const {entryPlan,unmanagedEntry}=require('./subscriptions.cjs');
+  const {entryPlan}=require('./subscriptions.cjs');
   const [relay,providers,plan]=await Promise.all([
    this.relayState(timeout),this.api('GET','/providers/proxies',undefined,timeout).catch(()=>({})),
    entryPlan(cfg,this.root).catch(()=>null),
   ]);
-  const owners=this.nodePolicy.selected_nodes==null||unmanagedEntry(cfg,this.root)
+  const owners=this.nodePolicy.selected_nodes==null
    ? new Map(relay.live.map(name=>[name,plan?.get(name)?.owner??null]))
    : selectionOwners(this.nodePolicy.selected_nodes);
   const entryOwners=Object.fromEntries([...owners].filter(([name])=>relay.live.includes(name)));
@@ -171,11 +171,10 @@ class Backend{
  async loadNodes(){
   const config=await this.config();
   const selection=(await jsonRead(path.join(this.dataDir,'node-policy.json'))).selected_nodes;
-  const {entryPlan,unmanagedEntry}=require('./subscriptions.cjs');
-  const unmanaged=selection==null||unmanagedEntry(config,this.root);
-  const owners=selectionOwners(unmanaged?null:selection);
+  const {entryPlan}=require('./subscriptions.cjs');
+  const owners=selectionOwners(selection);
   const nodes=new Map();
-  if(unmanaged){
+  if(selection==null){
    const plan=await entryPlan(config,this.root).catch(()=>new Map());
    for(const [name,{node}] of plan)if(node)nodes.set(name,node);
   }

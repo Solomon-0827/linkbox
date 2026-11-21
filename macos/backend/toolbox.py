@@ -80,9 +80,12 @@ def switch_lock():
 
 
 def relay_owners(selection, live):
+    if selection is not None:
+        return selection_owners(selection)
+
     import yaml
     import runtime
-    from subscription_update import entry_plan, unmanaged_entry
+    from subscription_update import entry_plan
 
     root = runtime.CONFIG_DIR
     try:
@@ -91,8 +94,6 @@ def relay_owners(selection, live):
         config = None
     if not isinstance(config, dict):
         config = {}
-    if selection is not None and not unmanaged_entry(config, root):
-        return selection_owners(selection)
     plan = entry_plan(config, root) or {}
     return {name: plan.get(name, (None, None))[0] for name in live}
 

@@ -191,7 +191,7 @@ function configureEntry(groups, use) {
  for (const key of ['url', 'include-all', 'include-all-proxies', 'include-all-providers', 'filter', 'exclude-filter', 'exclude-type']) delete group[key];
 }
 
-function transform(config, managed, replace) {
+function transform(config, managed) {
  const updated = structuredClone(config);
  const groups = updated['proxy-groups'] || [];
  const providers = updated['proxy-providers'] || {};
@@ -201,7 +201,6 @@ function transform(config, managed, replace) {
   } else delete providers[name];
  }
  updated['proxy-providers'] = {...providers, ...managed.providers};
- updated.proxies = (updated.proxies || []).filter(n => !replace.includes(n.name));
  configureEntry(groups, managed.use);
  updated.dns ||= {};
  for (const key of ['nameserver-policy', 'proxy-server-nameserver-policy']) {
@@ -257,22 +256,6 @@ function legacyPin(original, config, savedName) {
  return pin;
 }
 
-function ruleTarget(rule) {
- const fields = rule.split(',').map(field => field.trim());
- if (['AND', 'OR', 'NOT'].includes(fields[0])) {
-  // Logical rule payloads contain nested, comma-separated rules.
-  return rule.match(/.*\)\s*,\s*([^,]+)/)?.[1].trim();
- }
- return fields[fields[0] === 'MATCH' ? 1 : 2];
-}
-
-function pinReferenced(config, name) {
- return config['proxy-groups']?.some(g => g.name !== ENTRY && (g.proxies?.includes(name) ||
-     ((g['include-all-proxies'] || g['include-all']) && groupFilter(g)(name)))) ||
-     config.proxies.some(node => node['dialer-proxy'] === name) ||
-     config.rules?.some(rule => typeof rule === 'string' && ruleTarget(rule) === name);
-}
-
 async function selectAfterReload(b, before, selected, desired) {
  async function observe() {
   const state = await b.relayState().catch(() => null);
@@ -319,12 +302,6 @@ function benchmarkResults(b) {
 
 function managedCache(root, owner, definition) {
  return definition.path && path.resolve(root, definition.path) === path.join(root, 'providers', 'linkbox', owner + '.yaml');
-}
-
-function unmanagedEntry(config, root) {
- const entry = config['proxy-groups']?.find(group => group.name === ENTRY);
- const providers = config['proxy-providers'] || {};
- return !!entry && !(entry.use || []).some(owner => managedCache(root, owner, providers[owner] || {}));
 }
 
 async function providerPayload(definition, root, readCache, filtered) {
@@ -504,13 +481,8 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const retired = Object.fromEntries(Object.entries(existing).filter(([name, definition]) =>
    !definitions.has(name) && managedCache(b.root, name, definition)));
   const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
-  const replace = [];
-  if (pin) {
-   if (pinReferenced(config, pin.name)) managed.pin = pin;
-   else replace.push(pin.name);
-  }
-  const updated = transform(config, managed, replace);
-  // Keep the old pin definition until the config containing it is replaced.
+  if (pin) managed.pin = pin;
+  const updated = transform(config, managed);
   updates.set(configFile, YAML.stringify(updated));
   updates.set(script, scriptText(baselines.get(script), managed));
   const {payload, members} = await reloadPayload(updated, b.root, updates, baselines);
@@ -613,4 +585,4 @@ async function remove(b, request) {
  return run(b, null, {removal: request});
 }
 
-module.exports = {discover, catalog, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan, unmanagedEntry};
+module.exports = {discover, catalog, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan};

@@ -114,7 +114,7 @@ def configure_entry(groups, use):
         group.pop(key, None)
 
 
-def transform(config, managed, replacement):
+def transform(config, managed):
     updated = copy.deepcopy(config)
     groups = updated.get('proxy-groups', [])
     providers = updated.setdefault('proxy-providers', {})
@@ -125,7 +125,6 @@ def transform(config, managed, replacement):
         else:
             providers.pop(name, None)
     providers.update(managed['providers'])
-    updated['proxies'] = [n for n in updated.get('proxies', []) if n['name'] not in replacement]
     configure_entry(groups, managed['use'])
     for key in ('nameserver-policy', 'proxy-server-nameserver-policy'):
         updated.setdefault('dns', {}).setdefault(key, {}).update(managed['dns'])
@@ -183,24 +182,6 @@ def legacy_pin(original, config, saved_name):
             or pin not in config.get('proxies', [])):
         return None
     return pin
-
-
-def rule_target(rule):
-    fields = [field.strip() for field in rule.split(',')]
-    if fields[0] in ('AND', 'OR', 'NOT'):
-        # Logical rule payloads contain nested, comma-separated rules.
-        match = re.match(r'.*\)\s*,\s*([^,]+)', rule)
-        return match[1].strip() if match else None
-    index = 1 if fields[0] == 'MATCH' else 2
-    return fields[index] if len(fields) > index else None
-
-
-def pin_referenced(config, name):
-    return (any(g['name'] != t.ENTRY and (name in (g.get('proxies') or [])
-                or ((g.get('include-all-proxies') or g.get('include-all')) and group_filter(g)(name)))
-                for g in config.get('proxy-groups', []))
-            or any(n.get('dialer-proxy') == name for n in config.get('proxies', []))
-            or any(isinstance(rule, str) and rule_target(rule) == name for rule in config.get('rules') or []))
 
 
 def check_chain(state):
@@ -264,13 +245,6 @@ def benchmark_results():
 def managed_cache(root, owner, definition):
     source = definition.get('path')
     return bool(source) and (root / source).resolve() == (root / 'providers/linkbox' / (owner + '.yaml')).resolve()
-
-
-def unmanaged_entry(config, root):
-    entry = next((g for g in config.get('proxy-groups', []) if g['name'] == t.ENTRY), None)
-    providers = config.get('proxy-providers') or {}
-    return entry is not None and not any(managed_cache(root, owner, providers.get(owner) or {})
-                                         for owner in entry.get('use') or [])
 
 
 def provider_payload(definition, root, read_cache, *, filtered):
@@ -464,14 +438,9 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         retired = {name: definition for name, definition in existing.items()
                    if name not in definitions and managed_cache(root, name, definition)}
         managed = {'providers': definitions, 'retired': retired, 'dns': dns, 'use': use}
-        replacement = []
         if pin:
-            if pin_referenced(config, pin['name']):
-                managed['pin'] = pin
-            else:
-                replacement.append(pin['name'])
-        updated = transform(config, managed, replacement)
-        # Keep the old pin definition until the config containing it is replaced.
+            managed['pin'] = pin
+        updated = transform(config, managed)
         updates[config_file] = dump(updated)
         updates[script] = script_text(baselines[script], managed)
         payload, members = reload_payload(updated, root, updates, baselines)

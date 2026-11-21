@@ -139,35 +139,76 @@ test('unmanaged switching uses live names with an unsupported group filter', asy
  assert.deepEqual(requests.map(r => r.route), [ENTRY_ROUTE]);
 });
 
-for (const saved of [false, true]) {
- test(`unmanaged ENTRY uses live relays with a native HTTP provider (saved selection: ${saved})`, async t => {
-  const {b, config, policy, state, write, setProviders} = await fixture(t);
-  config['proxy-groups'][0].use = ['native'];
-  config['proxy-providers'] = {native:{type:'http', url:'https://example.invalid/native'}};
-  await write('clash-verge.yaml', config);
-  if (saved) await fs.writeFile(policy, JSON.stringify({selected_nodes:{a:['current']}}));
-  const names = ['current','fast','native-relay'];
-  state.live = names;
-  setProviders({native:{proxies:[node('native-relay')]}});
-  delete b.state;
-  await t.test('lists live relays', async () => {
-   assert.deepEqual((await b.state()).nodes.map(row => row.name), names);
-  });
-  await t.test('benchmarks available live relay credentials', async () => {
-   const probes = [];
-   b.network = async () => ({name:'fixture'});
-   b.corePath = async () => 'fixture';
-   b.testNode = async node => {probes.push(node.name);return {delay:100,status:'done'};};
-   const {results} = await b.benchmark();
-   assert.deepEqual(probes.sort(), ['current','fast']);
-   assert.deepEqual(Object.keys(results).sort(), [...names].sort());
-  });
-  await t.test('switches between live relays', async () => {
-   assert.equal((await b.switchNode('fast','current')).entry, 'fast');
-   assert.equal((await b.switchNode('native-relay','fast')).entry, 'native-relay');
-  });
+test('unmanaged ENTRY uses live relays with a native HTTP provider', async t => {
+ const {b, config, state, write, setProviders} = await fixture(t);
+ config['proxy-groups'][0].use = ['native'];
+ config['proxy-providers'] = {native:{type:'http', url:'https://example.invalid/native'}};
+ await write('clash-verge.yaml', config);
+ const names = ['current','fast','native-relay'];
+ state.live = names;
+ setProviders({native:{proxies:[node('native-relay')]}});
+ delete b.state;
+ await t.test('lists live relays', async () => {
+  assert.deepEqual((await b.state()).nodes.map(row => row.name), names);
  });
-}
+ await t.test('benchmarks available live relay credentials', async () => {
+  const probes = [];
+  b.network = async () => ({name:'fixture'});
+  b.corePath = async () => 'fixture';
+  b.testNode = async node => {probes.push(node.name);return {delay:100,status:'done'};};
+  const {results} = await b.benchmark();
+  assert.deepEqual(probes.sort(), ['current','fast']);
+  assert.deepEqual(Object.keys(results).sort(), [...names].sort());
+ });
+ await t.test('switches between live relays', async () => {
+  assert.equal((await b.switchNode('fast','current')).entry, 'fast');
+  assert.equal((await b.switchNode('native-relay','fast')).entry, 'native-relay');
+ });
+});
+
+test('saved selection controls relays with a reused inline provider', async t => {
+ const {b, root, config, policy, state, requests, write, apply, saved} = await fixture(t);
+ const inline = {type:'inline', payload:[node('current'), node('fast')]};
+ config['proxy-providers'] = {a:inline};
+ await write('clash-verge.yaml', config);
+ await fs.writeFile(policy, JSON.stringify({selected_nodes:{a:['current']}}));
+ await fs.writeFile(path.join(root, 'profiles/a.yaml'), 'proxies: [');
+ delete b.state;
+
+ await apply({a:[], b:[]});
+ assert.deepEqual((await saved()).selected_nodes, {a:['current']});
+ assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-providers'].a, inline);
+ assert.deepEqual(state.live, ['current','fast']);
+
+ await t.test('lists only saved relays and their owners', async () => {
+  assert.deepEqual((await b.state()).nodes.map(({name, providerId}) => [name, providerId]), [['current','a']]);
+ });
+ const probes = [];
+ b.network = async () => ({name:'fixture'});
+ b.corePath = async () => 'fixture';
+ b.testNode = async ({name}) => {
+  probes.push(name);
+  return {delay:name === 'fast' ? 10 : 100, status:'done'};
+ };
+ await b.saveSettings({autoRelay:true});
+ const result = await b.benchmark('chain', () => true);
+ await t.test('benchmarks only saved relays', async () => {
+  const {nodes} = await b.loadNodes();
+  assert.deepEqual([...nodes.keys()], ['current']);
+  assert.deepEqual(probes, ['current']);
+  assert.deepEqual(Object.keys(result.latestResults), ['current']);
+  assert.equal(result.latestResults.current.owner, 'a');
+ });
+ await t.test('auto-switch leaves the entry unchanged', () => {
+  assert.equal(result.switchedTo, undefined);
+  assert.equal(state.entry, 'current');
+ });
+ await t.test('manual switch rejects an unchecked live relay', async () => {
+  state.entry = 'current';
+  await assert.rejects(b.switchNode('fast','current'), /节点状态已变化/);
+ });
+ assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false']);
+});
 
 test('Save and switch with identical names loaded by an include-all group', async t => {
  const {b, config, write, apply, saved, requests} = await fixture(t);
@@ -280,7 +321,7 @@ test('stale catalogs and unknown nodes are refused, duplicate submissions reconc
 });
 
 test('first run downloads before seeding even with truncated Verge YAML and drops obsolete policy', async t => {
- const {b, data, root, downloads, refreshWith, saved, requests, legacy} = await fixture(t);
+ const {b, data, root, downloads, refreshWith, saved, requests, legacy, state} = await fixture(t);
  await legacy({blocked_providers:['a'], excluded_nodes:{'*':['fast']}});
  await fs.writeFile(path.join(root, 'profiles/a.yaml'), 'proxies: [');
  refreshWith({a:['current','fast','new'], b:['fast']});
@@ -289,7 +330,8 @@ test('first run downloads before seeding even with truncated Verge YAML and drop
  assert.equal(downloads.length, 2);
  assert.deepEqual(await saved(), {selected_nodes:{a:['current','fast']}, provider_labels:{a:'A',b:'B'}});
  assert.ok(!(await fs.readdir(path.join(data, 'backups'), {recursive:true})).some(name => name.endsWith('node-policy.json')));
- assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
+ assert.deepEqual(YAML.parse(requests[0].body.payload).proxies.find(n => n.name === 'current'), node('current'));
+ assert.deepEqual(state.live, ['current','fast']);
 });
 
 for (const mode of ['first run', 'Save from Sync preview']) {
@@ -413,7 +455,7 @@ test('first run falls back for null proxies without losing other owners', async 
  assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['fast']});
 });
 
-test('sync after upgrade with saved selection cleans the old pin and switches once', async t => {
+test('sync after upgrade keeps the pin and switches once', async t => {
  const {b, root, state, legacy, downloads, requests, saved, refreshWith} = await fixture(t);
  await legacy({selected_nodes:{a:['fast'],b:['other']}});
  await fs.writeFile(path.join(root, 'profiles/a.yaml'), 'proxies: [');
@@ -422,7 +464,8 @@ test('sync after upgrade with saved selection cleans the old pin and switches on
  assert.equal(downloads.length, 0);
  await b.updateSubscriptions();
  assert.equal(state.entry, 'fast');
- assert.ok(!YAML.parse(requests.at(-1).body.payload).proxies.some(n => n.name === 'current'));
+ assert.deepEqual(YAML.parse(requests.at(-1).body.payload).proxies.find(n => n.name === 'current'), node('current'));
+ assert.deepEqual(state.live, ['fast','other']);
  assert.equal((await saved()).pinned_entry, undefined);
  assert.equal(await sub.initialize(b), false);
  assert.equal(requests.filter(r => r.route === '/configs?force=false').length, 1);
@@ -456,7 +499,7 @@ test('upgrade saving B switches off a pin excluded by unreadable A', async t => 
  assert.deepEqual(state.live, ['fast','other']);
  assert.equal(state.entry, 'other');
  assert.deepEqual(requests.map(({route}) => route), ['/configs?force=false', ENTRY_ROUTE]);
- assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
+ assert.deepEqual(YAML.parse(requests[0].body.payload).proxies.find(n => n.name === 'current'), node('current'));
  const index = YAML.parse(await fs.readFile(path.join(root,'profiles.yaml'),'utf8'));
  assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'other'}]);
  const selection = {a:['current','fast'], b:['other']};
@@ -481,7 +524,7 @@ test('Save ranks selected relays using legacy benchmark results until latestResu
 });
 
 for (const flag of ['include-all-proxies', 'include-all']) {
- test(`legacy pin respects filtered ${flag} references`, async t => {
+ test(`legacy pin survives ${flag} group filters`, async t => {
   for (const acceptsPin of [true, false]) {
    await t.test(acceptsPin ? 'includes the pin' : 'excludes the pin', async subtest => {
     const {config, write, apply, legacy, requests, state} = await fixture(subtest);
@@ -493,23 +536,28 @@ for (const flag of ['include-all-proxies', 'include-all']) {
     await apply({a:['fast'], b:[]});
     const reload = YAML.parse(requests[0].body.payload);
     assert.deepEqual(reload['proxy-groups'][1], secondary);
-    assert.equal(reload.proxies.some(n => n.name === 'current'), acceptsPin);
+    assert.deepEqual(reload.proxies.find(n => n.name === 'current'), node('current'));
     assert.deepEqual(state.live, ['fast']);
    });
   }
  });
 }
 
+const regexRule = 'DOMAIN-REGEX,^foo{1,3}$,current';
 for (const reference of ['selector', 'include-all-proxies', 'MATCH,current', 'DOMAIN,example.invalid,current',
- 'IP-CIDR,203.0.113.0/24,current,no-resolve', 'AND,((DOMAIN,example.invalid),(NETWORK,TCP)),current']) {
+ 'IP-CIDR,203.0.113.0/24,current,no-resolve', 'AND,((DOMAIN,example.invalid),(NETWORK,TCP)),current',
+ regexRule, 'regex and selector', 'unreferenced']) {
  test(`legacy pin survives Save and Verge regeneration with ${reference}`, async t => {
   const {b, root, config, write, apply, legacy, state} = await fixture(t);
   await legacy({selected_nodes:{a:['current','fast']}});
-  if (reference === 'selector') {
+  if (reference === 'selector' || reference === 'regex and selector') {
    config['proxy-groups'].push({name:'secondary', type:'select', proxies:['current']});
   } else if (reference === 'include-all-proxies') {
    config['proxy-groups'].push({name:'secondary', type:'select', [reference]:true});
-  } else {
+  }
+  if (reference === 'regex and selector') {
+   config.rules = [regexRule];
+  } else if (reference.includes(',')) {
    config.rules = [reference];
   }
   await write('clash-verge.yaml', config);
