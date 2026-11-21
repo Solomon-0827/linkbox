@@ -13,7 +13,7 @@ function reconcile({sources, selection, live, current, metric = 'chain', results
   for (const name of unreadable ? saved(owner) : nodes) {
    occurrences.set(name, (occurrences.get(name) || 0) + 1);
    if (requested.has(name) && !owners.has(name) && (reserved.get(name) ?? owner) === owner &&
-       (!seed || (seedOwners.get(name) ?? owner) === owner)) {
+       (!seed || !seedOwners.has(name) || seedOwners.get(name) === owner)) {
     if (!unreadable) {
      if (!selected.has(owner)) selected.set(owner, []);
      selected.get(owner).push(name);

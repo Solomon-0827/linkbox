@@ -198,18 +198,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '管理节点'):
             picker.synchronize()
 
-        atomic = update.atomic
-
-        class Crash(BaseException):
-            pass
-
-        def crash_after_journal(path, data):
-            atomic(path, data)
-            if path == self.policy:
-                raise Crash()
-
-        with patch.object(update, 'atomic', side_effect=crash_after_journal), self.assertRaises(Crash):
-            self.apply({'a': ['new'], 'b': []})
+        self.crash_during_save({'a': ['new'], 'b': []}, self.policy)
         self.assertEqual(json.loads(self.policy.read_bytes())['pending_update']['selection'], {'a': ['new']})
         before = self.files()
         before[self.policy.name] = saved
@@ -262,22 +251,23 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         }
         self.config.write_bytes(update.dump(config))
         self.active['live'].append('quick')
+        self.providers = {'a': {'proxies': [node('current'), node('fast')]},
+                          'b': {'proxies': [node('current')]}}
         self.downloaded = {'a': ['current', 'fast', 'quick'], 'b': ['current', 'fast', 'quick']}
         self.assertTrue(picker.initialize())
         self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'],
                          {'a': ['fast', 'quick'], 'b': ['current']})
 
-    def test_first_run_prefers_current_provider_cache_to_new_duplicate(self):
+    def test_first_run_keeps_live_owner_for_http_providers_without_paths(self):
         config = yaml.safe_load(self.config.read_bytes())
-        config['proxy-groups'][0].update(use=['a', 'b'], proxies=[])
+        config['proxy-groups'][0].update(use=['live-a', 'live-b'], proxies=[])
         config['proxy-providers'] = {
-            'a': {'type': 'http', 'url': self.sources[0]['url'], 'path': 'providers/a.yaml'},
-            'b': {'type': 'http', 'url': self.sources[1]['url'], 'path': str(self.root / 'providers/b.yaml')},
+            'live-a': {'type': 'http', 'url': self.sources[0]['url']},
+            'live-b': {'type': 'http', 'url': self.sources[1]['url']},
         }
         self.config.write_bytes(update.dump(config))
-        (self.root / 'providers').mkdir()
-        (self.root / 'providers/a.yaml').write_bytes(update.dump({'proxies': [node('fast')]}))
-        (self.root / 'providers/b.yaml').write_bytes(update.dump({'proxies': [node('current'), node('fast')]}))
+        self.providers = {'live-a': {'proxies': [node('fast')]},
+                          'live-b': {'proxies': [node('current'), node('fast')]}}
         self.downloaded = {'a': ['current', 'fast'], 'b': ['current', 'fast']}
 
         self.assertTrue(picker.initialize())
@@ -543,24 +533,28 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual([call.args[1] for call in self.api.call_args_list], ['/configs?force=false'] * 2)
 
     def crash_after_config(self):
+        self.crash_during_save({'a': ['fast'], 'b': []}, self.config)
+
+    def crash_during_save(self, selection, crash_file):
         original_index = self.index.read_bytes()
         registry = self.base / 'subscriptions.json'
         original_registry = registry.read_bytes()
+        original_requests = self.requests.copy()
         atomic = update.atomic
 
         class Crash(BaseException):
             pass
 
-        def crash_after_config(path, data):
+        def crash_after_write(path, data):
             atomic(path, data)
-            if path == self.config:
+            if path == crash_file:
                 raise Crash()
 
-        with patch.object(update, 'atomic', side_effect=crash_after_config), self.assertRaises(Crash):
-            self.apply({'a': ['fast'], 'b': []})
+        with patch.object(update, 'atomic', side_effect=crash_after_write), self.assertRaises(Crash):
+            self.apply(selection)
         self.assertEqual(self.index.read_bytes(), original_index)
         self.assertEqual(registry.read_bytes(), original_registry)
-        self.assertEqual(self.requests, [])
+        self.assertEqual(self.requests, original_requests)
 
     def test_restart_recomputes_from_newer_verge_files_after_a_crash(self):
         self.apply({'a': ['current', 'fast'], 'b': []})
@@ -602,13 +596,12 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '文件已回退'):
             picker.initialize()
         current = self.files()
-        for file, data in current.items():
-            if file != 'node-policy.json' and not file.startswith('backups/'):
-                self.assertEqual(data, previous[file], file)
-        self.assertEqual(json.loads(current['node-policy.json']), {
-            'selected_nodes': {'a': ['current', 'fast']}, 'provider_labels': {'a': 'A', 'b': 'B'}})
+        self.assertEqual({f: d for f, d in current.items() if not f.startswith('backups/')},
+                         {f: d for f, d in previous.items() if not f.startswith('backups/')})
         self.assertEqual(self.active['live'], ['current', 'fast'])
-        self.assertFalse(picker.initialize())
+        self.api.side_effect = self.controller
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
 
     def test_refresh_confirms_after_equivalent_config_reserialization(self):
         self.check_late_reload_after_save(['fast', 'quick'], rewrite=True)
@@ -710,9 +703,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                          [{'name': t.ENTRY, 'now': 'quick'}])
         self.assertNotIn('pending_update', json.loads(self.policy.read_bytes()))
 
-    def test_refresh_clears_journal_after_validation_rejection(self):
+    def test_refresh_keeps_journal_after_geoip_validation_failure(self):
         self.apply({'a': ['current', 'fast'], 'b': []})
-        saved = self.policy.read_bytes()
         self.requests.clear()
         self.crash_after_config()
         before = self.files()
@@ -721,14 +713,35 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             picker.initialize()
         self.assertEqual(self.files(), before)
 
-        self.validate.side_effect = CalledProcessError(1, 'mihomo')
+        self.validate.side_effect = CalledProcessError(1, 'mihomo', stderr=b'GeoIP database download failed')
         with self.assertRaisesRegex(RuntimeError, '配置校验失败'):
             picker.initialize()
-        before[self.policy.name] = saved
-        self.assertEqual(self.policy.read_bytes(), saved)
         self.assertEqual(self.files(), before)
         self.assertEqual(self.requests, [])
-        self.assertFalse(picker.initialize())
+        self.validate.side_effect = None
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'a': ['fast']})
+
+    def test_refresh_keeps_journal_when_target_profile_cannot_be_read(self):
+        self.apply({'a': ['current', 'fast'], 'b': []})
+        self.requests.clear()
+        self.crash_during_save({'a': [], 'b': ['other']}, self.policy)
+        before = self.files()
+        profile = self.root / 'profiles/b.yaml'
+        read_bytes = Path.read_bytes
+
+        def temporary_failure(path):
+            if path == profile:
+                raise PermissionError(errno.EACCES, 'fixture read failure')
+            return read_bytes(path)
+
+        with patch.object(Path, 'read_bytes', temporary_failure), self.assertRaisesRegex(RuntimeError, '本地缓存暂不可读'):
+            picker.initialize()
+        self.assertEqual(self.files(), before)
+        self.assertEqual(self.requests, [])
+        self.assertTrue(picker.initialize())
+        self.assertEqual(json.loads(self.policy.read_bytes())['selected_nodes'], {'b': ['other']})
+        self.assertEqual(self.active['entry'], 'other')
 
     def test_failed_benchmark_start_preserves_display_history_and_invalidates_ranking(self):
         history = {'results': {'fast': {'owner': 'a', 'delay': 10, 'chain_delay': 20}},

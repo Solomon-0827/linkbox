@@ -277,7 +277,7 @@ test('restart recomputes from newer Verge files after a crash', async t => {
 
 test('restart rolls back its own writes if reload is rejected', async t => {
  const fx = await fixture(t);
- const {b, root, data, state, apply, saved, requests, write} = fx;
+ const {b, root, data, state, apply, saved, requests, write, policy} = fx;
  await apply({a:['current','fast'], b:[]});
  requests.length = 0;
  await crashDuringSave(fx);
@@ -285,7 +285,7 @@ test('restart rolls back its own writes if reload is rejected', async t => {
  const renamed = YAML.parse(await fs.readFile(profile,'utf8'));
  renamed.items[0].name = 'Renamed in Verge after the crash';
  await write('profiles.yaml', renamed);
- const files = [profile, path.join(root,'clash-verge.yaml'), path.join(root,'profiles/Script.js'),
+ const files = [policy, profile, path.join(root,'clash-verge.yaml'), path.join(root,'profiles/Script.js'),
   path.join(root,'providers/linkbox/a.yaml'), path.join(data,'subscriptions.json')];
  const previous = await Promise.all(files.map(file => fs.readFile(file)));
  const controller = b.request;
@@ -295,29 +295,52 @@ test('restart rolls back its own writes if reload is rejected', async t => {
  };
  await assert.rejects(sub.initialize(b), /文件已回退/);
  assert.deepEqual(await Promise.all(files.map(file => fs.readFile(file))), previous);
- assert.deepEqual(await saved(), {selected_nodes:{a:['current','fast']}, provider_labels:{a:'A',b:'B'}});
  assert.deepEqual(state.live, ['current','fast']);
- assert.equal(await sub.initialize(b), false);
+ b.request = controller;
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
 });
 
-test('Refresh clears the journal after validation rejection', async t => {
+test('Refresh keeps the journal after a GeoIP validation failure', async t => {
  const fx = await fixture(t);
- const {b, data, policy, apply, requests} = fx;
+ const {b, data, apply, requests, saved} = fx;
  await apply({a:['current','fast'], b:[]});
- const saved = await fs.readFile(policy);
  requests.length = 0;
  await crashDuringSave(fx);
  const before = await fixtureFiles(data);
+ const validate = b.validateConfig;
  b.validateConfig = async () => { throw Object.assign(Error('timeout'), {killed:true}); };
  await assert.rejects(sub.initialize(b), /配置校验失败/);
  assert.deepEqual(await fixtureFiles(data), before);
 
- b.validateConfig = async () => { throw Object.assign(Error('invalid config'), {code:1}); };
+ b.validateConfig = async () => { throw Object.assign(Error('GeoIP database download failed'), {code:1}); };
  await assert.rejects(sub.initialize(b), /配置校验失败/);
- before[policy] = saved;
- assert.deepEqual(await fs.readFile(policy), saved);
  assert.deepEqual(await fixtureFiles(data), before);
  assert.deepEqual(requests, []);
+ b.validateConfig = validate;
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
+});
+
+test('Refresh keeps the journal when the target profile cannot be read', async t => {
+ const fx = await fixture(t);
+ const {b, data, root, policy, apply, requests, saved, state} = fx;
+ await apply({a:['current','fast'], b:[]});
+ requests.length = 0;
+ await crashDuringSave(fx, {a:[], b:['other']}, policy);
+ const before = await fixtureFiles(data);
+ const profile = path.join(root, 'profiles/b.yaml'), readFile = fs.readFile;
+ const read = t.mock.method(fs, 'readFile', async (file, ...args) => {
+  if (file === profile) throw Object.assign(Error('fixture read failure'), {code:'EACCES'});
+  return readFile(file, ...args);
+ });
+ await assert.rejects(sub.initialize(b), /本地缓存暂不可读/);
+ read.mock.restore();
+ assert.deepEqual(await fixtureFiles(data), before);
+ assert.deepEqual(requests, []);
+ assert.equal(await sub.initialize(b), true);
+ assert.deepEqual((await saved()).selected_nodes, {b:['other']});
+ assert.equal(state.entry, 'other');
 });
 
 test('Refresh confirms after equivalent config reserialization', async t => {
@@ -418,7 +441,7 @@ test('first run downloads before seeding even with truncated Verge YAML and drop
 });
 
 test('first run seeds in live provider order with picker fallback', async t => {
- const {b, config, state, write, refreshWith, saved} = await fixture(t);
+ const {b, config, state, write, refreshWith, saved, setProviders} = await fixture(t);
  Object.assign(config['proxy-groups'][0], {use:['b','a'], proxies:['quick']});
  config['proxy-providers'] = {
   a:{type:'inline', payload:['current','fast'].map(n => node(n))},
@@ -426,22 +449,21 @@ test('first run seeds in live provider order with picker fallback', async t => {
  };
  await write('clash-verge.yaml', config);
  state.live.push('quick');
+ setProviders({a:{proxies:[node('current'), node('fast')]}, b:{proxies:[node('current')]}});
  refreshWith({a:['current','fast','quick'], b:['current','fast','quick']});
  assert.equal(await sub.initialize(b), true);
  assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick'], b:['current']});
 });
 
-test('first run prefers the current provider cache to a new duplicate', async t => {
- const {b, root, items, config, state, write, refreshWith, saved, requests} = await fixture(t);
- Object.assign(config['proxy-groups'][0], {use:['a','b'], proxies:[]});
+test('first run keeps the live owner for HTTP providers without paths', async t => {
+ const {b, items, config, state, write, refreshWith, saved, requests, setProviders} = await fixture(t);
+ Object.assign(config['proxy-groups'][0], {use:['live-a','live-b'], proxies:[]});
  config['proxy-providers'] = {
-  a:{type:'http', url:items[0].url, path:'providers/a.yaml'},
-  b:{type:'http', url:items[1].url, path:path.join(root, 'providers/b.yaml')},
+  'live-a':{type:'http', url:items[0].url},
+  'live-b':{type:'http', url:items[1].url},
  };
  await write('clash-verge.yaml', config);
- await fs.mkdir(path.join(root, 'providers'));
- await write('providers/a.yaml', {proxies:[node('fast')]});
- await write('providers/b.yaml', {proxies:[node('current'), node('fast')]});
+ setProviders({'live-a':{proxies:[node('fast')]}, 'live-b':{proxies:[node('current'), node('fast')]}});
  refreshWith({a:['current','fast'], b:['current','fast']});
 
  assert.equal(await sub.initialize(b), true);

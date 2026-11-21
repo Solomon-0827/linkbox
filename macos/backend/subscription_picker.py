@@ -33,12 +33,12 @@ def source_key(url):
     return url
 
 
-def discover(for_update=False):
+def discover(for_update=False, *, recovering=False):
     root = runtime.CONFIG_DIR
     profiles = document(update.read(root / 'profiles.yaml'))
     items = profiles.get('items')
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-        raise update.RecomputeError('无法完整读取 Clash Verge 订阅，未删除节点')
+        raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
     # The saved registry can preserve IDs, but only Verge can list sources.
     registry = runtime.read_json('subscriptions.json').get('sources', [])
     by_url = {source_key(s['url']): s for s in registry if s.get('url')}
@@ -48,13 +48,13 @@ def discover(for_update=False):
         if item.get('type') != 'remote':
             continue
         if not isinstance(item.get('url'), str) or not item['url'].startswith('https://') or not item.get('file'):
-            if for_update:
+            if for_update or recovering:
                 raise RuntimeError('Clash Verge 订阅需要 HTTPS 地址及本地文件，未更新节点')
             continue
         # Only read local profile files under the known directory.
         filename = item.get('file', '')
         if not isinstance(filename, str) or Path(filename).name != filename or filename in {'.', '..'} or '\\' in filename:
-            if for_update:
+            if for_update or recovering:
                 raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
             continue
         old = by_url.get(source_key(item['url']), {})
@@ -72,7 +72,7 @@ def discover(for_update=False):
             raw = None
         sources.append((source, raw))
     if len({s['name'] for s, _ in sources}) != len(sources):
-        raise update.RecomputeError('订阅标识冲突，请先整理 Clash Verge 订阅')
+        raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, None if raw is None else hashlib.sha256(raw).hexdigest()] for source, raw in sources]
     revision = fingerprint([str(root), revisions, runtime.read_json('node-policy.json')])
     if for_update:
