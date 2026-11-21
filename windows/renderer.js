@@ -40,6 +40,10 @@ async function updateSubscriptions(fromPicker){
   if(fromPicker)await loadPicker();
   notify(mainListUpdated?result.message:result.message+' 主列表读取失败，请刷新状态。');
  }catch(error){
+  if(fromPicker&&!updateFinished&&error.message.startsWith('订阅里已没有你勾选的节点')){
+   pickerCatalogCurrent=false;
+   try{await loadPicker()}catch(readError){notify(error.message+' 列表读取失败。'+readError.message);return}
+  }
   notify(fromPicker&&updateFinished?'订阅已更新，列表读取失败。'+error.message:error.message);
  }finally{
   updating=false;

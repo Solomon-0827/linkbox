@@ -3,11 +3,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const {execFileSync} = require('node:child_process');
 const YAML = require('yaml');
 const {Backend, ENTRY, EXIT} = require('../backend.cjs');
 const sub = require('../subscriptions.cjs');
 
-const node = (name, server = 'relay.example.invalid') => ({name, type: 'ss', server, port: 443});
+const node = (name, server = 'relay.example.invalid') => ({
+ name, type: 'ss', server, port: 443, cipher: 'aes-128-gcm', password: 'fixture',
+});
+const ENTRY_ROUTE = '/proxies/' + encodeURIComponent(ENTRY);
 async function fixture(t) {
  const dir = await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-selection-'));
  t.after(() => fs.rm(dir, {recursive: true, force: true}));
@@ -31,7 +35,11 @@ async function fixture(t) {
  const policy = path.join(data, 'node-policy.json');
  const state = {mode: 'global', tun: true, entry: 'current', exit: EXIT, dialer: ENTRY,
   mixedPort: 7897, live: ['current', 'fast']};
- const requests = [], downloads = [];
+ const requests = [], downloads = [], atReload = [];
+ let providers = {
+  [ENTRY]: {vehicleType: 'Compatible', proxies: [node('current')]},
+  a: {vehicleType: 'HTTP', proxies: [node('fast')]},
+ };
  let refreshed = {};
  b.state = async () => structuredClone(state);
  b.validateConfig = async file => {
@@ -42,15 +50,20 @@ async function fixture(t) {
   return YAML.stringify({proxies: refreshed[url.split('/').at(-1)].map(n => node(n))});
  };
  b.request = async (_endpoint, method, route, body) => {
+  if (method === 'GET' && route === '/providers/proxies') return {providers};
   assert.equal(method, 'PUT');
   requests.push({route, body});
   if (route === '/configs?force=false') {
+   atReload.push(state.entry);
    const payload = YAML.parse(body.payload), group = payload['proxy-groups'][0];
    assert.deepEqual(group.proxies, []);
+   providers = Object.fromEntries(Object.entries(payload['proxy-providers']).map(([owner, p]) => [
+    owner, {proxies: p.payload, vehicleType: 'Inline', testUrl: p['health-check']?.url},
+   ]));
    state.live = group.use.flatMap(id => payload['proxy-providers'][id].payload.map(n => n.name));
    if (!state.live.includes(state.entry)) state.entry = state.live[0];
   } else {
-   assert.equal(route, '/proxies/' + encodeURIComponent(ENTRY));
+   assert.equal(route, ENTRY_ROUTE);
    assert.ok(state.live.includes(body.name));
    state.entry = body.name;
   }
@@ -60,7 +73,14 @@ async function fixture(t) {
   return {fingerprint, current, selected};
  };
  const apply = async selected => sub.run(b, await request(selected));
- return {b, root, data, config, policy, state, requests, downloads, items, write, request, apply,
+ const legacy = async saved => {
+  await fs.writeFile(policy, JSON.stringify({...saved, pinned_entry: 'current'}));
+  await fs.writeFile(path.join(root, 'profiles/Script.js'), 'function main(c){return c;}\n' +
+   '// BEGIN LINKBOX MANAGED PROVIDERS\nmain=function(r){const m=' + JSON.stringify({pin: node('current')}) +
+   ";r['proxy-providers']={};return r;};\n");
+ };
+ return {b, root, data, config, policy, state, requests, downloads, atReload, items, write, request, apply, legacy,
+  setProviders: value => {providers = value;},
   refreshWith: value => {refreshed = value;}, saved: async () => JSON.parse(await fs.readFile(policy, 'utf8'))};
 }
 
@@ -89,10 +109,10 @@ test('stale catalogs and unknown nodes are refused, duplicate submissions reconc
  assert.deepEqual((await saved()).selected_nodes, {a:['current']});
 });
 
-test('first run downloads all subscriptions before seeding live names and drops obsolete policy', async t => {
- const {b, data, policy, root, downloads, refreshWith, saved, requests} = await fixture(t);
- await fs.writeFile(policy, JSON.stringify({blocked_providers:['a'], excluded_nodes:{'*':['fast']}, pinned_entry:'current'}));
- await fs.writeFile(path.join(root, 'profiles', 'Script.js'), 'function main(c){return c;}\n// BEGIN LINKBOX MANAGED PROVIDERS');
+test('first run downloads before seeding even with truncated Verge YAML and drops obsolete policy', async t => {
+ const {b, data, root, downloads, refreshWith, saved, requests, legacy} = await fixture(t);
+ await legacy({blocked_providers:['a'], excluded_nodes:{'*':['fast']}});
+ await fs.writeFile(path.join(root, 'profiles/a.yaml'), 'proxies: [');
  refreshWith({a:['current','fast','new'], b:['fast']});
  assert.equal(await sub.initialize(b), true);
  assert.equal(await sub.initialize(b), false);
@@ -100,6 +120,18 @@ test('first run downloads all subscriptions before seeding live names and drops 
  assert.deepEqual(await saved(), {selected_nodes:{a:['current','fast']}, provider_labels:{a:'A',b:'B'}});
  assert.ok(!(await fs.readdir(path.join(data, 'backups'), {recursive:true})).some(name => name.endsWith('node-policy.json')));
  assert.ok(!YAML.parse(requests[0].body.payload).proxies.some(n => n.name === 'current'));
+});
+
+test('upgrade with saved selection cleans the old pin and switches once', async t => {
+ const {b, state, legacy, downloads, requests, saved} = await fixture(t);
+ await legacy({selected_nodes:{a:['fast']}});
+ assert.equal(await sub.initialize(b), true);
+ assert.equal(state.entry, 'fast');
+ assert.ok(!YAML.parse(requests.at(-1).body.payload).proxies.some(n => n.name === 'current'));
+ assert.equal((await saved()).pinned_entry, undefined);
+ assert.equal(await sub.initialize(b), false);
+ assert.equal(requests.filter(r => r.route === '/configs?force=false').length, 1);
+ assert.equal(downloads.length, 0);
 });
 
 test('sync keeps saved nodes outside the live group and removes vanished nodes and sources', async t => {
@@ -117,26 +149,36 @@ test('sync keeps saved nodes outside the live group and removes vanished nodes a
  assert.match(await fs.readFile(path.join(root,'profiles/a.yaml'),'utf8'), /brand-new/);
 });
 
-test('save reloads valid candidates before switching by configured metric and persists the entry', async t => {
+test('absent benchmark winner is first at reload and persisted', async t => {
  const {b, state, requests, root, apply, downloads} = await fixture(t);
  b.settings.metric = 'entrance';
- b.history = {latestResults:{fast:{chainDelay:10,entranceDelay:90,owner:'a'}, quick:{chainDelay:30,entranceDelay:20,owner:'a'}}};
- await apply({a:['fast','quick'],b:[]});
- assert.deepEqual(requests.map(r=>r.route), ['/configs?force=false','/proxies/'+encodeURIComponent(ENTRY)]);
- assert.equal(state.entry, 'quick');
+ b.history = {latestResults:{fast:{chainDelay:10,entranceDelay:90,owner:'a'}, other:{chainDelay:30,entranceDelay:20,owner:'b'}}};
+ await apply({a:['fast'],b:['same','other']});
+ assert.deepEqual(requests.map(r=>r.route), ['/configs?force=false']);
+ assert.equal(state.entry, 'other');
  const live = YAML.parse(requests[0].body.payload);
- assert.equal(live['proxy-providers'].a.type, 'inline');
- assert.equal(live['proxy-providers'].a.path, undefined);
+ assert.equal(live['proxy-providers'].b.type, 'inline');
+ assert.equal(live['proxy-providers'].b.path, undefined);
+ assert.deepEqual(live['proxy-groups'][0].use, ['b','a']);
+ assert.equal(live['proxy-providers'].b.payload[0].name, 'other');
  const saved = YAML.parse(await fs.readFile(path.join(root,'clash-verge.yaml'),'utf8'));
- assert.equal(saved['proxy-providers'].a.type, 'http');
- assert.equal(saved['proxy-providers'].a.filter, '^fast$|^quick$');
+ assert.equal(saved['proxy-providers'].b.type, 'http');
+ assert.equal(saved['proxy-providers'].b.filter, '^same$|^other$');
  const index = YAML.parse(await fs.readFile(path.join(root,'profiles.yaml'),'utf8'));
- assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'quick'}]);
+ assert.deepEqual(index.items[0].selected, [{name:ENTRY, now:'other'}]);
  assert.equal(downloads.length, 0);
 });
 
-test('empty and vanished selections leave config, subscription caches and policy untouched', async t => {
- const {b, root, apply, requests, saved, refreshWith} = await fixture(t);
+test('present owned winner is switched before reload', async t => {
+ const {apply, requests, atReload, state} = await fixture(t);
+ await apply({a:['fast','quick'],b:[]});
+ assert.deepEqual(requests.map(r => r.route), [ENTRY_ROUTE, '/configs?force=false']);
+ assert.deepEqual(atReload, ['fast']);
+ assert.equal(state.entry, 'fast');
+});
+
+test('empty selection refuses and all vanished can recover in the picker', async t => {
+ const {b, root, apply, requests, saved, refreshWith, state} = await fixture(t);
  await assert.rejects(apply({a:[],b:[]}), /没有你勾选/);
  assert.equal(requests.length, 0);
  await apply({a:['current'],b:[]});
@@ -149,6 +191,29 @@ test('empty and vanished selections leave config, subscription caches and policy
  assert.deepEqual(await snapshot(), before);
  assert.deepEqual(await saved(), savedBefore);
  assert.equal(requests.length, 0);
+ const fresh = await sub.catalog(b);
+ assert.deepEqual(fresh.sources.map(s => s.nodes.map(n => n.name)), [['new'], ['new']]);
+ await sub.run(b, {fingerprint: fresh.fingerprint, current: fresh.current, selected: {a:['new'],b:[]}});
+ assert.equal(state.entry, 'new');
+ assert.deepEqual((await saved()).selected_nodes, {a:['new']});
+ assert.deepEqual(YAML.parse(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8')).proxies, [node('new')]);
+});
+
+test('other group keeps its static reference and ENTRY uses the selected owner once', async t => {
+ const {b, root, config, write, apply, state, requests} = await fixture(t);
+ config['proxy-groups'][0].proxies = ['current'];
+ config['proxy-groups'].push({name:'secondary',type:'select',proxies:['current']});
+ await write('clash-verge.yaml', config);
+ await write('profiles/a.yaml', {proxies:[node('current')]});
+ if (process.env.LINKBOX_TEST_CORE) b.validateConfig = file => {
+  execFileSync(process.env.LINKBOX_TEST_CORE, ['-t', '-d', root, '-f', file]);
+ };
+ await apply({a:['current'],b:[]});
+ const payload = YAML.parse(requests[0].body.payload);
+ assert.deepEqual(payload.proxies.find(n => n.name === 'current'), node('current'));
+ assert.deepEqual(payload['proxy-groups'][1].proxies, ['current']);
+ assert.deepEqual(state.live, ['current']);
+ assert.deepEqual(payload['proxy-providers'].a.payload.map(n => n.name), ['current']);
 });
 
 test('validation failure and external state change cancel before any reload', async t => {
@@ -163,10 +228,15 @@ test('validation failure and external state change cancel before any reload', as
 });
 
 test('failed reload restores the files and does not attempt to switch', async t => {
- const {b, root, policy, apply} = await fixture(t);
+ const {b, root, policy, apply, setProviders} = await fixture(t);
  const file = path.join(root,'clash-verge.yaml'), original = await fs.readFile(file);
  let count = 0;
- b.request = async () => {count++;throw Error('timeout');};
+ setProviders({});
+ const controller = b.request;
+ b.request = async (...args) => {
+  if(args[1] === 'PUT'){count++;throw Error('timeout');}
+  return controller(...args);
+ };
  await assert.rejects(apply({a:['fast'],b:[]}), /文件已回退/);
  assert.equal(count, 1);
  assert.deepEqual(await fs.readFile(file), original);
@@ -213,16 +283,59 @@ test('deleted subscriptions disappear from picker and a rotation retains the sta
   sub.sourceKey('https://b.invalid/client/'+'a'.repeat(24)));
 });
 
-test('a confirmed reload with an unconfirmed selector change reports the failure', async t => {
+test('lost reload response keeps new files even with unchanged group membership', async t => {
+ const {b, root, state, apply, refreshWith} = await fixture(t);
+ await apply({a:['current','fast'],b:[]});
+ const before = structuredClone(state);
+ refreshWith({a:['current','fast','new'],b:['other']});
+ const controller = b.request;
+ b.request = async (...args) => {
+  const result = await controller(...args);
+  if(args[2] === '/configs?force=false') throw Error('response lost');
+  return result;
+ };
+ await b.updateSubscriptions();
+ assert.deepEqual(state, before);
+ assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /new/);
+});
+
+test('unobservable reload keeps new files and requests refresh', async t => {
+ const {b, state, apply, saved} = await fixture(t);
+ const controller = b.request;
+ let offline = false;
+ b.request = async (...args) => {
+  if(offline) throw Error('offline');
+  const result = await controller(...args);
+  if(args[2] === '/configs?force=false'){offline = true;throw Error('response lost');}
+  return result;
+ };
+ await assert.rejects(apply({a:['quick'],b:[]}), /无法确认.*已保留.*请刷新/);
+ assert.equal(state.entry, 'quick');
+ assert.deepEqual((await saved()).selected_nodes, {a:['quick']});
+});
+
+for(const recover of [true, false]) test('switch retries after reading state, then ' + (recover ? 'recovers' : 'reports failure'), async t => {
  const {b, state, apply, requests, saved} = await fixture(t);
  b.history = {latestResults: {quick: {chainDelay:20, owner:'a'}}};
  const controller = b.request;
+ const calls = [];
+ const observe = b.state;
+ b.state = async () => {calls.push('state');return observe();};
  b.request = async (...args) => {
-  if(args[2] === '/configs?force=false')await controller(...args);
-  else requests.push({route:args[2], body:args[3]});
+  calls.push(args[2]);
+  if(args[2] === ENTRY_ROUTE && (!recover || !requests.some(r => r.route === ENTRY_ROUTE))){
+   requests.push({route:args[2], body:args[3]});
+   throw Error('switch failed');
+  }
+  const result = await controller(...args);
+  if(args[2] === '/configs?force=false') state.entry = 'fast';
+  return result;
  };
- await assert.rejects(apply({a:['fast','quick'],b:[]}), /切换后的状态待核对/);
- assert.equal(requests.length, 2);
- assert.equal(state.entry, 'fast');
+ if(recover) await apply({a:['fast','quick'],b:[]});
+ else await assert.rejects(apply({a:['fast','quick'],b:[]}), /配置已更新，但无法切换/);
+ assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', ENTRY_ROUTE, ENTRY_ROUTE]);
+ const first = calls.indexOf(ENTRY_ROUTE);
+ assert.deepEqual(calls.slice(first + 1, first + 3), ['state', '/providers/proxies']);
+ assert.equal(state.entry, recover ? 'quick' : 'fast');
  assert.deepEqual((await saved()).selected_nodes, {a:['fast','quick']});
 });

@@ -26,6 +26,32 @@ function autoCandidate(results,current,metric){
  return !valid(currentRow.chainDelay)||(valid(baseline)&&baseline-best[1][key]>=Math.max(20,baseline*.10))?best[0]:null;
 }
 function signature(s){return JSON.stringify([s.mode,s.tun,s.entry,s.exit,s.dialer,s.live]);}
+function entryOwners(live, providers){
+ const names=new Set(), ambiguous=new Set();
+ for(const name of live){
+  if(names.has(name))ambiguous.add(name);
+  names.add(name);
+ }
+ const owners=new Map();
+ // Mihomo exposes static group members through a Compatible provider.
+ for(const [owner,provider] of Object.entries(providers)){
+  if(owner!==ENTRY&&provider.vehicleType==='Compatible')continue;
+  for(const {name} of provider.proxies||[]){
+   if(!names.has(name)||ambiguous.has(name))continue;
+   if(owner===ENTRY||(owners.has(name)&&owners.get(name)!==owner)){
+    ambiguous.add(name);
+    owners.delete(name);
+   }else owners.set(name,owner);
+  }
+ }
+ return owners;
+}
+function entryMemberOwned(live, providers, name, owner){
+ return !!owner&&entryOwners(live,providers).get(name)===owner;
+}
+function switchable(state,name,owner){
+ return !!owner&&state.switchable.includes(name)&&state.nodes.some(row=>row.name===name&&row.providerId===owner);
+}
 function ipv6Assessment(addresses,probes){
  if(probes.some(x=>x.connected))return {status:'warn',detail:'存在 IPv6 通路，需核实出口；连接成功本身不等于泄漏'};
  if(!Array.isArray(addresses)||probes.some(x=>x.connected!==false))return {status:'warn',detail:'结果不完整，IPv6 未验证'};
@@ -83,6 +109,7 @@ class Backend{
   const [c,p,providers]=await Promise.all([this.api('GET','/configs'),this.api('GET','/proxies'),this.api('GET','/providers/proxies')]);
   const all=p.proxies||{},g=all[ENTRY]||{},live=g.all||[];
   const owners=selectionOwners(this.nodePolicy.selected_nodes);
+  const liveOwners=entryOwners(live,providers.providers||{});
   const liveRows=new Map();
   for(const [owner,provider] of Object.entries(providers.providers||{})){
    for(const node of provider.proxies||[]){
@@ -96,12 +123,28 @@ class Backend{
   });
   return {expectedIP:this.expectedIP,mode:c.mode,tun:!!c.tun?.enable,ipv6:c.ipv6,mixedPort:c['mixed-port']||7897,
    entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live,nodes,
-   switchable:live.filter(name=>liveRows.has(name)),lastTest:this.history.finishedAt,
+   switchable:live.filter(name=>liveOwners.has(name)&&liveOwners.get(name)===owners.get(name)),lastTest:this.history.finishedAt,
    settings:{...benchmarkSettings(this.settings),hourly:this.settings.hourly!==false,configDir:this.root,corePath:this.settings.corePath||''},
    progress:this.progress};
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
- async switchNode(name,previous){if(this.busy)throw Error('请先停止本轮测速或等待当前操作完成');this.busy=true;try{const before=await this.state();this.assertChain(before);if(before.entry!==previous||!before.switchable.includes(name))throw Error('节点状态已变化，请刷新状态');if(name!==previous)await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name});const after=await this.state();if(after.entry!==name||after.exit!==EXIT||after.mode!=='global'||after.dialer!==ENTRY)throw Error('切换后的状态待核对，请刷新；没有继续调整');return after;}finally{this.busy=false;}}
+ async switchNode(name,previous){
+  if(this.busy)throw Error('请先停止本轮测速或等待当前操作完成');
+  this.busy=true;
+  try{
+   const before=await this.state();
+   this.assertChain(before);
+   if(before.entry!==previous||!before.live.includes(name))throw Error('节点状态已变化，请刷新状态');
+   const owner=before.nodes.find(row=>row.name===name)?.providerId;
+   if(!switchable(before,name,owner))throw Error('节点归属已变化，请先更新订阅');
+   if(name!==previous)await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name});
+   const after=await this.state();
+   if(after.entry!==name||after.exit!==EXIT||after.mode!=='global'||after.dialer!==ENTRY||!switchable(after,name,owner)){
+    throw Error('切换后的状态待核对，请刷新 Clash 状态');
+   }
+   return after;
+  }finally{this.busy=false;}
+ }
 
  async textRequest(url,port=null,{timeout=12000,max=2e6,signal,accept=[200]}={}){
   const u=new URL(url);if(u.protocol!=='https:')throw Error('只允许 HTTPS');
@@ -219,10 +262,12 @@ class Backend{
    const sameRouting=fresh?.nodes.has(target)&&isDeepStrictEqual(
     [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
     [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);
-   if(sameRouting&&authorized()&&signature(current)===signature(before)&&JSON.stringify(currentNetwork)===JSON.stringify(network)&&current.switchable.includes(target)){
+   if(sameRouting&&authorized()&&signature(current)===signature(before)&&JSON.stringify(currentNetwork)===JSON.stringify(network)&&current.live.includes(target)){
+    const owner=before.nodes.find(row=>row.name===target)?.providerId;
+    if(!switchable(current,target,owner))throw Error('节点归属已变化，请先更新订阅');
     await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name:target});
     const after=await this.state();
-    if(signature(after)!==signature({...before,entry:target}))throw Error('自动切换后的状态待核对，请刷新 Clash 状态');
+    if(signature(after)!==signature({...before,entry:target})||!switchable(after,target,owner))throw Error('自动切换后的状态待核对，请刷新 Clash 状态');
     return {...this.history,switchedTo:target};
    }
   }
@@ -243,4 +288,4 @@ class Backend{
  const result={time:new Date().toISOString(),expected:this.expectedIP,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,autoCandidate,benchmarkSettings,isolatedConfig,signature,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,autoCandidate,benchmarkSettings,isolatedConfig,signature,entryMemberOwned,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};

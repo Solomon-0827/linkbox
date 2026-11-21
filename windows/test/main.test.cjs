@@ -19,6 +19,21 @@ test('dynamic scheduler replaces its previous timer and skips while the UI is bu
  vm.runInContext('backend.settings.hourly=false;scheduleAuto()',context);assert.deepEqual(cleared,[1,2]);assert.equal(intervals.length,2);
 });
 
+test('startup state retries a failed initialization on Refresh and stops after success', async () => {
+ let calls=0;
+ const electron={app:{setName(){},requestSingleInstanceLock:()=>false,quit(){}},nativeTheme:{},ipcMain:{handle(){}}};
+ const subscriptions={async initialize(){if(++calls===1)throw Error('offline');return true;}};
+ const fake={root:'fixture',state:async()=>({mode:'global',exit:'美国静态家宽',dialer:'中转入口'})};
+ const context=vm.createContext({require:name=>name==='electron'?electron:name==='./subscriptions.cjs'?subscriptions:
+  name==='./backend.cjs'?{safeError:e=>e.message}:require(name),process:{argv:[],platform:'darwin'},__dirname,fake});
+ vm.runInContext(fs.readFileSync(require.resolve('../main.cjs'),'utf8'),context);
+ vm.runInContext('backend=fake',context);
+ assert.equal((await vm.runInContext('startupState()',context)).selectionError,'offline');
+ assert.equal((await vm.runInContext('startupState()',context)).selectionError,undefined);
+ await vm.runInContext('startupState()',context);
+ assert.equal(calls,2);
+});
+
 test('every renderer action crosses the real preload allowlist and has a main IPC handler', async () => {
  const renderer=fs.readFileSync(require.resolve('../renderer.js'),'utf8')
   .replace('function call(a,d)', 'function invokeAction(a,d)').replace('window.linkbox.call(a,d)', 'bridge(a,d)');

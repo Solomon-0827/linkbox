@@ -103,7 +103,6 @@ def change(target,previous,guard=None):
         raise RuntimeError('当前全局链路与预期不符，已取消。请先在 Clash 恢复全局 → 美国静态家宽。')
     if s['entry']!=previous or target not in s['nodes'] or target not in s['live']:
         raise RuntimeError('节点状态已变化，请刷新后重新选择。')
-    if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     if guard is not None:
         import chain_test
         if chain_test.physical_network()!=guard['network'] or chain_test.active_state()[0]!=guard['before']:
@@ -113,12 +112,17 @@ def change(target,previous,guard=None):
                 (t.BASE/'chain-cancel').exists()):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
     owners = selection_owners(runtime.read_json('node-policy.json').get('selected_nodes'))
-    if target not in owners or target not in t.node_inventory({}, owners):
+    owner = owners.get(target)
+    if not t.entry_member_owned(s['live'], t.proxy_providers(), target, owner):
         raise RuntimeError('节点归属已变化，请先更新订阅')
+    if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
+    if (selection_owners(runtime.read_json('node-policy.json').get('selected_nodes')).get(target) != owner
+            or not t.entry_member_owned(after['live'], t.proxy_providers(), target, owner)):
+        raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)
     except Exception as e:warning='实时切换成功，但保存选择失败：'+str(e)
@@ -157,6 +161,7 @@ def main():
             try:
                 result['initialized'] = subscription_picker.initialize(sys.argv[2])
             except RuntimeError as error:
+                result['startup_checked'] = False
                 result['message'] = str(error)
         result['state'] = snapshot()
     elif action=='subscription-catalog':

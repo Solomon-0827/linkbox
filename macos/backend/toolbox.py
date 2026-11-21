@@ -48,6 +48,21 @@ def relay_state():
             'dialer': proxies.get(EXIT, {}).get('dialer-proxy'), 'live': group.get('all', [])}
 
 
+def proxy_providers():
+    return api('GET', '/providers/proxies')['providers']
+
+
+def entry_member_owned(live, providers, name, owner):
+    if not owner or live.count(name) != 1:
+        return False
+    # Mihomo exposes static group members through a Compatible provider.
+    if any(node['name'] == name for node in providers.get(ENTRY, {}).get('proxies', [])):
+        return False
+    possible = [key for key, provider in providers.items() if provider.get('vehicleType') != 'Compatible'
+                and any(node['name'] == name for node in provider.get('proxies', []))]
+    return possible == [owner]
+
+
 def node_inventory(proxies, owners):
     result = {name: (value, value.get('provider-name')) for name, value in proxies.items()
               if name not in owners}

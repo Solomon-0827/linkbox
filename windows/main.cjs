@@ -23,7 +23,7 @@ app.whenReady().then(async()=>{
  win.on('close',e=>{if(!quitting){e.preventDefault();win.hide();}});await win.loadFile('index.html');win.show();
  tray=new Tray(nativeImage.createFromPath(path.join(__dirname,'icon.png')).resize({width:32,height:32}));tray.setToolTip('链路盒子 · 后台运行');tray.setContextMenu(Menu.buildFromTemplate([{label:'打开链路盒子',click:()=>win.show()},{label:'停止测速',click:()=>backend.cancel()},{type:'separator'},{label:'退出链路盒子',click:()=>app.quit()}]));tray.on('double-click',()=>win.show());
  scheduleAuto();
- if(!DEMO)setTimeout(()=>{if(!initializedSelection)auto();},12000);
+ if(!DEMO)setTimeout(()=>{if(startupChecked&&!initializedSelection)auto();},12000);
 });
 }
 async function coffee(){if(coffeePending)return coffeePending;coffeePending=(async()=>{
@@ -41,9 +41,13 @@ async function startupState(){
  if(startupChecked)return state;
  initialization ||= subscriptions.initialize(backend).then(changed=>({changed}))
   .catch(error=>({changed:false,selectionError:safeError(error)}));
- const {changed,selectionError}=await initialization;
- startupChecked=true;
- initializedSelection=changed;
+ const pending=initialization;
+ const {changed,selectionError}=await pending;
+ if(initialization===pending){
+  initialization=null;
+  startupChecked=!selectionError;
+  initializedSelection=changed;
+ }
  return {...(changed?await backend.state():state),selectionError};
 }
 ipcMain.handle('linkbox',async(event,action,data)=>{

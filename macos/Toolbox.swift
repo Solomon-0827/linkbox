@@ -620,7 +620,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         invoke(["startup",autoMetric],message:"正在读取 Clash 状态…") { result in
             self.startupChecked=result["startup_checked"] as? Bool ?? false
             self.refreshOnline()
-            if result["initialized"] as? Bool != true { self.startAutomaticTest() }
+            if self.startupChecked && result["initialized"] as? Bool != true { self.startAutomaticTest() }
         }
         configureAutoTests()
     }
@@ -909,15 +909,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func updatePickerSubscriptions(_ picker:SubscriptionPicker) {
         guard !busy,nodePicker === picker else { return }
         picker.setUpdating(true,message:"正在更新全部订阅…")
-        invoke(["update-subscriptions",autoMetric],message:"正在更新全部订阅…",failed:{ error in
-            picker.setUpdating(false,message:error)
-        }) { result in
-            self.showFastestNodes()
-            self.refreshOnline()
+        let reloadCatalog: (String)->Void = { message in
             picker.catalogCurrent=false
             picker.setUpdating(true,message:"正在读取最新节点…")
             let readFailed: (String)->Void = { error in
-                picker.setUpdating(false,message:"订阅已更新，列表读取失败。\(error)")
+                picker.setUpdating(false,message:"\(message) 列表读取失败。\(error)")
             }
             self.invoke(["subscription-catalog"],message:"正在读取最新节点…",failed:readFailed) { updated in
                 guard let catalog=updated["catalog"] as? [String:Any] else {
@@ -925,8 +921,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     return
                 }
                 picker.loadCatalog(catalog)
-                picker.setUpdating(false,message:result["message"] as? String ?? "订阅已更新")
+                picker.setUpdating(false,message:message)
             }
+        }
+        invoke(["update-subscriptions",autoMetric],message:"正在更新全部订阅…",failed:{ error in
+            if error.hasPrefix("订阅里已没有你勾选的节点") { reloadCatalog(error) }
+            else { picker.setUpdating(false,message:error) }
+        }) { result in
+            self.showFastestNodes()
+            self.refreshOnline()
+            reloadCatalog(result["message"] as? String ?? "订阅已更新")
         }
     }
     @objc func updateSubscriptions() {

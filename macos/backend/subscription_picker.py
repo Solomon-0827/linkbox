@@ -10,12 +10,18 @@ import toolbox as t
 import subscription_update as update
 from reconcile import reconcile, selection_owners
 
+PREVIEW = 'subscription-preview.yaml'
 
-def document(path):
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def document(raw):
     try:
-        value = yaml.safe_load(path.read_text())
+        value = yaml.safe_load(raw) if raw is not None else None
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, yaml.YAMLError):
+    except (ValueError, yaml.YAMLError):
         return {}
 
 
@@ -29,7 +35,7 @@ def source_key(url):
 
 def discover(for_update=False):
     root = runtime.CONFIG_DIR
-    profiles = document(root / 'profiles.yaml')
+    profiles = document(update.read(root / 'profiles.yaml'))
     items = profiles.get('items')
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
@@ -38,24 +44,6 @@ def discover(for_update=False):
     by_url = {source_key(s['url']): s for s in registry if s.get('url')}
     sources = []
     seen = set()
-    def add(source, doc):
-        url = source.get('url', '')
-        if source_key(url) in seen or not url.startswith('https://'):
-            return
-        seen.add(source_key(url))
-        nodes = []
-        names = set()
-        entries = doc.get('proxies')
-        for n in entries if isinstance(entries, list) else []:
-            if (not isinstance(n, dict) or not isinstance(n.get('name'), str)
-                    or not all(n.get(k) for k in ('name', 'type', 'server', 'port'))):
-                continue
-            if n['name'] in (t.ENTRY, t.EXIT, 'DIRECT', 'REJECT') or update.NOTICE.search(n['name']):
-                continue
-            if n['name'] in names:
-                raise RuntimeError('订阅含重名节点，请先在 Clash Verge 修复：' + source['display_name'])
-            names.add(n['name']); nodes.append(n)
-        sources.append((source, {**doc, 'proxies': nodes}))
     for item in items:
         if item.get('type') != 'remote':
             continue
@@ -71,12 +59,43 @@ def discover(for_update=False):
             continue
         old = by_url.get(source_key(item['url']), {})
         identifier = old.get('name') or 'verge_' + hashlib.sha256(str(item.get('uid', filename)).encode()).hexdigest()[:12]
-        add({'name': identifier, 'display_name': item.get('name') or identifier,
-             'url': item['url'], 'profile_file': filename}, document(root / 'profiles' / filename))
+        profile = root / 'profiles' / filename
+        source = {'name': identifier, 'display_name': item.get('name') or identifier,
+                  'url': item['url'], 'profile_file': filename}
+        key = source_key(item['url'])
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append((source, update.read(profile)))
     if len({s['name'] for s, _ in sources}) != len(sources):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
-    fingerprint = hashlib.sha256(json.dumps([sources, runtime.read_json('node-policy.json')], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    return sources, fingerprint
+    revisions = [[source, None if raw is None else hashlib.sha256(raw).hexdigest()] for source, raw in sources]
+    revision = fingerprint([str(root), revisions, runtime.read_json('node-policy.json')])
+    if for_update:
+        return [(source, None) for source, _ in sources], revision, False
+    raw_preview = update.read(runtime.BASE / PREVIEW)
+    preview = document(raw_preview)
+    use_preview = preview.get('revision') == revision
+    inventory = [(source, preview['documents'][source['name']] if use_preview
+                  else clean(document(raw), source['display_name'])) for source, raw in sources]
+    return inventory, fingerprint([revision, hashlib.sha256(raw_preview).hexdigest() if use_preview else None]), use_preview
+
+
+def clean(doc, label):
+    nodes = []
+    names = set()
+    entries = doc.get('proxies')
+    for n in entries if isinstance(entries, list) else []:
+        if (not isinstance(n, dict) or not isinstance(n.get('name'), str)
+                or not all(n.get(k) for k in ('name', 'type', 'server', 'port'))):
+            continue
+        if n['name'] in (t.ENTRY, t.EXIT, 'DIRECT', 'REJECT') or update.NOTICE.search(n['name']):
+            continue
+        if n['name'] in names:
+            raise RuntimeError('订阅含重名节点，请先在 Clash Verge 修复：' + label)
+        names.add(n['name'])
+        nodes.append(n)
+    return {**doc, 'proxies': nodes}
 
 
 def plan(sources, selection, state, metric='chain', results=None):
@@ -86,7 +105,7 @@ def plan(sources, selection, state, metric='chain', results=None):
 
 
 def catalog():
-    sources, fingerprint = discover()
+    sources, fingerprint, _ = discover()
     state = t.relay_state()
     saved = runtime.read_json('node-policy.json').get('selected_nodes')
     owners = selection_owners(plan(sources, saved, state)['selection'])
@@ -127,6 +146,4 @@ def synchronize(metric='chain'):
 
 
 def initialize(metric='chain'):
-    if runtime.read_json('node-policy.json').get('selected_nodes') is not None:
-        return False
     return update.run(metric, initialize=True)
