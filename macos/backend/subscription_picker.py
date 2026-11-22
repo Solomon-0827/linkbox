@@ -38,7 +38,8 @@ def source_key(url):
 
 
 def discover(for_update=False):
-    profiles = document(clash.read_file(clash.profiles_file()))
+    root = clash.CONFIG_DIR
+    profiles = document(clash.read_file(clash.profiles_file(root)))
     items = profiles.get('items')
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
@@ -56,7 +57,7 @@ def discover(for_update=False):
             continue
         filename = item['file']
         try:
-            profile = clash.profile_file(filename)
+            profile = clash.profile_file(root, filename)
         except ValueError as error:
             if for_update:
                 raise RuntimeError(str(error)) from None
@@ -78,7 +79,7 @@ def discover(for_update=False):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, digest(raw)] for source, raw in sources]
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
-    revision = fingerprint([str(clash.CONFIG_DIR), revisions, selection])
+    revision = fingerprint([str(root), revisions, selection])
     if for_update:
         return [(source, None) for source, _ in sources], revision, None
     raw_preview = clash.read_file(runtime.BASE / PREVIEW)

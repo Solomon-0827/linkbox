@@ -26,7 +26,7 @@ class PolicyTests(unittest.TestCase):
         def relay(address):
             return {'name': 'same', 'server': address}
 
-        with tempfile.TemporaryDirectory() as tmp, patch.object(clash, 'CONFIG_DIR', Path(tmp)):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(chain_test, 'CONFIG_DIR', Path(tmp)):
             (Path(tmp) / 'a.yaml').write_text(yaml.safe_dump({'proxies': [relay('a.example.invalid')]}))
             config = {'proxies': [relay('local.example.invalid'),
                                    {'name': t.EXIT, 'server': '203.0.113.10', 'dialer-proxy': t.ENTRY}],

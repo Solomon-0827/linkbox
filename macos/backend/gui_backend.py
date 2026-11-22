@@ -130,7 +130,7 @@ def change(target,previous,guard=None):
     if target not in after_owners or after_owners[target] != owner:
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
-    try:clash.persist_selection(target, backup_dir=t.BASE / 'backups')
+    try:t.persist_selection(target)
     except Exception as e:warning='实时切换成功，但保存选择失败：'+str(e)
     return {'message':warning or '已切换中转入口，美国静态出口保持不变。建议运行网络检查。','state':after}
 

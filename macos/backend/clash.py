@@ -48,7 +48,10 @@ def _request(method, path, payload=None, *, timeout=6, expected_status=None):
     conn = Connection('localhost')
     try:
         body = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
-        conn.request(method, path, body, {'Content-Type': 'application/json'} if body is not None else {})
+        if expected_status == 200:
+            conn.request(method, path)
+        else:
+            conn.request(method, path, body, {'Content-Type': 'application/json'})
         response = conn.getresponse()
         if not 200 <= response.status < 300 or expected_status not in (None, response.status):
             raise ClashHTTPError(response.status, expected_status=expected_status)
@@ -83,12 +86,12 @@ def switch_entry(name):
     _request('PUT', _ENTRY_ROUTE, {'name': name})
 
 
-def reload(payload, prepare, rollback):
+def reload(root, payload, prepare, rollback):
     try:
-        with tempfile.TemporaryDirectory(prefix='linkbox-update-', dir=CONFIG_DIR) as folder:
+        with tempfile.TemporaryDirectory(prefix='linkbox-update-', dir=root) as folder:
             file = Path(folder) / 'config.yaml'
             file.write_bytes(payload)
-            subprocess.run([CORE, '-t', '-d', str(CONFIG_DIR), '-f', str(file)],
+            subprocess.run([CORE, '-t', '-d', str(root), '-f', str(file)],
                            capture_output=True, timeout=30, check=True)
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError(_VALIDATION_FAILED) from None
@@ -107,30 +110,30 @@ def reload(payload, prepare, rollback):
         raise RuntimeError(message) from None
 
 
-def config_file():
-    return CONFIG_DIR / 'clash-verge.yaml'
+def config_file(root):
+    return root / 'clash-verge.yaml'
 
 
-def profiles_file():
-    return CONFIG_DIR / 'profiles.yaml'
+def profiles_file(root):
+    return root / 'profiles.yaml'
 
 
-def script_file():
-    return profile_file('Script.js')
+def script_file(root):
+    return profile_file(root, 'Script.js')
 
 
-def profile_file(filename):
+def profile_file(root, filename):
     if not isinstance(filename, str) or not filename or Path(filename).name != filename or filename in {'.', '..'} or '\\' in filename:
         raise ValueError('Clash Verge 订阅路径无效，未删除节点')
-    return CONFIG_DIR / 'profiles' / filename
+    return root / 'profiles' / filename
 
 
-def managed_cache_file(owner):
-    return CONFIG_DIR / 'providers/linkbox' / (owner + '.yaml')
+def managed_cache_file(root, owner):
+    return root / 'providers/linkbox' / (owner + '.yaml')
 
 
-def provider_file(path):
-    return CONFIG_DIR / path
+def provider_file(root, path):
+    return root / path
 
 
 def read_file(path):
@@ -140,14 +143,13 @@ def read_file(path):
         return None
 
 
-def read_config(*, text=True):
-    path = config_file()
+def read_yaml(path, *, text=True):
     return yaml.safe_load(path.read_text() if text else path.read_bytes())
 
 
-def write_file(path, data, *, expected=None, conflict=None, require_existing=False):
+def write_file(path, data, *, expected=None, conflict=None, require_existing=False, prefix='.linkbox-'):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix='.linkbox-', dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=prefix, dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as output:
             output.write(data)
@@ -189,8 +191,7 @@ def update_selector(index, name, *, include_exit=False):
     return changed
 
 
-def persist_selection(name, *, backup_dir=None):
-    path = profiles_file()
+def persist_selection(path, name, *, backup_dir=None):
     original = path.read_bytes()
     index = yaml.safe_load(original)
     if not update_selector(index, name, include_exit=backup_dir is not None) and backup_dir is None:
@@ -202,5 +203,6 @@ def persist_selection(name, *, backup_dir=None):
         with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as file:
             file.write(original)
     write_file(path, output, expected=original, require_existing=backup_dir is not None,
+               prefix='.toolbox-' if backup_dir is not None else '.linkbox-',
                conflict='Clash 同时更新了订阅文件，跳过持久化，避免覆盖' if backup_dir is not None
                else '配置或节点已被其他操作改变，已取消更新')

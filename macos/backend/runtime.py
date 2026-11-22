@@ -20,7 +20,7 @@ def expected_ip(config=None):
     value=read_json('settings.json').get('expected_ip','')
     if not value:
         try:
-            if config is None:config=clash.read_config()
+            if config is None:config=clash.read_yaml(clash.config_file(clash.CONFIG_DIR))
             value=next(n.get('server','') for n in config.get('proxies',[]) if n.get('name')==clash.EXIT)
         except (OSError,ValueError,StopIteration,AttributeError):return ''
     try:return str(ip_address(value))

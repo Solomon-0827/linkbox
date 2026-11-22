@@ -17,6 +17,7 @@ import tempfile
 import time
 import yaml
 import clash
+from clash import CONFIG_DIR
 import toolbox as t
 import runtime
 from settings import benchmark_value
@@ -62,14 +63,14 @@ def load_nodes():
     from subscription_update import entry_plan
 
     global DNS_POLICY
-    conf = clash.read_config()
+    conf = clash.read_yaml(clash.config_file(CONFIG_DIR))
     DNS_POLICY = {k: v for k, v in conf.get('dns', {}).get('proxy-server-nameserver-policy', {}).items()
                   if not k.startswith(('geosite:', 'rule-set:'))}
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
     owners = selection_owners(selection)
     nodes = {}
     if selection is None:
-        nodes = {name: node for name, (_, node) in (entry_plan(conf) or {}).items() if node is not None}
+        nodes = {name: node for name, (_, node) in (entry_plan(conf, CONFIG_DIR) or {}).items() if node is not None}
     providers = conf.get('proxy-providers', {})
     for owner in dict.fromkeys(owners.values()):
         provider = providers.get(owner, {})
@@ -77,7 +78,7 @@ def load_nodes():
             continue
         if provider.get('path'):
             try:
-                data = yaml.safe_load(clash.read_file(clash.provider_file(provider['path'])) or b'')
+                data = clash.read_yaml(clash.provider_file(CONFIG_DIR, provider['path']))
             except (OSError, ValueError, yaml.YAMLError):
                 continue
             proxies = data.get('proxies') if isinstance(data, dict) else None

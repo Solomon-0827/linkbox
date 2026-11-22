@@ -111,12 +111,14 @@ class Clash {
  #transport;
  #validate;
  #endpoint;
- constructor(settings, powershell, {transport = request, validate, endpoint} = {}) {
+ #resolveConfig;
+ constructor(settings, powershell, {transport = request, validate, endpoint, resolveConfig = () => this.config()} = {}) {
   this.#settings = settings;
   this.#powershell = powershell;
   this.#transport = transport;
   this.#validate = validate;
   this.#endpoint = endpoint;
+  this.#resolveConfig = resolveConfig;
  }
 
  resetConnection() { this.#endpoint = null; }
@@ -130,13 +132,14 @@ class Clash {
  async connections(timeout) { return this.#call('GET', '/connections', undefined, timeout); }
  async switchEntry(name) { await this.#call('PUT', ENTRY_ROUTE, {name}); }
 
- async reload(root, payload, prepare, rollback) {
+ async reload(root, payload, prepare, rollback, validationRoot = () => root) {
   const temp = await fs.mkdtemp(path.join(root, 'linkbox-validate-'));
   try {
    const file = path.join(temp, 'config.yaml');
    await fs.writeFile(file, payload, {mode: 0o600});
    if (this.#validate) await this.#validate(file);
-   else await exec(await this.corePath(), ['-t', '-d', root, '-f', file],
+   // The core lookup can yield to another config resolution before -d is read.
+   else await exec(await this.corePath(), ['-t', '-d', validationRoot(), '-f', file],
     {windowsHide: true, timeout: 30000, maxBuffer: 2e6});
   } catch {
    throw Error('配置校验失败，未改动当前代理');
@@ -187,8 +190,8 @@ class Clash {
   return typeof value === 'string' ? value : '';
  }
 
- async config(pinnedRoot) {
-  const configured = pinnedRoot ?? this.connectionPath('configDir');
+ async config() {
+  const configured = this.connectionPath('configDir');
   const directory = 'io.github.clash-verge-rev.clash-verge-rev';
   const roots = configured ? [configured] : process.platform === 'win32'
    ? [process.env.APPDATA, process.env.LOCALAPPDATA].map(base => path.join(base || '', directory))
@@ -207,7 +210,7 @@ class Clash {
 
  async #discover() {
   let config;
-  try { ({config} = await this.config()); }
+  try { ({config} = await this.#resolveConfig()); }
   catch (error) { throw new ClashRequestNotSent(error.message); }
   const endpoints = [];
   // Clash Verge service uses an owner-scoped endpoint, overriding the sidecar path in YAML.

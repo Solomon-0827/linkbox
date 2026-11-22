@@ -59,7 +59,8 @@ class SubscriptionFixture:
         stack = ExitStack()
         self.addCleanup(stack.close)
         for obj, key, value in [(runtime, 'BASE', self.base), (t, 'BASE', self.base),
-                                (clash, 'CONFIG_DIR', self.root)]:
+                                (clash, 'CONFIG_DIR', self.root), (chain, 'CONFIG_DIR', self.root),
+                                (t, 'PROFILES', self.index)]:
             stack.enter_context(patch.object(obj, key, value))
         self.validate = stack.enter_context(patch.object(clash.subprocess, 'run'))
         self.requests = []

@@ -35,7 +35,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(config['proxies'][0]['interface-name'],'en9')
         self.assertEqual(config['rules'],['DOMAIN,www.gstatic.com,TEST_ENTRY','MATCH,TEST_US_EXIT'])
     def test_expected_ip_override_with_hostname_and_different_server_ip(self):
-        with TemporaryDirectory() as tmp, patch.object(clash, 'CONFIG_DIR', Path(tmp)), \
+        with TemporaryDirectory() as tmp, patch.object(c, 'CONFIG_DIR', Path(tmp)), \
                 patch.object(c.runtime, 'read_json', return_value={'expected_ip': '203.0.113.10'}):
             path = Path(tmp) / 'clash-verge.yaml'
             for server in ['exit.example.invalid', '203.0.113.11']:

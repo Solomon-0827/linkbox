@@ -60,22 +60,33 @@ class ClashAdapterTests(unittest.TestCase):
                     self.assertEqual(network_check.safe(diagnostic), {'error': 'Clash API HTTP 204'})
             receive.return_value.read.assert_not_called()
 
-    def test_controller_sends_json_header_only_for_requests_with_a_body(self):
+    def test_controller_preserves_ordinary_and_diagnostic_request_headers(self):
         connection = http.client.HTTPConnection
         with (patch.object(connection, 'request') as send,
               patch.object(connection, 'getresponse') as receive,
               patch.object(network_check, 'run', side_effect=['123 claude', ''])):
             receive.return_value.status = 200
-            receive.return_value.read.side_effect = [b'{}', b'{"proxies": {}}', b'{}', b'']
+            receive.return_value.read.side_effect = [
+                b'{}', b'{"proxies": {}}', b'{}',
+                b'{}', b'{"proxies": {}}', b'{}', b'{"delay": 12}', b'',
+            ]
             network_check.local_state()
             network_check.claude_connections()
+            clash.state()
+            clash.providers()
+            clash.entry_delay('fast', 'fixture')
             clash.switch_entry('fast')
 
-        for request, route in zip(send.call_args_list[:3], ['/configs', '/proxies', '/connections']):
-            self.assertEqual(request.args[:2], ('GET', route))
-            self.assertNotIn('Content-Type', request.args[3])
-        self.assertEqual(send.call_args.args[:2], ('PUT', '/proxies/' + quote(clash.ENTRY, safe='')))
-        self.assertIn('Content-Type', send.call_args.args[3])
+        self.assertEqual(send.call_args_list[:3], [
+            call('GET', route) for route in ('/configs', '/proxies', '/connections')
+        ])
+        headers = {'Content-Type': 'application/json'}
+        self.assertEqual(send.call_args_list[3:6], [
+            call('GET', route, None, headers) for route in ('/configs', '/proxies', '/providers/proxies')
+        ])
+        self.assertEqual(send.call_args_list[6].args[2:], (None, headers))
+        self.assertEqual(send.call_args, call('PUT', '/proxies/' + quote(clash.ENTRY, safe=''),
+                                             b'{"name": "fast"}', headers))
 
     def test_reload_validates_the_exact_payload_before_guard_and_write(self):
         payload = b'proxies: []'
@@ -89,16 +100,15 @@ class ClashAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with (patch.object(clash, 'CONFIG_DIR', root),
-                  patch.object(clash.subprocess, 'run', side_effect=validate) as validator,
+            with (patch.object(clash.subprocess, 'run', side_effect=validate) as validator,
                   patch.object(clash, '_request', side_effect=lambda *_: events.append('send')) as transport):
-                clash.reload(payload, lambda: events.append('prepare'), lambda: self.fail('rollback'))
+                clash.reload(root, payload, lambda: events.append('prepare'), lambda: self.fail('rollback'))
                 self.assertEqual(events, ['validate', 'prepare', 'send'])
                 transport.assert_called_once_with('PUT', '/configs?force=false', {'payload': payload.decode()})
                 transport.reset_mock()
                 validator.side_effect = subprocess.CalledProcessError(1, 'mihomo', stderr=b'password: fixture-only')
                 with self.assertRaisesRegex(RuntimeError, '^配置校验失败，未改动当前代理$'):
-                    clash.reload(payload, lambda: self.fail('prepare'), lambda: self.fail('rollback'))
+                    clash.reload(root, payload, lambda: self.fail('prepare'), lambda: self.fail('rollback'))
                 transport.assert_not_called()
                 self.assertEqual(list(root.iterdir()), [])
 
@@ -116,10 +126,10 @@ class ClashAdapterTests(unittest.TestCase):
                 profiles.write_bytes(concurrent)
                 return mkstemp(*args, **kwargs)
 
-            with (patch.object(clash, 'CONFIG_DIR', root),
-                  patch.object(clash.tempfile, 'mkstemp', side_effect=edit_profiles_before_guard)):
+            with patch.object(clash.tempfile, 'mkstemp', side_effect=edit_profiles_before_guard) as make_temp:
                 with self.assertRaisesRegex(RuntimeError, '同时更新'):
-                    clash.persist_selection('new', backup_dir=root / 'backups')
+                    clash.persist_selection(profiles, 'new', backup_dir=root / 'backups')
+                make_temp.assert_called_once_with(prefix='.toolbox-', dir=root)
             self.assertEqual(profiles.read_bytes(), concurrent)
             self.assertEqual([p.read_bytes() for p in (root / 'backups').iterdir()], [original])
-            self.assertEqual(list(root.glob('.linkbox-*')), [])
+            self.assertEqual(list(root.glob('.toolbox-*')), [])

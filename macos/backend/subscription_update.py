@@ -206,15 +206,15 @@ def benchmark_results():
             if recent is not chain or (type(row.get('chain_delay')) in (int, float) and row['chain_delay'] > 0)}
 
 
-def managed_cache(owner, definition):
+def managed_cache(root, owner, definition):
     source = definition.get('path')
-    return bool(source) and clash.provider_file(source).resolve() == clash.managed_cache_file(owner).resolve()
+    return bool(source) and clash.provider_file(root, source).resolve() == clash.managed_cache_file(root, owner).resolve()
 
 
-def provider_payload(definition, read_cache, *, filtered):
+def provider_payload(definition, root, read_cache, *, filtered):
     payload = definition.get('payload')
     if source := definition.get('path'):
-        data = yaml.safe_load(read_cache(clash.provider_file(source)) or b'')
+        data = yaml.safe_load(read_cache(clash.provider_file(root, source)) or b'')
         payload = data.get('proxies') if isinstance(data, dict) else None
     if not isinstance(payload, list):
         raise RuntimeError('代理缓存不完整，未修改')
@@ -224,7 +224,7 @@ def provider_payload(definition, read_cache, *, filtered):
     return payload
 
 
-def entry_plan(config):
+def entry_plan(config, root):
     try:
         entry = next(g for g in config.get('proxy-groups', []) if g['name'] == t.ENTRY)
         static_nodes = {node['name']: node for node in config.get('proxies', [])}
@@ -239,7 +239,7 @@ def entry_plan(config):
         use = sorted(providers) if include_all or entry.get('include-all-providers') else entry.get('use') or []
         for owner in use:
             try:
-                payload = provider_payload(providers[owner], clash.read_file, filtered=True)
+                payload = provider_payload(providers[owner], root, clash.read_file, filtered=True)
             except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError, re.error, yaml.YAMLError):
                 continue
             for node in payload:
@@ -250,7 +250,7 @@ def entry_plan(config):
         return None
 
 
-def reload_payload(config, updates, baselines):
+def reload_payload(config, root, updates, baselines):
     # The service cannot read LinkBox's user-owned provider cache files.
     live = copy.deepcopy(config)
     entry = next(g for g in live['proxy-groups'] if g['name'] == t.ENTRY)
@@ -263,10 +263,10 @@ def reload_payload(config, updates, baselines):
         return updates.get(path, baselines.get(path))
 
     for owner, definition in live['proxy-providers'].items():
-        managed = managed_cache(owner, definition)
+        managed = managed_cache(root, owner, definition)
         if not managed and owner not in use:
             continue
-        payload = provider_payload(definition, read_cache, filtered=owner in use)
+        payload = provider_payload(definition, root, read_cache, filtered=owner in use)
         if owner in use:
             members.update(node['name'] for node in payload)
         if managed:
@@ -287,9 +287,10 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             return False
         before = t.relay_state()
         check_chain(before)
+        root = clash.CONFIG_DIR
         syncing = request is None and removal is None
         preview_file = runtime.BASE / picker.PREVIEW
-        config_file, script, profiles = clash.config_file(), clash.script_file(), clash.profiles_file()
+        config_file, script, profiles = clash.config_file(root), clash.script_file(root), clash.profiles_file(root)
         baselines = {path: clash.read_file(path) for path in (config_file, script, profiles, policy_file)}
         sources, fingerprint, preview_profiles = picker.discover(for_update=syncing)
         if request is not None:
@@ -328,7 +329,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             if t.relay_state() != before or picker.discover(for_update=True)[1] != fingerprint:
                 raise RuntimeError(EXTERNAL_CHANGE)
         if downloaded_profiles:
-            updates.update({clash.profile_file(source['profile_file']): dump(downloaded_profiles[source['name']])
+            updates.update({clash.profile_file(root, source['profile_file']): dump(downloaded_profiles[source['name']])
                             for source, _ in sources if source['name'] in downloaded_profiles})
         try:
             config = yaml.safe_load(baselines[config_file] or b'')
@@ -366,7 +367,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 continue
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}', owner):
                 raise RuntimeError('订阅标识需使用字母、数字或短横线')
-            cache = clash.managed_cache_file(owner)
+            cache = clash.managed_cache_file(root, owner)
             updates[cache] = dump(doc)
             # Mihomo separates filter expressions at literal backticks.
             escaped = [re.sub(r'([.*+?^${}()|\[\]\\])', r'\\\1', name).replace('`', r'\x60') for name in keep]
@@ -377,14 +378,14 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                         if not k.startswith(('geosite:', 'rule-set:'))})
         use = [owner for owner in definitions if plan['selection'].get(owner)]
         retired = {name: definition for name, definition in existing.items()
-                   if name not in definitions and managed_cache(name, definition)}
+                   if name not in definitions and managed_cache(root, name, definition)}
         managed = {'providers': definitions, 'retired': retired, 'dns': dns, 'use': use}
         if pin:
             managed['pin'] = pin
         updated = transform(config, managed)
         updates[config_file] = dump(updated)
         updates[script] = script_text(baselines[script], managed)
-        payload, members = reload_payload(updated, updates, baselines)
+        payload, members = reload_payload(updated, root, updates, baselines)
         # A saved relay can be absent from the live group while its subscription cache is unreadable.
         selected = {owner: [name for name in names if name in members]
                     for owner, names in plan['selection'].items()}
@@ -429,10 +430,10 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 rollback()
                 raise
 
-        clash.reload(payload, prepare, rollback)
+        clash.reload(root, payload, prepare, rollback)
         entry = select_after_reload(before, selected_names, desired)
         if entry != planned_entry:
-            clash.persist_selection(entry)
+            clash.persist_selection(profiles, entry)
         if initialize:
             return True
         message = '已同步 Clash Verge 订阅。' if syncing else '已保存节点选择。'

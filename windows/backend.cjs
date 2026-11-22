@@ -45,7 +45,7 @@ function assessClaude(rows,connections,expectedProxyIP,expectedIP=EXPECTED){
  return {status:bad?'bad':good>0&&good===rows.length&&sameIP(expectedProxyIP,expectedIP)?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
 }
 class Backend{
- constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.clash=new Clash(()=>this.settings,script=>this.powershell(script));this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.nodePolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
+ constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.clash=new Clash(()=>this.settings,script=>this.powershell(script),{resolveConfig:()=>this.resolveConfig()});this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.nodePolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
  async init(){
   await fs.mkdir(this.dataDir,{recursive:true});
   const saved=await jsonRead(path.join(this.dataDir,'settings.json'));
@@ -66,14 +66,21 @@ class Backend{
  this.settingsWrite=write.catch(()=>{});try{await write;}finally{this.pendingSettings--;this.autoRevision++;}
  }
  async powershell(script){const encoded=Buffer.from("[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$ErrorActionPreference='Stop';"+script,'utf16le').toString('base64');const {stdout}=await exec('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{windowsHide:true,timeout:12000,maxBuffer:2e6});return stdout.trim();}
- async state(timeout, verge){
+ async resolveConfig(){
+  const resolved=await this.clash.config();
+  // The most recent resolution supplies the paths that callers haven't captured yet.
+  this.root=resolved.root;
+  this.configFile=resolved.file;
+  return resolved;
+ }
+ async state(timeout){
   const override=this.settings.expectedIP;
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
-  const {config,root}=verge??await this.clash.config(), configured=config.proxies?.find(n=>n.name===EXIT)?.server;
+  const {config}=await this.resolveConfig(), configured=config.proxies?.find(n=>n.name===EXIT)?.server;
   const {entryPlan}=require('./subscriptions.cjs');
   const [relay,providers,plan]=await Promise.all([
    this.clash.relayState(timeout),this.clash.providers(timeout).catch(()=>({})),
-   entryPlan(config,this.clash,root).catch(()=>null),
+   entryPlan(config,this.clash,this.root).catch(()=>null),
   ]);
   const owners=this.nodePolicy.selected_nodes==null
    ? new Map(relay.live.map(name=>[name,plan?.get(name)?.owner??null]))
@@ -92,7 +99,7 @@ class Backend{
   });
   return {...relay,expectedIP:expectedIP(override,configured),nodes,
    entryOwners,switchable:Object.keys(entryOwners),lastTest:this.history.finishedAt,
-   settings:{...benchmarkSettings(this.settings),configDir:root,corePath:this.clash.connectionPath('corePath')},
+   settings:{...benchmarkSettings(this.settings),configDir:this.root,corePath:this.clash.connectionPath('corePath')},
    progress:this.progress};
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
@@ -119,14 +126,14 @@ class Backend{
   return new Promise((resolve,reject)=>{const agent=port?new HttpsProxyAgent('http://127.0.0.1:'+port):undefined;const req=https.get(u,{agent,signal,headers:{'User-Agent':'clash-verge/LinkBox-1.0'}},r=>{let parts=[],size=0;r.on('data',b=>{size+=b.length;if(size>max){req.destroy(Error('响应过大'));return;}parts.push(b)});r.on('error',reject);r.on('end',()=>{if(!accept.includes(r.statusCode))return reject(Error('网络响应 '+r.statusCode));resolve(Buffer.concat(parts).toString())});});const timer=setTimeout(()=>req.destroy(Error('请求超时')),timeout);req.on('error',reject);req.on('close',()=>{clearTimeout(timer);agent?.destroy()});});}
  async trace(port,signal){const text=await this.textRequest(TRACE,port,{signal,timeout:8000});const values=Object.fromEntries(text.split('\n').filter(x=>x.includes('=')).map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)]}));if(!net.isIP(values.ip))throw Error('未取得有效出口');return {ip:values.ip,country:values.loc};}
  async ipInfo(){const s=await this.state();const v=JSON.parse(await this.textRequest('https://ipwho.is/',s.mixedPort));if(v.success!==true)throw Error('IP 属性查询失败');return {ip:v.ip,country:v.country,region:v.region,city:v.city,asn:v.connection?.asn,isp:v.connection?.isp,updatedAt:new Date().toISOString()};}
- async loadNodes({expectedIP:override}=this.settings, verge){
-  const {config,root}=verge??await this.clash.config();
+ async loadNodes({expectedIP:override}=this.settings){
+  const {config}=await this.resolveConfig();
   const selection=(await jsonRead(path.join(this.dataDir,'node-policy.json'))).selected_nodes;
   const {entryPlan}=require('./subscriptions.cjs');
   const owners=selectionOwners(selection);
   const nodes=new Map();
   if(selection==null){
-   const plan=await entryPlan(config,this.clash,root).catch(()=>new Map());
+   const plan=await entryPlan(config,this.clash,this.root).catch(()=>new Map());
    for(const [name,{node}] of plan)if(node)nodes.set(name,node);
   }
   const providers=config['proxy-providers']||{};
@@ -134,7 +141,7 @@ class Backend{
    const provider=Object.hasOwn(providers,owner)?providers[owner]??{}:{};
    let list=provider.payload;
    if(provider.path){
-    try{list=YAML.parse((await readFile(this.clash.providerFile(root,provider.path)))?.toString() || '')?.proxies;}
+    try{list=YAML.parse((await readFile(this.clash.providerFile(this.root,provider.path)))?.toString() || '')?.proxies;}
     catch{continue;}
    }
    if(!Array.isArray(list))continue;
@@ -169,13 +176,11 @@ class Backend{
  const historyFile=path.join(this.dataDir,'results.json');
  this.history={...this.history,latestResults:{}};
  await writeJSON(historyFile,this.history);
- const verge=await this.clash.config();
- const readState=async()=>this.state(undefined,await this.clash.config(verge.root));
- const before=await this.state(undefined,verge);this.assertChain(before);
- const network=await this.network(),probe=await this.loadNodes(settings,verge),{nodes,exit}=probe,core=await this.clash.corePath();
+ const before=await this.state();this.assertChain(before);
+ const network=await this.network(),probe=await this.loadNodes(settings),{nodes,exit}=probe,core=await this.clash.corePath();
  this.progress={running:true,kind,total:before.nodes.length,completed:0,results:{},active:[]};const emit=()=>this.notify('progress',this.progress);emit();
  let next=0;
- const unchanged=async()=>signature(await readState())===signature(before)&&
+ const unchanged=async()=>signature(await this.state())===signature(before)&&
   JSON.stringify(await this.network())===JSON.stringify(network);
  let pendingGuard;
  const guard=setInterval(()=>{
@@ -237,10 +242,10 @@ class Backend{
  if(kind==='chain'&&!this.history.reason&&this.progress.completed===this.progress.total&&authorized()){
   const target=autoCandidate(this.progress.results,before.entry,options.metric);
   if(target){
-   const currentNetwork=await this.network(),current=await readState();
+   const currentNetwork=await this.network(),current=await this.state();
    const unchanged=authorized()&&signature(current)===signature(before)&&
     JSON.stringify(currentNetwork)===JSON.stringify(network);
-   const fresh=await this.clash.config(verge.root).then(currentVerge=>this.loadNodes(this.settings,currentVerge)).catch(()=>null);
+   const fresh=await this.loadNodes().catch(()=>null);
    const sameRouting=fresh?.nodes.has(target)&&isDeepStrictEqual(
     [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
     [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);
@@ -249,7 +254,7 @@ class Backend{
     if(!current.switchable.includes(target)||current.entryOwners[target]!==owner)throw Error('节点归属已变化，请先更新订阅');
     if(!authorized())return this.history;
     await this.clash.switchEntry(target);
-    const after=await readState();
+    const after=await this.state();
     if(after.entry!==target||after.mode!==before.mode||after.tun!==before.tun||
      after.exit!==before.exit||after.dialer!==before.dialer||
      !after.switchable.includes(target)||after.entryOwners[target]!==owner)throw Error('自动切换后的状态待核对，请刷新 Clash 状态');

@@ -10,6 +10,8 @@ from clash import ENTRY, EXIT, state
 from runtime import BASE
 from reconcile import selection_owners
 
+PROFILES = clash.profiles_file(clash.CONFIG_DIR)
+
 
 def relay_state(**request_options):
     config, proxies = state(**request_options)
@@ -36,13 +38,14 @@ def relay_owners(selection, live):
     import yaml
     from subscription_update import entry_plan
 
+    root = clash.CONFIG_DIR
     try:
-        config = clash.read_config(text=False)
+        config = clash.read_yaml(clash.config_file(root), text=False)
     except (OSError, ValueError, yaml.YAMLError):
         config = None
     if not isinstance(config, dict):
         config = {}
-    plan = entry_plan(config) or {}
+    plan = entry_plan(config, root) or {}
     return {name: plan.get(name, (None, None))[0] for name in live}
 
 
@@ -75,6 +78,10 @@ def node_inventory(proxies, owners):
             if name not in owners or owners[name] == provider:
                 result.setdefault(name, (value, provider))
     return result
+
+
+def persist_selection(name):
+    clash.persist_selection(PROFILES, name, backup_dir=BASE / 'backups')
 
 
 def show():
@@ -136,7 +143,7 @@ def switch_entry(current, target):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:
-        clash.persist_selection(target, backup_dir=BASE / 'backups')
+        persist_selection(target)
         print('已保存当前订阅的选择，下次加载时可恢复；原文件已备份。')
     except Exception as e:
         print('注意：实时切换成功，但持久化保存失败：' + str(e))

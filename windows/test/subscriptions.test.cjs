@@ -163,8 +163,92 @@ for (const sync of [false, true]) test(`${sync ? 'Sync' : 'Save'} reconciles the
  assert.equal(await fs.readFile(otherProfiles, 'utf8'), unrelated);
 });
 
+for (const operation of ['Sync', 'Save', 'First run']) test(`${operation} cancels if AppData becomes preferred before writing`, async t => {
+ const {b, root, data, request, requests, policy, refreshWith} = await fixture(t);
+ const {primary, secondary} = await windowsRoots(t, root);
+ const config = path.join(primary, 'clash-verge.yaml');
+ const originalConfig = await fs.readFile(config);
+ await fs.unlink(config);
+ b.settings.configDir = '';
+ b.state = Backend.prototype.state;
+ assert.equal((await b.state()).settings.configDir, secondary);
+ const selected = {a: ['fast'], b: []};
+ if (operation === 'Sync') await fs.writeFile(policy, JSON.stringify({selected_nodes: selected}));
+ const selection = operation === 'Save' ? await request(selected) : undefined;
+ refreshWith({a: ['fast', 'current'], b: ['same']});
+ const before = await fixtureFiles(data);
+ const restorePrimary = () => fs.writeFile(config, originalConfig);
+ if (operation === 'Save') {
+  const validate = b.validateConfig;
+  b.validateConfig = async file => { await validate(file); await restorePrimary(); };
+ } else {
+  const download = b.textRequest;
+  b.textRequest = async url => { await restorePrimary(); return download(url); };
+ }
+ const update = operation === 'Save' ? sub.run(b, selection) :
+  operation === 'First run' ? sub.initialize(b) : b.updateSubscriptions();
+ await assert.rejects(update, {message: '配置或节点已被其他操作改变，已取消更新'});
+ assert.deepEqual(await fixtureFiles(data), {...before, [config]: originalConfig});
+ assert.deepEqual(requests, []);
+});
+
+for (const kind of ['chain', 'entrance']) test(`${kind} benchmark probes the server updated during network detection`, async t => {
+ const {b, config, write, policy, setProviders} = await fixture(t);
+ const previous = 'before.example.invalid', updated = 'after.example.invalid';
+ config['proxy-providers'] = {a: {payload: [node('current', previous), node('fast')]}};
+ await write('clash-verge.yaml', config);
+ await fs.writeFile(policy, JSON.stringify({selected_nodes: {a: ['current']}}));
+ b.state = Backend.prototype.state;
+ b.clash.corePath = async () => 'fixture';
+ setProviders({});
+ b.network = async () => {
+  if (config['proxy-providers'].a.payload[0].server === previous) {
+   config['proxy-providers'].a.payload[0].server = updated;
+   await write('clash-verge.yaml', config);
+  }
+  return {name: 'fixture'};
+ };
+ const probed = [];
+ b.testNode = async relay => {
+  probed.push(relay.server);
+  return {delay: 100, status: 'done'};
+ };
+ const result = await b.benchmark(kind);
+ assert.deepEqual(probed, [updated]);
+ assert.equal(result.latestResults.current.delay, 100);
+});
+
+test('scheduled auto-switch skips when the preferred directory has different routing for the same names', async t => {
+ const {b, root, config, write, policy, state, requests} = await fixture(t);
+ config['proxy-providers'] = {a: {payload: [node('current'), node('fast', 'tested.example.invalid')]}};
+ await write('clash-verge.yaml', config);
+ const {primary, secondary} = await windowsRoots(t, root);
+ const primaryConfig = path.join(primary, 'clash-verge.yaml');
+ await fs.unlink(primaryConfig);
+ b.settings = {...b.settings, configDir: '', autoRelay: true, concurrency: 1};
+ await fs.writeFile(policy, JSON.stringify({selected_nodes: {a: ['current', 'fast']}}));
+ b.state = Backend.prototype.state;
+ assert.equal((await b.state()).settings.configDir, secondary);
+ b.clash.corePath = async () => 'fixture';
+ b.network = async () => ({name: 'fixture'});
+ b.testNode = async relay => {
+  if (relay.name === 'fast') {
+   assert.equal(relay.server, 'tested.example.invalid');
+   config['proxy-providers'].a.payload[1].server = 'different.example.invalid';
+   await fs.writeFile(primaryConfig, YAML.stringify(config));
+  }
+  return {delay: relay.name === 'current' ? 200 : 50, status: 'done'};
+ };
+ const result = await b.benchmark('chain', () => true);
+ assert.equal(result.reason, '');
+ assert.equal(result.latestResults.fast.chainDelay, 50);
+ assert.equal(result.switchedTo, undefined);
+ assert.equal(state.entry, 'current');
+ assert.deepEqual(requests, []);
+});
+
 for (const benchmark of [false, true]) test(
- `${benchmark ? 'Benchmark setup' : 'Refresh'} keeps reading caches from the resolved Verge directory`, async t => {
+ `${benchmark ? 'Benchmark setup' : 'Refresh'} keeps its entry plan on the directory passed to it`, async t => {
   const {b, root, config, state, write, setProviders} = await fixture(t);
   config['proxy-groups'][0] = {name: ENTRY, type: 'select', use: ['a', 'b']};
   config['proxy-providers'] = {a: {path: 'a.yaml'}, b: {path: 'b.yaml'}};
@@ -209,7 +293,7 @@ for (const benchmark of [false, true]) test(
   } else {
    const snapshot = await b.state();
    assert.equal(snapshot.nodes.find(relay => relay.name === 'fast').type, 'trojan');
-   assert.equal(snapshot.settings.configDir, primary);
+   assert.equal(snapshot.settings.configDir, secondary);
   }
   assert.ok(fellBack);
 });

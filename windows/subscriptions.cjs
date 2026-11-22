@@ -28,9 +28,9 @@ function clean(document) {
  }
  return {...document, proxies};
 }
-async function discover(b, forUpdate = false, root) {
- root ??= (await b.clash.config()).root;
- const profiles = parseProfile(await readFile(b.clash.profilesFile(root)));
+async function discover(b, forUpdate = false) {
+ await b.resolveConfig();
+ const profiles = parseProfile(await readFile(b.clash.profilesFile(b.root)));
  if (!Array.isArray(profiles?.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
   throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
  }
@@ -47,7 +47,7 @@ async function discover(b, forUpdate = false, root) {
    if (typeof url !== 'string' || !url.startsWith('https://')) {
     throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
    }
-   profile = b.clash.profileFile(root, file);
+   profile = b.clash.profileFile(b.root, file);
   } catch (error) {
    if (forUpdate) throw error;
    continue;
@@ -66,7 +66,7 @@ async function discover(b, forUpdate = false, root) {
   throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
  }
  const revisions = sources.map(({source, raw}) => [source, digest(raw)]);
- const revision = hash([root, revisions, (await policy(b)).selected_nodes]);
+ const revision = hash([b.root, revisions, (await policy(b)).selected_nodes]);
  if (forUpdate) return {sources: sources.map(({source}) => ({source})), fingerprint: revision};
  const rawPreview = await readFile(path.join(b.dataDir, PREVIEW));
  const preview = parseProfile(rawPreview);
@@ -155,9 +155,8 @@ function mergeSelectionDraft(catalog, changes){
 }
 
 async function catalog(b, changes=[]) {
- const verge = await b.clash.config();
- const {sources, fingerprint} = await discover(b, false, verge.root);
- const state = await b.state(undefined, verge);
+ const {sources, fingerprint} = await discover(b);
+ const state = await b.state();
  const owners = selectionOwners(reconcile({sources: inventoryFor(sources),
   selection: (await policy(b)).selected_nodes, live: state.live, current: state.entry}).selection);
  const current = state.entry;
@@ -378,17 +377,15 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const policyFile = path.join(b.dataDir, 'node-policy.json');
   let selection = saved.selected_nodes;
   if (initialize && selection != null) return false;
-  const verge = await b.clash.config();
-  const {root, file: configFile} = verge;
-  const readState = async () => b.state(undefined, await b.clash.config(root));
-  const before = await b.state(undefined, verge);
+  const before = await b.state();
   b.assertChain(before);
+  await b.resolveConfig();
   const syncing = request === null && removal === null;
   const previewFile = path.join(b.dataDir, PREVIEW);
-  const script = b.clash.scriptFile(root), profiles = b.clash.profilesFile(root);
+  const configFile = b.configFile, script = b.clash.scriptFile(b.root), profiles = b.clash.profilesFile(b.root);
   const baselines = new Map();
   for (const file of [configFile, script, profiles, policyFile]) baselines.set(file, await readFile(file));
-  const discovered = await discover(b, syncing, root);
+  const discovered = await discover(b, syncing);
   let {sources} = discovered;
   if (request !== null) {
    selection = validateSelection(discovered, request, selection);
@@ -424,13 +421,13 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    if (refreshed.length !== sources.length) throw Error('订阅下载或解析失败，未改动当前配置');
    sources = refreshed;
    downloadedProfiles = Object.fromEntries(downloads);
-   if (sig(await readState()) !== sig(before) ||
-       (await discover(b, true, root)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
+   if (sig(await b.state()) !== sig(before) ||
+       (await discover(b, true)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   }
   if (downloadedProfiles) {
    for (const {source} of sources) {
     if (Object.hasOwn(downloadedProfiles, source.name)) {
-     updates.set(b.clash.profileFile(root, source.profile_file), YAML.stringify(downloadedProfiles[source.name]));
+     updates.set(b.clash.profileFile(b.root, source.profile_file), YAML.stringify(downloadedProfiles[source.name]));
     }
    }
   }
@@ -466,7 +463,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    }
    if (!keep?.length) continue;
    if (!/^[A-Za-z0-9_-]{1,60}$/.test(owner)) throw Error('订阅标识需使用字母、数字或短横线');
-   const file = b.clash.managedCacheFile(root, owner);
+   const file = b.clash.managedCacheFile(b.root, owner);
    updates.set(file, YAML.stringify(document));
    definitions.set(owner, {
     type: 'http', url: source.url, path: file, interval: 86400,
@@ -478,13 +475,13 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const use = [...definitions.keys()].filter(owner => Object.hasOwn(plan.selection, owner) && plan.selection[owner].length);
   const retired = Object.fromEntries(Object.entries(existing).filter(([name, definition]) =>
-   !definitions.has(name) && managedCache(b.clash, root, name, definition)));
+   !definitions.has(name) && managedCache(b.clash, b.root, name, definition)));
   const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
   if (pin) managed.pin = pin;
   const updated = transform(config, managed);
   updates.set(configFile, YAML.stringify(updated));
   updates.set(script, scriptText(baselines.get(script), managed));
-  const {payload, members} = await reloadPayload(updated, b.clash, root, updates, baselines);
+  const {payload, members} = await reloadPayload(updated, b.clash, b.root, updates, baselines);
   // A saved relay can be absent from the live group while its subscription cache is unreadable.
   const selected = Object.fromEntries(Object.entries(plan.selection).map(([owner, names]) =>
    [owner, names.filter(name => members.has(name))]));
@@ -508,9 +505,9 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
 
   const written = [];
   const rollback = () => restoreFiles(written, originals);
-  await b.clash.reload(root, payload, async () => {
-   if ((await discover(b, syncing, root)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
-   if (sig(await readState()) !== sig(before)) {
+  await b.clash.reload(b.root, payload, async () => {
+   if ((await discover(b, syncing)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
+   if (sig(await b.state()) !== sig(before)) {
     throw Error(EXTERNAL_CHANGE);
    }
    for (const [file, raw] of new Map([...originals, ...baselines])) {
@@ -537,7 +534,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
     await rollback();
     throw error;
    }
-  }, rollback);
+  }, rollback, () => b.root);
   const entry = await selectAfterReload(b, before, selectedNames, desired);
   if (entry !== plannedEntry) await b.clash.persistSelection(profiles, entry);
   if (initialize) return true;
