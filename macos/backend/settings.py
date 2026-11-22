@@ -1,14 +1,17 @@
 """Normalize local preferences independently of their storage."""
+from benchmark_policy import PARAMETERS
+
+
 def bounded(low, high):
     return lambda value: type(value) in (int, float) and low <= value <= high and int(value) == value
 
 
 BENCHMARK_FIELDS = {
     'hourly': (True, lambda value: type(value) is bool, '无效动态测速设置'),
-    'interval': (60, bounded(1, 1440), '测速间隔须为 1–1440 分钟。'),
-    'concurrency': (5, bounded(1, 10), '并发测速量须为 1–10 条。'),
+    'interval': (PARAMETERS['interval_default_minutes'], bounded(*PARAMETERS['interval_range_minutes']), '测速间隔须为 1–1440 分钟。'),
+    'concurrency': (PARAMETERS['concurrency_default'], bounded(*PARAMETERS['concurrency_range']), '并发测速量须为 1–10 条。'),
     'autoRelay': (False, lambda value: type(value) is bool, '无效动态测速设置'),
-    'metric': ('chain', lambda value: value in ('chain', 'entrance'), '无效动态测速设置'),
+    'metric': (PARAMETERS['default_metric'], lambda value: value in PARAMETERS['metrics'], '无效动态测速设置'),
 }
 
 

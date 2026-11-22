@@ -1,15 +1,16 @@
 'use strict';
 const {isIP}=require('node:net');
+const {PARAMETERS,isMetric}=require('./benchmark-policy.cjs');
 
 const integer=(min,max)=>({valid:value=>Number.isInteger(value)&&value>=min&&value<=max});
 const boolean={valid:value=>typeof value==='boolean'};
 const invalidSettings='无效动态测速设置';
 const benchmarkFields={
  hourly:{default:true,...boolean},
- interval:{default:60,...integer(1,1440),error:'测速间隔须为 1–1440 分钟。'},
- concurrency:{default:5,...integer(1,10),error:'并发测速量须为 1–10 条。'},
+ interval:{default:PARAMETERS.intervalDefaultMinutes,...integer(...PARAMETERS.intervalRangeMinutes),error:'测速间隔须为 1–1440 分钟。'},
+ concurrency:{default:PARAMETERS.concurrencyDefault,...integer(...PARAMETERS.concurrencyRange),error:'并发测速量须为 1–10 条。'},
  autoRelay:{default:false,...boolean},
- metric:{default:'chain',valid:value=>value==='chain'||value==='entrance'},
+ metric:{default:PARAMETERS.defaultMetric,valid:isMetric},
 };
 const pathFields={
  configDir:{valid:value=>typeof value==='string'},

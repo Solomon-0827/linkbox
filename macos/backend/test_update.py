@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 import yaml
 
+from benchmark_policy import recommendation
 import clash
 import chain_test as chain
 import gui_backend as gui
@@ -220,7 +221,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             self.assertEqual(set(report['results']), {'current'})
             self.assertEqual(report['results']['current']['owner'], 'a')
         with self.subTest(operation='auto-switch'):
-            self.assertIsNone(chain.auto_candidate(report, 'chain'))
+            self.assertIsNone(recommendation(report, 'chain'))
         with self.subTest(operation='manual switch'):
             with self.assertRaisesRegex(RuntimeError, '节点状态已变化'):
                 gui.change('fast', 'current')

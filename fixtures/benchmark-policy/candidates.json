@@ -1,0 +1,15 @@
+[
+  {"name":"tie with the current entry","current":"current","metric":"chain","results":{"current":{"chainDelay":100},"a":{"chainDelay":100}},"expected":null},
+  {"name":"tied candidates use name order","current":"current","metric":"chain","results":{"current":{"chainDelay":200},"b":{"chainDelay":100},"a":{"chainDelay":100}},"expected":"a"},
+  {"name":"exactly 20 ms faster","current":"current","metric":"chain","results":{"current":{"chainDelay":190},"a":{"chainDelay":170}},"expected":"a"},
+  {"name":"19 ms fails even when over 10 percent","current":"current","metric":"chain","results":{"current":{"chainDelay":150},"a":{"chainDelay":131}},"expected":null},
+  {"name":"exactly 10 percent faster","current":"current","metric":"chain","results":{"current":{"chainDelay":300},"a":{"chainDelay":270}},"expected":"a"},
+  {"name":"over 20 ms but under 10 percent","current":"current","metric":"chain","results":{"current":{"chainDelay":300},"a":{"chainDelay":271}},"expected":null},
+  {"name":"missing current entry","current":null,"metric":"chain","results":{"a":{"chainDelay":80}},"expected":null},
+  {"name":"current entry is unselected and has no result","current":"current","metric":"chain","results":{"a":{"chainDelay":80}},"expected":null},
+  {"name":"current entry was tested but its chain is blocked","current":"current","metric":"entrance","results":{"current":{"chainDelay":null,"entranceDelay":30},"a":{"chainDelay":120,"entranceDelay":90}},"expected":"a"},
+  {"name":"entrance metric still requires a verified candidate chain","current":"current","metric":"entrance","results":{"current":{"chainDelay":200,"entranceDelay":160},"a":{"chainDelay":null,"entranceDelay":30},"b":{"chainDelay":150,"entranceDelay":110}},"expected":"b"},
+  {"name":"verified current entry has no entrance baseline","current":"current","metric":"entrance","results":{"current":{"chainDelay":200},"a":{"chainDelay":80,"entranceDelay":50}},"expected":null},
+  {"name":"empty results","current":"current","metric":"chain","results":{},"expected":null},
+  {"name":"no alternatives to the current entry","current":"current","metric":"chain","results":{"current":{"chainDelay":100}},"expected":null}
+]

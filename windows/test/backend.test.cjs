@@ -263,6 +263,31 @@ test('automatic relay checks settings commits and fresh subscription definitions
  assert.equal((await running).switchedTo,undefined);assert.equal(b.settings.autoRelay,false);assert.equal(writes,0);stub.mock.restore();
 });
 
+test('automatic benchmark keeps worker and pre-switch reads in order',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-order-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const b=await fakeBackend(folder).init(),names=['current','fast'],calls=[];
+ let entry='current';
+ b.settings={autoRelay:true,concurrency:1};
+ b.clash.corePath=async()=>'/mock';
+ b.state=async()=>{
+  calls.push('state');
+  return {mode:'global',tun:true,entry,exit:EXIT,dialer:ENTRY,live:names,switchable:names,
+   nodes:names.map(name=>({name,providerId:'fixture'})),entryOwners:{current:'fixture',fast:'fixture'}};
+ };
+ b.network=async()=>{calls.push('network');return {name:'fixture'};};
+ b.loadNodes=async()=>{calls.push('routing');return {nodes:new Map(names.map(name=>[name,{name}])),exit:{}};};
+ b.testNode=async node=>{calls.push(node.name);return {delay:node.name==='current'?200:80};};
+ b.controller=async(method,route,body)=>{
+  assert.equal(method,'PUT');assert.equal(route,'/proxies/'+encodeURIComponent(ENTRY));
+  calls.push('switch');entry=body.name;
+ };
+ const result=await b.benchmark('chain',()=>{calls.push('authorize');return true;});
+ assert.equal(result.switchedTo,'fast');
+ assert.deepEqual(calls,['state','network','routing','current','state','network','fast','state','network',
+  'authorize','network','state','authorize','routing','authorize','switch','state']);
+});
+
 test('benchmark waits for a deferred worker after another post-probe read rejects', async t => {
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-worker-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));

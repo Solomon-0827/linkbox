@@ -11,6 +11,7 @@ import tempfile
 from urllib.parse import quote, urlencode
 
 import yaml
+from benchmark_policy import PARAMETERS
 
 ENTRY = '中转入口'
 EXIT = '美国静态家宽'
@@ -79,7 +80,8 @@ def connections(*, timeout=6, expected_status=None):
 def entry_delay(name, provider):
     route = ('/providers/proxies/' + quote(provider, safe='') + '/' + quote(name, safe='') + '/healthcheck'
              if provider else '/proxies/' + quote(name, safe='') + '/delay')
-    query = urlencode({'url': 'https://www.gstatic.com/generate_204', 'timeout': 3000, 'expected': '204'})
+    query = urlencode({'url': 'https://www.gstatic.com/generate_204',
+                       'timeout': PARAMETERS['entrance_timeout_seconds'] * 1000, 'expected': '204'})
     return _request('GET', route + '?' + query).get('delay')
 
 

@@ -1,0 +1,7 @@
+[
+  {"name":"unchanged global chain","mode":"global","routingUnchanged":true,"cancelled":false,"allowed":true},
+  {"name":"mode not allowed","mode":"rule","routingUnchanged":true,"cancelled":false,"allowed":false},
+  {"name":"routing changed during the run","mode":"global","routingUnchanged":false,"cancelled":false,"allowed":false},
+  {"name":"cancelled run","mode":"global","routingUnchanged":true,"cancelled":true,"allowed":false},
+  {"name":"cancellation and routing change","mode":"global","routingUnchanged":false,"cancelled":true,"allowed":false}
+]
