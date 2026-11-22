@@ -73,5 +73,5 @@ class SelectionDraft(unittest.TestCase):
     def test_draft_refresh_preserves_catalog_order_and_explicit_owner(self):
         self.check_draft_fixture('refresh.json')
 
-    def test_draft_refresh_uses_swift_canonical_equivalence(self):
-        self.check_draft_fixture('canonical-equivalence.json')
+    def test_draft_refresh_keeps_distinct_relay_names_selected(self):
+        self.check_draft_fixture('exact-relay-names.json')

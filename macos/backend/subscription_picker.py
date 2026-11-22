@@ -4,7 +4,6 @@ import json
 import re
 from pathlib import Path
 from urllib.parse import urlsplit
-from unicodedata import normalize
 import yaml
 import runtime
 import toolbox as t
@@ -145,24 +144,22 @@ def merge_selection_draft(catalog, changes):
             not isinstance(row, list) or len(row) != 3 or not isinstance(row[0], str)
             or not isinstance(row[1], str) or type(row[2]) is not bool for row in changes):
         raise ValueError('节点选择无效，请重新打开管理节点')
-    edits = {(normalize('NFC', source), normalize('NFC', name)): selected for source, name, selected in changes}
+    edits = {(source, name): selected for source, name, selected in changes}
     explicit = {}
     sources = []
     for source in catalog['sources']:
-        source_key = normalize('NFC', source['id'])
         nodes = []
         for node in source['nodes']:
-            name_key = normalize('NFC', node['name'])
-            changed = edits.get((source_key, name_key))
+            changed = edits.get((source['id'], node['name']))
             row = {**node, 'initialSelected': node['selected'],
                    'selected': changed if changed is not None else node['selected']}
             if changed is True:
-                explicit[name_key] = row
+                explicit[node['name']] = row
             nodes.append(row)
         sources.append({**source, 'nodes': nodes})
     for source in sources:
         for node in source['nodes']:
-            owner = explicit.get(normalize('NFC', node['name']))
+            owner = explicit.get(node['name'])
             if owner is not None:
                 node['selected'] = node is owner
     return {**catalog, 'sources': sources}

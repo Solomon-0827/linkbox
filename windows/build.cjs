@@ -15,7 +15,18 @@ const requiredAppEntries=[
  'node_modules/ms/package.json','node_modules/ms/index.js',
 ];
 
-async function checkPackage(zip,zipRoot){
+async function stageApp(stage){
+ await fs.rm(stage,{recursive:true,force:true});await fs.mkdir(stage,{recursive:true});
+ for(const f of appFiles)await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
+ const pkg=JSON.parse(await fs.readFile(path.join(__dirname,'package.json'),'utf8'));delete pkg.devDependencies;delete pkg.scripts;await fs.writeFile(path.join(stage,'package.json'),JSON.stringify(pkg));
+ for(const dep of ['yaml','https-proxy-agent','agent-base','debug','ms'])await fs.cp(path.join(__dirname,'node_modules',dep),path.join(stage,'node_modules',dep),{recursive:true});
+ const entries=await fs.readdir(stage,{recursive:true,withFileTypes:true});
+ const stagedFiles=entries.filter(entry=>!entry.isDirectory()).map(entry=>
+  path.relative(stage,path.join(entry.parentPath,entry.name)).split(path.sep).join('/'));
+ return {pkg,stagedFiles};
+}
+
+async function checkPackage(zip,zipRoot,stagedFiles){
  const onWindows=process.platform==='win32';
  const listing=onWindows?execFileSync('tar.exe',['-tf',zip]):execFileSync('/usr/bin/unzip',['-Z1',zip]);
  const entries=new Set(listing.toString().split(/\r?\n/));
@@ -32,11 +43,12 @@ async function checkPackage(zip,zipRoot){
    else execFileSync('/usr/bin/unzip',['-p',zip,entry],options);
   }finally{await output.close();}
   const asar=await import('@electron/asar');
-  for(const file of requiredAppEntries){
+  for(const file of new Set([...requiredAppEntries,...stagedFiles])){
    let entry;
    try{entry=asar.statFile(archive,file);}
    catch{throw Error('Missing app.asar entry: '+file);}
-   if(!entry.size||entry.unpacked)throw Error('Empty or unpacked app.asar entry: '+file);
+   if(entry.unpacked||!('size' in entry))throw Error('Not packed as an app.asar file: '+file);
+   if(requiredAppEntries.includes(file)&&!entry.size)throw Error('Empty required app.asar entry: '+file);
   }
  }finally{await fs.rm(folder,{recursive:true,force:true});}
 }
@@ -49,10 +61,7 @@ async function build(){
  // Use Windows' bundled bsdtar to avoid PowerShell Archive module overload differences.
  if(process.platform==='win32')execFileSync('tar.exe',['-xf',runtime,'-C',folder]);
  else execFileSync('/usr/bin/unzip',['-q',runtime,'-d',folder]);
- const stage=path.join(work,'stage');await fs.rm(stage,{recursive:true,force:true});await fs.mkdir(stage,{recursive:true});
- for(const f of appFiles)await fs.copyFile(path.join(__dirname,f),path.join(stage,f));
- const pkg=JSON.parse(await fs.readFile(path.join(__dirname,'package.json'),'utf8'));delete pkg.devDependencies;delete pkg.scripts;await fs.writeFile(path.join(stage,'package.json'),JSON.stringify(pkg));
- for(const dep of ['yaml','https-proxy-agent','agent-base','debug','ms'])await fs.cp(path.join(__dirname,'node_modules',dep),path.join(stage,'node_modules',dep),{recursive:true});
+ const stage=path.join(work,'stage'),{pkg,stagedFiles}=await stageApp(stage);
  const asar=await import('@electron/asar'),archive=path.join(folder,'resources','app.asar');
  await asar.createPackage(stage,archive);await fs.rm(path.join(folder,'resources','default_app.asar'),{force:true});
  await fs.rename(path.join(folder,'electron.exe'),path.join(folder,'LinkBox.exe'));
@@ -65,7 +74,7 @@ async function build(){
  await fs.rm(zip,{force:true});
  if(process.platform==='win32')execFileSync('tar.exe',['-a','-cf',zip,'-C',work,path.basename(folder)]);
  else execFileSync('python3',['-c','import shutil,sys;shutil.make_archive(sys.argv[1][:-4],"zip",sys.argv[2],sys.argv[3])',zip,work,zipRoot]);
- await checkPackage(zip,zipRoot);
+ await checkPackage(zip,zipRoot,stagedFiles);
  const checksum=crypto.createHash('sha256').update(await fs.readFile(zip)).digest('hex');
  const output=path.join(out,zipName);
  await fs.rename(zip,output);
@@ -74,4 +83,4 @@ async function build(){
 }
 
 if(require.main===module)build().catch(e=>{console.error(e.message);process.exit(1)});
-module.exports={checkPackage};
+module.exports={checkPackage,stageApp};

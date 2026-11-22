@@ -246,15 +246,16 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     let scroll=NSScrollView()
     let document=Canvas(frame:.zero)
     var checks:[NSButton]=[]
-    var groups:[String:[NSButton]]=[:]
-    var sourceIDs:[String]=[]
-    var sourceNames:[String:String]=[:]
-    var nodeNames:[Int:String]=[:]
-    var warnings:[String:String]=[:]
-    var activeSource:String=""
+    // NSString distinguishes exact Clash names and IDs that Swift String considers equivalent.
+    var groups:[NSString:[NSButton]]=[:]
+    var sourceIDs:[NSString]=[]
+    var sourceNames:[NSString:String]=[:]
+    var nodeNames:[Int:NSString]=[:]
+    var warnings:[NSString:String]=[:]
+    var activeSource:NSString=""
     private var fingerprint=""
     private var currentEntry=""
-    private var duplicates:[String:[NSButton]]=[:]
+    private var duplicates:[NSString:[NSButton]]=[:]
     private var initialChecks=Set<Int>()
     private var currentChecks=Set<Int>()
     private var updateButton:SoftButton!
@@ -318,10 +319,10 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         currentEntry=catalog["current"] as? String ?? ""
         catalogCurrent=true
         for source in catalog["sources"] as? [[String:Any]] ?? [] {
-            guard let id=source["id"] as? String else { continue }
-            sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? id;groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
+            guard let id=source["id"] as? NSString else { continue }
+            sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? (id as String);groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
             for node in source["nodes"] as? [[String:Any]] ?? [] {
-                guard let name=node["name"] as? String else { continue }
+                guard let name=node["name"] as? NSString else { continue }
                 let current=node["current"] as? Bool ?? false
                 let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)));b.tag=checks.count
                 let selected=node["selected"] as? Bool ?? false
@@ -329,7 +330,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
                 if current { currentChecks.insert(b.tag) }
                 b.state=selected ? .on : .off
                 b.isEnabled = !updating
-                b.setAccessibilityLabel(name+(current ? "，当前入口" : ""))
+                b.setAccessibilityLabel((name as String)+(current ? "，当前入口" : ""))
                 checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name
                 duplicates[name,default:[]].append(b)
             }
@@ -360,7 +361,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
         let id=sourceIDs[row],items=groups[id] ?? []
         let cell=Canvas(frame:NSRect(x:0,y:0,width:190,height:60))
-        let name=NSTextField(wrappingLabelWithString:sourceNames[id] ?? id);name.frame=NSRect(x:12,y:8,width:166,height:24);name.font = .systemFont(ofSize:13,weight:.medium);name.textColor=ink;cell.addSubview(name)
+        let name=NSTextField(wrappingLabelWithString:sourceNames[id] ?? (id as String));name.frame=NSRect(x:12,y:8,width:166,height:24);name.font = .systemFont(ofSize:13,weight:.medium);name.textColor=ink;cell.addSubview(name)
         let count=NSTextField(labelWithString:"已选 \(items.filter{$0.state == .on}.count) / \(items.count)");count.frame=NSRect(x:12,y:35,width:166,height:18);count.font = .systemFont(ofSize:11);count.textColor=muted;cell.addSubview(count)
         return cell
     }
@@ -377,7 +378,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         for b in items {
             let current=currentChecks.contains(b.tag)
             let name=nodeNames[b.tag] ?? ""
-            let value=name+(current ? "  · 当前入口" : "")+((duplicates[name]?.count ?? 0) > 1 ? "  · 另一订阅有同名节点" : "")
+            let value=(name as String)+(current ? "  · 当前入口" : "")+((duplicates[name]?.count ?? 0) > 1 ? "  · 另一订阅有同名节点" : "")
             let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=current ? accent : ink
             let measured=(value as NSString).boundingRect(with:NSSize(width:476,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:NSFont.systemFont(ofSize:12)])
             let height=max(CGFloat(40),ceil(measured.height)+20)
@@ -433,7 +434,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     @objc func cancel() { if !updating { onCancel() } }
     @objc func save() {
         guard !updating,catalogCurrent else { return }
-        var selected=[String:[String]]()
+        var selected=[NSString:[NSString]]()
         for id in sourceIDs { selected[id]=(groups[id] ?? []).filter{$0.state == .on}.compactMap{nodeNames[$0.tag]} }
         onSave(["fingerprint":fingerprint,"current":currentEntry,"selected":selected])
     }
@@ -557,7 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var chainRunning=false
 
     var expectedIP = ""
-    var current = ""
+    var current:NSString = ""
     var busy = false
     var controls: [NSControl] = []
     var nodePicker:SubscriptionPicker?
@@ -569,7 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var deleteButton:NSButton!
     var refreshingOnline=Set<String>()
     var editingNodes=false
-    var selectedNodes=Set<String>()
+    var selectedNodes=Set<NSString>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named:.aqua)
@@ -772,11 +773,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func render(_ s: [String:Any]) {
         expectedIP = s["expected_ip"] as? String ?? ""
-        current = s["entry"] as? String ?? ""
-        entry.stringValue = current
+        current = s["entry"] as? NSString ?? ""
+        entry.stringValue = current as String
         exitLabel.stringValue = s["exit"] as? String ?? "未知"
         modeLabel.stringValue = "●  \((s["mode"] as? String) == "global" ? "全局代理" : (s["mode"] as? String ?? "未知"))  ·  TUN \((s["tun"] as? Bool ?? false) ? "开启" : "关闭")"
-        picker.removeAllItems(); picker.addItems(withTitles: s["nodes"] as? [String] ?? []); picker.selectItem(withTitle: current)
+        picker.removeAllItems()
+        // Adding titles through NSPopUpButton replaces items with equivalent titles.
+        for name in s["nodes"] as? [String] ?? [] {
+            picker.menu?.addItem(NSMenuItem(title:name,action:nil,keyEquivalent:""))
+        }
+        selectRelay(current)
         nodeRows=s["node_rows"] as? [[String:Any]] ?? (s["nodes"] as? [String] ?? []).map{["name":$0,"status":"未验证"]}
         let sortKey=nodeRows.contains{ $0["chain_delay"] as? Double != nil } ? "chain_delay" : "delay"
         nodeRows.sort { a,b in
@@ -787,6 +793,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         selectedNodes.removeAll();updateEditingControls()
         nodeTable.reloadData()
         nodeTable.deselectAll(nil)
+    }
+    private func selectRelay(_ name:NSString) {
+        picker.selectItem(at:picker.itemArray.firstIndex { ($0.title as NSString) == name } ?? -1)
     }
     func updateEditingControls() {
         deleteButton?.title="删除已选（\(selectedNodes.count)）"
@@ -802,7 +811,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.reloadData()
     }
     @objc func selectNodeForRemoval(_ sender:NSButton) {
-        guard editingNodes,!busy,sender.tag<nodeRows.count,let name=nodeRows[sender.tag]["name"] as? String,name != current else { return }
+        guard editingNodes,!busy,sender.tag<nodeRows.count,let name=nodeRows[sender.tag]["name"] as? NSString,name != current else { return }
         if sender.state == .on { selectedNodes.insert(name) } else { selectedNodes.remove(name) }
         updateEditingControls()
     }
@@ -817,8 +826,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc func doubleClickNode() {
         let row=nodeTable.clickedRow
-        guard !busy,!editingNodes,row>=0,row<nodeRows.count,let name=nodeRows[row]["name"] as? String else { return }
-        picker.selectItem(withTitle:name)
+        guard !busy,!editingNodes,row>=0,row<nodeRows.count,let name=nodeRows[row]["name"] as? NSString else { return }
+        selectRelay(name)
         switchNode()
     }
     func runBackend(_ command:BackendCommand,_ args:[String] = [],input:Data? = nil,
@@ -861,18 +870,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             complete(result)
         }
     }
-    func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { let v=LightRow();v.currentNode=nodeRows[row]["name"] as? String == current;return v }
+    func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { let v=LightRow();v.currentNode=nodeRows[row]["name"] as? NSString == current;return v }
     func numberOfRows(in tableView:NSTableView)->Int { nodeRows.count }
     func tableView(_ tableView:NSTableView,shouldSelectRow row:Int)->Bool { false }
     func tableViewSelectionDidChange(_ notification:Notification) {
         let index=nodeTable.selectedRow
-        if index>=0,index<nodeRows.count,let name=nodeRows[index]["name"] as? String { picker.selectItem(withTitle:name) }
+        if index>=0,index<nodeRows.count,let name=nodeRows[index]["name"] as? NSString { selectRelay(name) }
     }
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
         guard row<nodeRows.count,let key=tableColumn?.identifier.rawValue else{return nil}
         if key == "rank",editingNodes {
-            let name=nodeRows[row]["name"] as? String ?? ""
-            let cell=NSTableCellView();let check=NSButton(checkboxWithTitle:"",target:self,action:#selector(selectNodeForRemoval(_:)));check.tag=row;check.state=selectedNodes.contains(name) ? .on : .off;check.isEnabled = !busy && name != current;check.setAccessibilityLabel(name == current ? "当前入口，保留" : "选择删除 " + name);cell.addSubview(check);check.translatesAutoresizingMaskIntoConstraints=false
+            let name=nodeRows[row]["name"] as? NSString ?? ""
+            let cell=NSTableCellView();let check=NSButton(checkboxWithTitle:"",target:self,action:#selector(selectNodeForRemoval(_:)));check.tag=row;check.state=selectedNodes.contains(name) ? .on : .off;check.isEnabled = !busy && name != current;check.setAccessibilityLabel(name == current ? "当前入口，保留" : "选择删除 " + (name as String));cell.addSubview(check);check.translatesAutoresizingMaskIntoConstraints=false
             NSLayoutConstraint.activate([check.centerXAnchor.constraint(equalTo:cell.centerXAnchor),check.centerYAnchor.constraint(equalTo:cell.centerYAnchor)])
             return cell
         }
@@ -882,7 +891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case "rank":label.stringValue="\(row+1)";label.textColor=muted;label.font = .monospacedDigitSystemFont(ofSize:11,weight:.regular)
         case "name":
             let name=item["name"] as? String ?? "";label.stringValue=name
-            if name==current { label.textColor=accent;label.setAccessibilityLabel(name + "，当前使用");label.font = .systemFont(ofSize:13,weight:.semibold) }
+            if (name as NSString)==current { label.textColor=accent;label.setAccessibilityLabel(name + "，当前使用");label.font = .systemFont(ofSize:13,weight:.semibold) }
         case "delay":label.stringValue=(item["delay"] as? Int).map{"\($0) ms"} ?? "—";label.textColor = (item["delay"] as? Int) != nil ? ink : muted
         case "chain_delay":label.stringValue=(item[key] as? Int).map{"\($0) ms"} ?? "—";label.textColor = (item[key] as? Int) != nil ? ink : muted
         case "test_state":
@@ -926,10 +935,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func readTestProgress(_ kind:String,finished:Bool=false) {
         guard let data=try? Data(contentsOf:base.appendingPathComponent("\(kind)-progress.json")),
               let p=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else { return }
-        let running=Set(p["running"] as? [String] ?? [])
-        let results=p["results"] as? [String:[String:Any]] ?? [:]
+        let running=Set(p["running"] as? [NSString] ?? [])
+        let results=p["results"] as? [NSString:[String:Any]] ?? [:]
         for i in nodeRows.indices {
-            let name=nodeRows[i]["name"] as? String ?? ""
+            let name=nodeRows[i]["name"] as? NSString ?? ""
             if let row=results[name] {
                 nodeRows[i].merge(row){ _,new in new };nodeRows[i]["test_state"]="已完成"
             } else {
@@ -963,7 +972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                   let recommendation=result["recommendation"] as? [String:Any],
                   let target=recommendation["target"] as? String,
                   let before=recommendation["before"] as? [String:Any],
-                  let previous=before["entry"] as? String,self.current==previous,
+                  let previous=before["entry"] as? String,self.current==(previous as NSString),
                   let input=try? JSONSerialization.data(withJSONObject:recommendation) else { return }
             self.invoke(.autoSwitch,[target,previous],message:"正在自动切换中转入口…",input:input) { outcome in
                 self.refreshOnline()
@@ -1067,10 +1076,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc func check() { invoke(.check,message:"正在检查；浏览器会打开结果页。不会改变代理或 Claude 任务。") { _ in } }
     @objc func switchNode() {
-        guard !busy, let target = picker.titleOfSelectedItem, !current.isEmpty else { return }
-        if target == current { feedback.stringValue = "已经是该节点，没有修改。"; return }
+        guard !busy, let target = picker.titleOfSelectedItem, current.length > 0 else { return }
+        if (target as NSString) == current { feedback.stringValue = "已经是该节点，没有修改。"; return }
         resetOnline()
-        invoke(.switchNode,[target,current],message:"正在切换中转入口…") { _ in self.refreshOnline() }
+        invoke(.switchNode,[target,current as String],message:"正在切换中转入口…") { _ in self.refreshOnline() }
     }
 
     @objc func showIP() { NSWorkspace.shared.open(URL(string:"https://ip.net.coffee/claude/")!) }

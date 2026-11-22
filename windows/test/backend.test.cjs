@@ -17,7 +17,8 @@ test('Windows chain benchmark compares parsed exit addresses',async t=>{
  child.pid=123;
  child.exitCode=null;
  child.kill=()=>queueMicrotask(()=>{child.exitCode=0;child.emit('exit');});
- const context=vm.createContext({module:{exports:{}},structuredClone,performance,setTimeout:fn=>queueMicrotask(fn),
+ const context=vm.createContext({module:{exports:{}},structuredClone,performance,AbortController,setInterval,clearInterval,
+  setTimeout:fn=>queueMicrotask(fn),
   require(name){
    if(name==='node:child_process')return {...require(name),spawn:()=>{child.exitCode=null;return child;}};
    if(name==='node:net')return {...net,connect(){
@@ -35,12 +36,38 @@ test('Windows chain benchmark compares parsed exit addresses',async t=>{
  b.freePort=async()=>12345;
  b.powershell=async()=>String(child.pid);
  for(const {name,expected,probe,matches} of ipComparison){
-  b.expectedIP=expected;
   b.textRequest=async()=>`ip=${probe}`;
-  const result=await b.testNode({}, {}, {name:'fixture'}, 'mock.exe', 'chain', new AbortController().signal);
+  const result=await b.testNode({}, {}, {name:'fixture'}, 'mock.exe', 'chain', new AbortController().signal,{expectedIP:expected});
   assert.equal(result.status,matches?'done':'failed',name);
   if(matches)assert.equal(result.samples[0].ip,probe,name);
  }
+ await t.test('settings changed during probe setup apply to the next benchmark',async()=>{
+  const nextIP='203.0.113.11';
+  await fs.writeFile(path.join(folder,'node-policy.json'),JSON.stringify({selected_nodes:{fixture:['relay']}}));
+  await b.init();
+  b.settings={expectedIP:EXPECTED};
+  b.config=async()=>({proxies:[{name:'美国静态家宽',server:EXPECTED,'dialer-proxy':'中转入口'}],
+   'proxy-providers':{fixture:{payload:[{name:'relay'}]}}});
+  b.relayState=async()=>({mode:'global',entry:'relay',exit:'美国静态家宽',dialer:'中转入口',live:['relay']});
+  b.api=async()=>({});
+  b.corePath=async()=>'mock.exe';
+  const started=Promise.withResolvers(),ready=Promise.withResolvers();
+  b.network=async()=>{started.resolve();return ready.promise;};
+  b.textRequest=async()=>`ip=${EXPECTED}`;
+
+  const pending=b.benchmark();
+  await Promise.race([started.promise,pending]);
+  b.settings={expectedIP:nextIP};
+  ready.resolve({name:'fixture'});
+  const first=await pending;
+  assert.equal(first.results.relay.status,'done');
+  assert.equal(first.results.relay.samples.length,3);
+
+  b.textRequest=async()=>`ip=${nextIP}`;
+  const second=await b.benchmark();
+  assert.equal(second.results.relay.status,'done');
+  assert.equal(second.results.relay.samples.length,3);
+ });
 });
 
 test('saved Windows exit addresses load verbatim and survive a settings save', async t=>{
@@ -133,6 +160,35 @@ test('parallel benchmark is bounded and leaves live API read-only',async()=>{con
 test('network changes discard results and do not switch nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-change-'));try{const b=await new Backend(dir).init();let changed=false;const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a'}]};b.state=async()=>s;b.network=async()=>({name:changed?'Ethernet':'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map([['a',{}]]),exit:{}});b.corePath=async()=>'mock';b.testNode=async()=>{changed=true;return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.match(r.reason,/变化/);assert.equal(s.entry,'a')}finally{await fs.rm(dir,{recursive:true,force:true})}});
 test('a cancelled benchmark never runs remaining nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-cancel-'));try{const b=await new Backend(dir).init();const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.corePath=async()=>'mock';let calls=0;b.testNode=async()=>{calls++;b.cancel();return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.ok(calls<=5);assert.equal(b.busy,false);assert.equal(b.progress.running,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
 test('network report records changes during checks without issuing mutations',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-'));try{const b=new Backend(dir);let calls=0;b.state=async()=>({mode:'global',tun:true,entry:++calls===1?'WiFi relay':'Ethernet relay',exit:'美国静态家宽',dialer:'中转入口',mixedPort:7897});b.trace=async()=>({ip:EXPECTED});b.ipv6Probe=async()=>({connected:false});b.api=async method=>{assert.equal(method,'GET');return {connections:[]}};const r=await b.networkCheck();assert.equal(r.stable,false);assert.equal(r.proxy.ip,EXPECTED);assert.equal(r.claude.status,'warn');assert.deepEqual(await fs.readdir(dir),[])}finally{await fs.rm(dir,{recursive:true,force:true})}});
+test('network report uses the expected IP from before its probes',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-exit-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ t.mock.method(os,'networkInterfaces',()=>({}));
+ const b=await new Backend(folder).init(),nextIP='203.0.113.11';
+ b.settings={expectedIP:EXPECTED};
+ b.config=async()=>({proxies:[]});
+ b.relayState=async()=>({mode:'global',entry:'relay',live:['relay'],mixedPort:7897});
+ b.ipv6Probe=async()=>({connected:false});
+ b.api=async method=>{assert.equal(method,'GET');return {connections:[]};};
+ b.powershell=async()=>JSON.stringify({connections:[]});
+ const started=Promise.withResolvers(),probe=Promise.withResolvers();
+ b.trace=async()=>{started.resolve();return probe.promise;};
+
+ const pending=b.networkCheck();
+ await Promise.race([started.promise,pending]);
+ b.settings={expectedIP:nextIP};
+ probe.resolve({ip:EXPECTED});
+ const first=await pending;
+ assert.equal(first.stable,true);
+ assert.equal(first.expected,EXPECTED);
+ assert.equal(first.proxy.ip,first.expected);
+ assert.equal(first.tun.ip,first.expected);
+
+ b.trace=async()=>({ip:nextIP});
+ const second=await b.networkCheck();
+ assert.equal(second.stable,true);
+ assert.equal(second.expected,nextIP);
+});
 test('isolated probes retain provider DNS and never enable TUN',()=>{const policy={'+.example.invalid':['https://dns.example.invalid/dns-query']};const c=isolatedConfig({name:'a'},{name:'b'},12345,'Wi-Fi','chain',policy);assert.deepEqual(c.dns['proxy-server-nameserver-policy'],policy);assert.equal(c.tun.enable,false)});
 
 test('dynamic benchmark limits concurrency and only an opted-in scheduled run changes the relay',async t=>{

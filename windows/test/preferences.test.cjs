@@ -21,7 +21,7 @@ test('Windows connection preferences validate new path changes',()=>{
  assert.deepEqual(settingChanges({corePath:'fixture-core.exe',expectedIP:'203.0.113.10'}),{corePath:'fixture-core.exe'});
 });
 
-for(const name of ['refresh.json','canonical-equivalence.json']){
+for(const name of ['refresh.json','exact-relay-names.json']){
  test('shared selection draft '+name,()=>{
   const {catalog,changes,output}=require(path.join(fixtures,'selection-draft',name));
   const before=structuredClone(catalog);

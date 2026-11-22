@@ -84,6 +84,30 @@ test('network check cards compare parsed browser and system addresses',async()=>
  }
 });
 
+test('browser probes keep their initial expected IP if the system check fails',async()=>{
+ const priorIP='203.0.113.10',nextIP='203.0.113.11';
+ let expectedIP=priorIP;
+ const probe=Promise.withResolvers();
+ const {select}=loadRenderer(async action=>{
+  if(action==='state')return {ok:true,data:{expectedIP,nodes:[],settings:{}}};
+  return {ok:false,error:'offline'};
+ },undefined,{AbortController,setTimeout,clearTimeout,fetch:async url=>{
+  const ip=await probe.promise;
+  return {ok:true,text:async()=>url.includes('trace')?'ip='+ip:JSON.stringify({ip})};
+ }});
+ await new Promise(resolve=>setImmediate(resolve));
+ select('#report').showModal=()=>{};
+ const cards=[];
+ select('#checkRows').append=card=>cards.push(card.className);
+
+ const pending=select('#check').onclick();
+ expectedIP=nextIP;
+ await select('#refresh').onclick();
+ probe.resolve(priorIP);
+ await pending;
+ assert.deepEqual(cards.slice(0,3),['check-card warn','check-card ok','check-card ok']);
+});
+
 test('only startup and manual Refresh retry transient initialization failures', async () => {
  let calls = 0, handler;
  const webContents = {mainFrame:{}}, event = {sender:webContents,senderFrame:webContents.mainFrame};

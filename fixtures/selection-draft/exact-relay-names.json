@@ -1,0 +1,15 @@
+{
+  "catalog": {
+    "sources": [
+      {"id": "a", "nodes": [{"name": "Cafe\u0301", "selected": true}]},
+      {"id": "b", "nodes": [{"name": "Caf\u00e9", "selected": false}]}
+    ]
+  },
+  "changes": [["b", "Caf\u00e9", true]],
+  "output": {
+    "sources": [
+      {"id": "a", "nodes": [{"name": "Cafe\u0301", "initialSelected": true, "selected": true}]},
+      {"id": "b", "nodes": [{"name": "Caf\u00e9", "initialSelected": false, "selected": true}]}
+    ]
+  }
+}

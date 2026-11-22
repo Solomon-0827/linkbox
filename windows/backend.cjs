@@ -55,7 +55,7 @@ function requestNotSent(error){
   ['ECONNREFUSED','ENOENT','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'].includes(error?.code);
 }
 class Backend{
- constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
+ constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.nodePolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
  async init(){
   await fs.mkdir(this.dataDir,{recursive:true});
   const saved=await jsonRead(path.join(this.dataDir,'settings.json'));
@@ -122,9 +122,9 @@ class Backend{
    entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live:g.all||[]};
  }
  async state(timeout){
+  const override=this.settings.expectedIP;
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
   const cfg=await this.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
-  this.expectedIP=expectedIP(this.settings.expectedIP,configured);
   const {entryPlan}=require('./subscriptions.cjs');
   const [relay,providers,plan]=await Promise.all([
    this.relayState(timeout),this.api('GET','/providers/proxies',undefined,timeout).catch(()=>({})),
@@ -145,7 +145,7 @@ class Backend{
    return {name,providerId:owner,provider:this.nodePolicy.provider_labels?.[owner]||owner||'Clash',
     type:liveRows.get(name)?.type??plan?.get(name)?.node?.type,...(result.owner==null||result.owner===owner?result:{})};
   });
-  return {...relay,expectedIP:this.expectedIP,nodes,
+  return {...relay,expectedIP:expectedIP(override,configured),nodes,
    entryOwners,switchable:Object.keys(entryOwners),lastTest:this.history.finishedAt,
    settings:{...benchmarkSettings(this.settings),configDir:this.root,corePath:this.connectionPath('corePath')},
    progress:this.progress};
@@ -174,7 +174,7 @@ class Backend{
   return new Promise((resolve,reject)=>{const agent=port?new HttpsProxyAgent('http://127.0.0.1:'+port):undefined;const req=https.get(u,{agent,signal,headers:{'User-Agent':'clash-verge/LinkBox-1.0'}},r=>{let parts=[],size=0;r.on('data',b=>{size+=b.length;if(size>max){req.destroy(Error('响应过大'));return;}parts.push(b)});r.on('error',reject);r.on('end',()=>{if(!accept.includes(r.statusCode))return reject(Error('网络响应 '+r.statusCode));resolve(Buffer.concat(parts).toString())});});const timer=setTimeout(()=>req.destroy(Error('请求超时')),timeout);req.on('error',reject);req.on('close',()=>{clearTimeout(timer);agent?.destroy()});});}
  async trace(port,signal){const text=await this.textRequest(TRACE,port,{signal,timeout:8000});const values=Object.fromEntries(text.split('\n').filter(x=>x.includes('=')).map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)]}));if(!net.isIP(values.ip))throw Error('未取得有效出口');return {ip:values.ip,country:values.loc};}
  async ipInfo(){const s=await this.state();const v=JSON.parse(await this.textRequest('https://ipwho.is/',s.mixedPort));if(v.success!==true)throw Error('IP 属性查询失败');return {ip:v.ip,country:v.country,region:v.region,city:v.city,asn:v.connection?.asn,isp:v.connection?.isp,updatedAt:new Date().toISOString()};}
- async loadNodes(){
+ async loadNodes({expectedIP:override}=this.settings){
   const config=await this.config();
   const selection=(await jsonRead(path.join(this.dataDir,'node-policy.json'))).selected_nodes;
   const {entryPlan}=require('./subscriptions.cjs');
@@ -198,11 +198,11 @@ class Backend{
    }
   }
   const exit=config.proxies?.find(n=>n.name===EXIT);
-  this.expectedIP=expectedIP(this.settings.expectedIP,exit?.server);
-  this.dnsPolicy=Object.fromEntries(Object.entries(config.dns?.['proxy-server-nameserver-policy']||{}).filter(([k])=>!k.startsWith('geosite:')&&!k.startsWith('rule-set:')));
-  if(!exit||!net.isIP(this.expectedIP))throw Error('找不到固定出口配置或有效的预期出口 IP');
+  const expected=expectedIP(override,exit?.server);
+  const dnsPolicy=Object.fromEntries(Object.entries(config.dns?.['proxy-server-nameserver-policy']||{}).filter(([k])=>!k.startsWith('geosite:')&&!k.startsWith('rule-set:')));
+  if(!exit||!net.isIP(expected))throw Error('找不到固定出口配置或有效的预期出口 IP');
   if(exit['dialer-proxy']!==ENTRY)throw Error('固定出口的链式上游已变化，未开始测试');
-  return {nodes,exit,config};
+  return {nodes,exit,config,expectedIP:expected,dnsPolicy};
  }
  async corePath(){const configured=this.connectionPath('corePath');if(configured){await fs.access(configured);return configured;}if(process.platform==='darwin')return '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo';
  try{const raw=await this.powershell("@(Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^(verge-mihomo|mihomo|clash-meta)(-alpha)?\\.exe$'} | Select-Object -ExpandProperty ExecutablePath) | ConvertTo-Json -Compress");const found=JSON.parse(raw||'[]');for(const p of [found].flat())if(p){await fs.access(p);return p;}}catch{}
@@ -212,7 +212,7 @@ class Backend{
  const raw=await this.powershell("$a=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up');$r=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {$a.ifIndex -contains $_.ifIndex} | ForEach-Object {$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.ifIndex;[pscustomobject]@{name=$_.InterfaceAlias;index=$_.ifIndex;gateway=$_.NextHop;metric=($_.RouteMetric+$i.InterfaceMetric)}} | Sort-Object metric);if(!$r.Count){throw 'No physical IPv4 route'};$n=$r[0];$ip=@(Get-NetIPAddress -InterfaceIndex $n.index -AddressFamily IPv4 | Where-Object AddressState -eq 'Preferred' | Select-Object -ExpandProperty IPAddress);[pscustomobject]@{name=$n.name;index=$n.index;gateway=$n.gateway;addresses=$ip} | ConvertTo-Json -Compress");return JSON.parse(raw);}
  async freePort(){const s=net.createServer();await new Promise((resolve,reject)=>{s.once('error',reject);s.listen(0,'127.0.0.1',resolve)});const port=s.address().port;await new Promise(r=>s.close(r));return port;}
  async stopChild(child){if(child.exitCode!==null)return;child.kill();await Promise.race([new Promise(r=>child.once('exit',r)),pause(1800)]);if(child.exitCode===null)child.kill('SIGKILL');}
- async testNode(node,exit,network,core,kind,signal,probe={dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP}){const folder=await fs.mkdtemp(path.join(this.dataDir,'probe-'));let child,entranceDelay=null;const samples=[];try{
+ async testNode(node,exit,network,core,kind,signal,probe){const folder=await fs.mkdtemp(path.join(this.dataDir,'probe-'));let child,entranceDelay=null;const samples=[];try{
  const port=await this.freePort(),config=isolatedConfig(node,exit,port,network.name,kind,probe.dnsPolicy);const file=path.join(folder,'config.yaml');await fs.writeFile(file,YAML.stringify(config),{mode:0o600});
  child=spawn(core,['-d',folder,'-f',file],{windowsHide:true,stdio:'ignore'});this.children.add(child);let spawnError;child.once('error',e=>spawnError=e);
  let ready=false;for(let i=0;i<40;i++){if(signal.aborted)throw Error('已停止');if(spawnError||child.exitCode!==null)throw Error('隔离内核无法启动');ready=await new Promise(r=>{const s=net.connect(port,'127.0.0.1');s.setTimeout(100);s.once('connect',()=>{s.destroy();r(true)});s.once('error',()=>r(false));s.once('timeout',()=>{s.destroy();r(false)});});if(ready)break;await pause(100);}if(!ready)throw Error('临时端口未就绪');
@@ -223,12 +223,13 @@ class Backend{
  if(kind==='chain'&&samples.length<2)throw Error('成功样本不足两次');const times=samples.map(x=>x.ms).sort((a,b)=>a-b);return {delay:Math.round((times[Math.floor((times.length-1)/2)]+times[Math.floor(times.length/2)])/2),samples,status:'done',kind,...(kind==='chain'?{entranceDelay}:{})};
  }catch(e){return {delay:null,status:'failed',kind,error:safeError(e),...(kind==='chain'?{entranceDelay}:{})}}finally{if(child){await this.stopChild(child);this.children.delete(child)}await fs.rm(folder,{recursive:true,force:true}).catch(()=>{});}}
  async benchmark(kind='chain',mayAutoSwitch=null){
- if(this.busy)throw Error('已有操作正在运行');if(!['chain','entrance'].includes(kind))throw Error('无效测速类型');this.busy=true;const abort=new AbortController();this.abort=abort;let reason='';const options=benchmarkSettings(this.settings),revision=this.autoRevision,settingsStable=!this.pendingSettings;
+ if(this.busy)throw Error('已有操作正在运行');if(!['chain','entrance'].includes(kind))throw Error('无效测速类型');this.busy=true;const abort=new AbortController();this.abort=abort;let reason='';const settings=this.settings,options=benchmarkSettings(settings),revision=this.autoRevision,settingsStable=!this.pendingSettings;
  try{
  const historyFile=path.join(this.dataDir,'results.json');
  this.history={...this.history,latestResults:{}};
  await writeJSON(historyFile,this.history);
- const before=await this.state();this.assertChain(before);const network=await this.network(),{nodes,exit}=await this.loadNodes(),probe={dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP},core=await this.corePath();
+ const before=await this.state();this.assertChain(before);
+ const network=await this.network(),probe=await this.loadNodes(settings),{nodes,exit}=probe,core=await this.corePath();
  this.progress={running:true,kind,total:before.nodes.length,completed:0,results:{},active:[]};const emit=()=>this.notify('progress',this.progress);emit();
  let next=0;
  const unchanged=async()=>signature(await this.state())===signature(before)&&
@@ -296,7 +297,7 @@ class Backend{
    const currentNetwork=await this.network(),current=await this.state();
    const unchanged=authorized()&&signature(current)===signature(before)&&
     JSON.stringify(currentNetwork)===JSON.stringify(network);
-   const fresh=await this.loadNodes().then(result=>({...result,dnsPolicy:this.dnsPolicy,expectedIP:this.expectedIP})).catch(()=>null);
+   const fresh=await this.loadNodes().catch(()=>null);
    const sameRouting=fresh?.nodes.has(target)&&isDeepStrictEqual(
     [nodes.get(before.entry),nodes.get(target),exit,probe.dnsPolicy,probe.expectedIP],
     [fresh.nodes.get(before.entry),fresh.nodes.get(target),fresh.exit,fresh.dnsPolicy,fresh.expectedIP]);
@@ -318,15 +319,15 @@ class Backend{
  cancel(){this.abort?.abort();}
  async updateSubscriptions(){return require('./subscriptions.cjs').run(this);}
  async ipv6Probe(host){return new Promise(resolve=>{const s=net.connect({host,port:443,family:6});const finish=v=>{s.destroy();resolve(v)};s.setTimeout(4000);s.once('connect',()=>finish({connected:true,local:s.localAddress}));s.once('error',e=>finish({connected:false,reason:e.code}));s.once('timeout',()=>finish({connected:false,reason:'timeout'}));});}
- async networkCheck(){const interfacesBefore=JSON.stringify(os.networkInterfaces());const safe=async fn=>{try{return await fn()}catch(e){return {error:safeError(e)}}};const s=await this.state();
+ async networkCheck(){const interfacesBefore=JSON.stringify(os.networkInterfaces());const safe=async fn=>{try{return await fn()}catch(e){return {error:safeError(e)}}};const s=await this.state(),expected=s.expectedIP;
  const [proxy,tun,v6a,v6b,claudeRaw,connectionSnapshot]=await Promise.all([safe(()=>this.trace(s.mixedPort)),safe(()=>this.trace()),this.ipv6Probe('2606:4700:4700::1111'),this.ipv6Probe('2001:4860:4860::8888'),safe(async()=>{
  if(process.platform!=='win32')throw Error('Claude Code 进程核验需要 Windows');
  const raw=await this.powershell("$p=@(Get-Process -Name claude -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id);$c=@(Get-NetTCPConnection -State Established | Where-Object {$p -contains $_.OwningProcess} | Select-Object OwningProcess,LocalAddress,LocalPort,RemoteAddress,RemotePort);[pscustomobject]@{processCount=$p.Count;connections=$c} | ConvertTo-Json -Depth 5 -Compress");return JSON.parse(raw);
  }),safe(()=>this.api('GET','/connections'))]);
  const addresses=Object.values(os.networkInterfaces()).flat().filter(x=>x&&x.family==='IPv6'&&!x.internal&&!/^(fe[89ab]|f[cd]|::)/i.test(x.address)).map(x=>x.address);
- const claude=claudeRaw.error||connectionSnapshot.error?{status:'warn',detail:'Claude Code 连接未验证：'+(claudeRaw.error||connectionSnapshot.error)}:assessClaude(claudeRaw.connections||[],connectionSnapshot.connections||[],proxy.ip,this.expectedIP);
+ const claude=claudeRaw.error||connectionSnapshot.error?{status:'warn',detail:'Claude Code 连接未验证：'+(claudeRaw.error||connectionSnapshot.error)}:assessClaude(claudeRaw.connections||[],connectionSnapshot.connections||[],proxy.ip,expected);
  let stable=false;try{stable=signature(await this.state())===signature(s)&&JSON.stringify(os.networkInterfaces())===interfacesBefore;}catch{}
- const result={time:new Date().toISOString(),expected:this.expectedIP,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
+ const result={time:new Date().toISOString(),expected,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
 module.exports={Backend,ClashHTTPError,requestNotSent,autoCandidate,isolatedConfig,signature,providerNodes,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
