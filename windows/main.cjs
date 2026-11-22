@@ -2,7 +2,7 @@
 const {app,BrowserWindow,ipcMain,Tray,Menu,nativeImage,shell,dialog,session,nativeTheme,clipboard}=require('electron');
 const path=require('node:path'),fs=require('node:fs/promises');
 const {Backend,writeJSON,safeError}=require('./backend.cjs');
-const {benchmarkSettings,benchmarkChanges,limits}=require('./preferences.cjs');
+const {benchmarkSettings,benchmarkChanges}=require('./preferences.cjs');
 const subscriptions=require('./subscriptions.cjs');
 const DEMO=process.argv.includes('--demo');let win,tray,backend,quitting=false,readyToQuit=false,timer,coffeeWindow,coffeePending,uiActive=false;
 async function auto(){
@@ -94,10 +94,11 @@ const commands={
   if(!r.canceled&&r.filePath)await writeJSON(r.filePath,data);
   return {};
  },
- benchmarkSettings: ()=>({...benchmarkSettings(backend.settings),limits}),
+ benchmarkSettings: ()=>benchmarkSettings(backend.settings),
  async settings(data){
-  await backend.saveSettings(benchmarkChanges(data));
-  scheduleAuto();return {};
+  const changes=benchmarkChanges(data);
+  await backend.saveSettings(changes);
+  scheduleAuto();return changes;
  },
  chooseConfig: ()=>chooseConnection(true),
  chooseCore: ()=>chooseConnection(false),

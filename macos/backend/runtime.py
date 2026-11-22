@@ -1,4 +1,5 @@
 """Local settings only. No subscriptions, credentials or user IPs ship with the app."""
+from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,16 @@ def expected_ip(config=None):
             if config is None:config=yaml.safe_load((CONFIG_DIR/'clash-verge.yaml').read_text())
             value=next(n.get('server','') for n in config.get('proxies',[]) if n.get('name')=='美国静态家宽')
         except (OSError,ValueError,StopIteration,AttributeError):return ''
-    return settings.expected_ip(value)
+    try:return str(ip_address(value))
+    except (ValueError, TypeError):return ''
+
+def same_ip(left, right):
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        return ip_address(left) == ip_address(right)
+    except ValueError:
+        return False
 
 def ssl_context():
     import ssl,certifi

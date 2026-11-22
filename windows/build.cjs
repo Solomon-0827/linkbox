@@ -3,8 +3,45 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
 const {downloadArtifact}=require('@electron/get');
 const electronVersion=require('electron/package.json').version;
 const checksums=require('electron/checksums.json');
-const appFiles=['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js','preferences.cjs'];
-(async()=>{
+const appFiles=['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js','preferences.cjs','ip-address.js'];
+const requiredZipEntries=['LinkBox.exe','resources/app.asar'];
+const requiredAppEntries=[
+ 'coffee-extract.js','package.json','main.cjs','preload.cjs','backend.cjs','preferences.cjs',
+ 'subscriptions.cjs','reconcile.cjs','index.html','renderer.js','ip-address.js','icons.js','style.css','icon.png',
+ 'node_modules/yaml/package.json','node_modules/yaml/dist/index.js',
+ 'node_modules/https-proxy-agent/package.json','node_modules/https-proxy-agent/dist/index.js',
+ 'node_modules/agent-base/package.json','node_modules/agent-base/dist/index.js',
+ 'node_modules/debug/package.json','node_modules/debug/src/index.js',
+ 'node_modules/ms/package.json','node_modules/ms/index.js',
+];
+
+async function checkPackage(zip,zipRoot){
+ const onWindows=process.platform==='win32';
+ const listing=onWindows?execFileSync('tar.exe',['-tf',zip]):execFileSync('/usr/bin/unzip',['-Z1',zip]);
+ const entries=new Set(listing.toString().split(/\r?\n/));
+ for(const file of requiredZipEntries){
+  if(!entries.has(zipRoot+'/'+file))throw Error('Missing required ZIP entry: '+file);
+ }
+ const folder=await fs.mkdtemp(path.join(path.dirname(zip),'.linkbox-package-'));
+ try{
+  const archive=path.join(folder,'app.asar'),entry=zipRoot+'/resources/app.asar';
+  const output=await fs.open(archive,'w');
+  try{
+   const options={stdio:['ignore',output.fd,'pipe']};
+   if(onWindows)execFileSync('tar.exe',['-xOf',zip,entry],options);
+   else execFileSync('/usr/bin/unzip',['-p',zip,entry],options);
+  }finally{await output.close();}
+  const asar=await import('@electron/asar');
+  for(const file of requiredAppEntries){
+   let entry;
+   try{entry=asar.statFile(archive,file);}
+   catch{throw Error('Missing app.asar entry: '+file);}
+   if(!entry.size||entry.unpacked)throw Error('Empty or unpacked app.asar entry: '+file);
+  }
+ }finally{await fs.rm(folder,{recursive:true,force:true});}
+}
+
+async function build(){
  const root=path.resolve(__dirname,'..'),out=path.join(root,'dist'),work=path.join(root,'build/windows'),folder=path.join(work,'LinkBox-Windows-x64');
  await fs.mkdir(out,{recursive:true});await fs.mkdir(work,{recursive:true});
  const runtime=await downloadArtifact({version:electronVersion,checksums,artifactName:'electron',platform:'win32',arch:'x64'});
@@ -23,17 +60,18 @@ const appFiles=['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html
  const info=R.Resource.VersionInfo.fromEntries(res.entries)[0];if(info){info.setFileVersion(...pkg.version.split('.').map(Number),0);info.setProductVersion(...pkg.version.split('.').map(Number),0);info.setStringValues({lang:1033,codepage:1200},{FileDescription:'链路盒子',ProductName:'链路盒子',OriginalFilename:'LinkBox.exe',CompanyName:'Solomon-0827'});info.outputToResourceEntries(res.entries);}
  const ico=R.Data.IconFile.from(await fs.readFile(path.join(__dirname,'icon.ico')));for(const group of R.Resource.IconGroupEntry.fromEntries(res.entries))R.Resource.IconGroupEntry.replaceIconsForResource(res.entries,group.id,group.lang,ico.icons.map(x=>x.data));res.outputResource(exe);await fs.writeFile(path.join(folder,'LinkBox.exe'),Buffer.from(exe.generate()));
  await fs.cp(path.join(root,'examples'),path.join(folder,'resources/examples'),{recursive:true});await fs.copyFile(path.join(root,'README.md'),path.join(folder,'README.md'));
- for(const file of [...appFiles,'package.json']){
-  if(!asar.statFile(archive,file)?.size)throw Error('Missing or empty app.asar entry: '+file);
- }
  if(!(await fs.stat(path.join(folder,'LinkBox.exe'))).size)throw Error('Missing or empty LinkBox.exe');
- const zip=path.join(out,'linkbox-windows-x64.zip'),zipRoot=path.basename(folder);await fs.rm(zip,{force:true});
+ const zipName='linkbox-windows-x64.zip',zip=path.join(work,zipName),zipRoot=path.basename(folder);
+ await fs.rm(zip,{force:true});
  if(process.platform==='win32')execFileSync('tar.exe',['-a','-cf',zip,'-C',work,path.basename(folder)]);
  else execFileSync('python3',['-c','import shutil,sys;shutil.make_archive(sys.argv[1][:-4],"zip",sys.argv[2],sys.argv[3])',zip,work,zipRoot]);
- const listing=process.platform==='win32'?execFileSync('tar.exe',['-tf',zip]):execFileSync('/usr/bin/unzip',['-Z1',zip]);
- const entries=new Set(listing.toString().split(/\r?\n/));
- for(const file of ['LinkBox.exe','resources/app.asar']){
-  if(!entries.has(zipRoot+'/'+file))throw Error('Missing required ZIP entry: '+file);
- }
- await fs.writeFile(zip+'.sha256',crypto.createHash('sha256').update(await fs.readFile(zip)).digest('hex')+'  '+path.basename(zip)+'\n');console.log(zip);
-})().catch(e=>{console.error(e.message);process.exit(1)});
+ await checkPackage(zip,zipRoot);
+ const checksum=crypto.createHash('sha256').update(await fs.readFile(zip)).digest('hex');
+ const output=path.join(out,zipName);
+ await fs.rename(zip,output);
+ await fs.writeFile(output+'.sha256',checksum+'  '+zipName+'\n');
+ console.log(output);
+}
+
+if(require.main===module)build().catch(e=>{console.error(e.message);process.exit(1)});
+module.exports={checkPackage};

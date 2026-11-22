@@ -14,10 +14,12 @@ BUILD = ROOT / 'build/macos'
 APP = OUT / '链路盒子.app'
 RESOURCES = [ROOT / 'assets/ProxyToolbox.icns', ROOT / 'windows/coffee-extract.js']
 CHECK_PAGE = ROOT / 'macos/backend/check.html'
+IP_COMPARISON = ROOT / 'windows/ip-address.js'
 REQUIRED_FILES = (
     'MacOS/ProxyToolbox',
     'Resources/backend/linkbox-backend',
     'Resources/backend/_internal/check.html',
+    'Resources/backend/_internal/ip-address.js',
     'Resources/ProxyToolbox.icns',
     'Resources/coffee-extract.js',
 )
@@ -61,7 +63,7 @@ def main():
     if sys.platform != 'darwin':
         raise SystemExit('Build the Mac package on macOS.')
     info = bundle_info()
-    for resource in (*RESOURCES, CHECK_PAGE):
+    for resource in (*RESOURCES, CHECK_PAGE, IP_COMPARISON):
         if not resource.is_file():
             raise SystemExit(f'Missing required app resource: {resource.relative_to(ROOT)}')
     OUT.mkdir(exist_ok=True)
@@ -70,7 +72,8 @@ def main():
         sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir',
         '--name', 'linkbox-backend', '--distpath', str(BUILD / 'backend'),
         '--workpath', str(BUILD / 'work'), '--specpath', str(BUILD),
-        '--add-data', str(CHECK_PAGE) + ':.', '--collect-data', 'certifi',
+        '--add-data', str(CHECK_PAGE) + ':.', '--add-data', str(IP_COMPARISON) + ':.',
+        '--collect-data', 'certifi',
         '--hidden-import', 'subscription_update', '--hidden-import', 'subscription_picker',
         str(ROOT / 'macos/backend/gui_backend.py'),
     ], check=True)

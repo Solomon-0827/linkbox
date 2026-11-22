@@ -2,6 +2,7 @@ from io import StringIO
 import json
 from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -29,6 +30,20 @@ class Commands(unittest.TestCase):
 
 
 class Settings(unittest.TestCase):
+    def test_expected_ip_loads_v130_values_from_disk(self):
+        with TemporaryDirectory() as folder, patch.object(runtime, 'BASE', Path(folder)):
+            settings_file = Path(folder) / 'settings.json'
+            for value, expected in [(3405803786, '203.0.113.10'), (4294967296, '::1:0:0'),
+                                    (True, '0.0.0.1'), (False, '192.0.2.1'),
+                                    ('2001:0DB8::1', '2001:db8::1'), ('exit.example.invalid', ''),
+                                    (3405803786.0, '')]:
+                with self.subTest(value=value):
+                    contents = json.dumps({'expected_ip': value})
+                    settings_file.write_text(contents)
+                    config = {'proxies': [{'name': gui_backend.t.EXIT, 'server': '192.0.2.1'}]}
+                    self.assertEqual(runtime.expected_ip(config), expected)
+                    self.assertEqual(settings_file.read_text(), contents)
+
     def test_shared_fixtures(self):
         fixtures = sorted((ROOT / 'fixtures/settings').glob('*.json'))
         self.assertTrue(fixtures)
@@ -49,8 +64,14 @@ class Settings(unittest.TestCase):
 
 
 class SelectionDraft(unittest.TestCase):
-    def test_draft_refresh_preserves_catalog_order_and_explicit_owner(self):
-        case = json.loads((ROOT / 'fixtures/selection-draft/refresh.json').read_text())
+    def check_draft_fixture(self, name):
+        case = json.loads((ROOT / 'fixtures/selection-draft' / name).read_text())
         before = json.dumps(case['catalog'])
         self.assertEqual(merge_selection_draft(case['catalog'], case['changes']), case['output'])
         self.assertEqual(json.dumps(case['catalog']), before)
+
+    def test_draft_refresh_preserves_catalog_order_and_explicit_owner(self):
+        self.check_draft_fixture('refresh.json')
+
+    def test_draft_refresh_uses_swift_canonical_equivalence(self):
+        self.check_draft_fixture('canonical-equivalence.json')

@@ -133,18 +133,21 @@ function mergeSelectionDraft(catalog, changes){
  }
  const edits=new Map(),explicit=new Map();
  for(const [source,name,selected] of changes){
-  if(!edits.has(source))edits.set(source,new Map());
-  edits.get(source).set(name,selected);
+  const sourceKey=source.normalize('NFC');
+  if(!edits.has(sourceKey))edits.set(sourceKey,new Map());
+  edits.get(sourceKey).set(name.normalize('NFC'),selected);
  }
  const sources=catalog.sources.map(source=>({...source,nodes:source.nodes.map(node=>{
-  const changed=edits.get(source.id)?.get(node.name);
+  const nameKey=node.name.normalize('NFC');
+  const changed=edits.get(source.id.normalize('NFC'))?.get(nameKey);
   const row={...node,initialSelected:node.selected,selected:changed??node.selected};
-  if(changed===true)explicit.set(node.name,row);
+  if(changed===true)explicit.set(nameKey,row);
   return row;
  })}));
  for(const {nodes} of sources){
   for(const node of nodes){
-   if(explicit.has(node.name))node.selected=node===explicit.get(node.name);
+   const owner=explicit.get(node.name.normalize('NFC'));
+   if(owner)node.selected=node===owner;
   }
  }
  return {...catalog,sources};

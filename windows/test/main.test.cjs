@@ -19,7 +19,7 @@ test('dynamic scheduler replaces its previous timer and skips while the UI is bu
  vm.runInContext('backend.settings.hourly=false;scheduleAuto()',context);assert.deepEqual(cleared,[1,2]);assert.equal(intervals.length,2);
 });
 
-function loadRenderer(call, setInterval=()=>{}) {
+function loadRenderer(call, setInterval=()=>{}, globals={}) {
  const elements = new Map();
  const element = () => ({value:'',classList:{add(){},remove(){},toggle(){}},replaceChildren(){},
   setAttribute(){},addEventListener(){},append(){}});
@@ -30,11 +30,59 @@ function loadRenderer(call, setInterval=()=>{}) {
  const context = vm.createContext({
   document:{querySelector:select,querySelectorAll:()=>[],addEventListener(){},
    createElement:element,createDocumentFragment:element},
-  window:{linkbox:{call,onProgress(){},onAutomatic(){}}},setInterval,
+  window:{linkbox:{call,onProgress(){},onAutomatic(){}}},setInterval,URL,...globals,
  });
+ const html=fs.readFileSync(require.resolve('../index.html'),'utf8');
+ if(html.includes('<script src="ip-address.js"></script>')){
+  vm.runInContext(fs.readFileSync(require.resolve('../ip-address.js'),'utf8'),context);
+ }
  vm.runInContext(fs.readFileSync(require.resolve('../renderer.js'),'utf8'),context);
  return {select, context};
 }
+
+test('benchmark interval errors use the macOS field message', async t => {
+ const {benchmarkChanges}=require('../preferences.cjs');
+ const html=fs.readFileSync(require.resolve('../index.html'),'utf8');
+ await t.test('out of range reaches shared validation without a browser bubble',()=>{
+  const form=html.match(/<form\b[^>]*\bid="autoSettingsForm"[^>]*>/)?.[0];
+  assert.match(form,/\bnovalidate\b/);
+ });
+ for(const [value,numeric] of [['1e2',100],['1441',1441],['0',0]]){
+  await t.test(`rejects ${value}`,async()=>{
+   const {select}=loadRenderer(async(action,values)=>{
+    if(action!=='settings')return {ok:false,error:'offline'};
+    try{return {ok:true,data:benchmarkChanges(values)}}
+    catch(error){return {ok:false,error:error.message}}
+   });
+   Object.assign(select('#testInterval'),{value,valueAsNumber:numeric});
+   Object.assign(select('#testConcurrency'),{value:'5',valueAsNumber:5});
+   select('#autoRelay').checked=false;
+   select('#autoMetric').value='chain';
+   let closed=false;
+   select('#autoSettings').close=()=>{closed=true;};
+   await select('#autoSettingsForm').onsubmit({preventDefault(){}});
+   assert.equal(closed,false);
+   assert.equal(select('#autoSettingsNotice').textContent,'测速间隔须为 1–1440 分钟。');
+  });
+ }
+});
+
+test('network check cards compare parsed browser and system addresses',async()=>{
+ for(const {name,expected,probe,matches} of require('../../fixtures/ip-comparison.json')){
+  const {select}=loadRenderer(async action=>{
+   if(action==='check')return {ok:true,data:{expected,tun:{ip:probe},proxy:{ip:probe},
+    ipv6:{status:'warn'},claude:{status:'warn'}}};
+   return {ok:false,error:'offline'};
+  },undefined,{AbortController,setTimeout,clearTimeout,fetch:async url=>({ok:true,text:async()=>
+   url.includes('trace')?'ip='+probe:JSON.stringify({ip:probe})})});
+  select('#report').showModal=()=>{};
+  const cards=[];
+  select('#checkRows').append=card=>cards.push(card.className);
+  await select('#check').onclick();
+  assert.equal(cards[0],'check-card '+(matches?'ok':probe?'bad':'warn'),name);
+  assert.equal(cards[4],'check-card '+(matches?'ok':probe?'bad':'warn'),name);
+ }
+});
 
 test('only startup and manual Refresh retry transient initialization failures', async () => {
  let calls = 0, handler;

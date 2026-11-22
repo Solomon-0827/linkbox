@@ -12,6 +12,7 @@ import socket
 import struct
 import socketserver
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -20,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import runtime
 BASE = runtime.BASE/'proxy-self-check'
 ASSETS = Path(__file__).resolve().parent
+IP_COMPARISON = (ASSETS if getattr(sys, 'frozen', False) else ASSETS.parents[1] / 'windows') / 'ip-address.js'
 EXPECTED = runtime.expected_ip()
 SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
 
@@ -180,7 +182,10 @@ def main():
             self.wfile.write(data)
         def do_GET(self):
             if self.path == '/' + token + '/':
-                self.send((ASSETS / 'check.html').read_text().replace('__EXPECTED_IP__',EXPECTED).encode(), 'text/html')
+                expected = json.dumps(EXPECTED).replace('<', '\\u003c')
+                self.send((ASSETS / 'check.html').read_text().replace('__EXPECTED_IP__', expected).encode(), 'text/html')
+            elif self.path == '/' + token + '/ip-address.js':
+                self.send(IP_COMPARISON.read_bytes(), 'text/javascript')
             elif self.path == '/' + token + '/results':
                 with lock:
                     self.send(json.dumps(report, ensure_ascii=False).encode())
@@ -210,7 +215,7 @@ def main():
     url = f'http://127.0.0.1:{server.server_port}/{token}/'
     print('只读检查：不更改代理、不重启应用、不终止连接。', flush=True)
     print('浏览器检测页面：' + url, flush=True)
-    if '--no-open' not in __import__('sys').argv:
+    if '--no-open' not in sys.argv:
         subprocess.run(['/usr/bin/open', url], check=False)
     with lock:
         pass

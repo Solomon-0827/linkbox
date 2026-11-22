@@ -138,7 +138,7 @@ def trace(port, cancelled, expected):
         text=stdout.decode(errors='replace');body,stats=text.rsplit('\n__TIMING__',1)
         code,total,ttfb=stats.split();values=dict(x.split('=',1) for x in body.splitlines() if '=' in x)
         if code!='200' or not values.get('ip'):raise RuntimeError('测试站返回无效结果')
-        if values['ip']!=expected:raise RuntimeError('出口不符：'+values['ip'])
+        if not runtime.same_ip(values['ip'], expected):raise RuntimeError('出口不符：'+values['ip'])
         return {'ms':round(float(total)*1000),'ttfb_ms':round(float(ttfb)*1000),'ip':values['ip']}
     finally:stop_owned(p)
 

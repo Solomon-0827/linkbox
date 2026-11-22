@@ -1,6 +1,22 @@
 import AppKit
 import WebKit
 
+private func sameIP(_ left:String,_ right:String) -> Bool {
+    func parsed(_ value:String) -> Data? {
+        let parts=value.components(separatedBy:"%")
+        guard !value.contains("\0"),parts.count <= 2 else { return nil }
+        var ipv4=in_addr(), ipv6=in6_addr()
+        if parts.count == 1,inet_pton(AF_INET,value,&ipv4) == 1 {
+            return withUnsafeBytes(of:ipv4) { Data($0) }
+        }
+        let scope=parts.count == 2 ? parts[1] : ""
+        guard (parts.count == 1 || !scope.isEmpty),inet_pton(AF_INET6,parts[0],&ipv6) == 1 else { return nil }
+        return withUnsafeBytes(of:ipv6) { Data($0) } + Data(scope.utf8)
+    }
+    guard let address=parsed(left) else { return false }
+    return address == parsed(right)
+}
+
 private let ink = NSColor(calibratedRed: 0.122, green: 0.161, blue: 0.216, alpha: 1)
 private let muted = NSColor(calibratedRed: 0.349, green: 0.396, blue: 0.475, alpha: 1)
 private let accent = NSColor(calibratedRed: 0.145, green: 0.388, blue: 0.922, alpha: 1)
@@ -1095,7 +1111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.ipSummary.stringValue=address
                 self.locationLine.stringValue=[info["city"],info["country"]].compactMap{$0 as? String}.joined(separator:" · ").replacingOccurrences(of:"United States",with:"美国").replacingOccurrences(of:"Los Angeles",with:"洛杉矶")
                 self.providerLine.stringValue="\(connection["isp"] as? String ?? "未知运营商") · AS\(connection["asn"] ?? "未知")"
-                self.ipTime.stringValue="ipwho.is \(info["updated_at"] as? String ?? "")\(address == self.expectedIP ? "" : " · 出口不一致")"
+                self.ipTime.stringValue="ipwho.is \(info["updated_at"] as? String ?? "")\(sameIP(address,self.expectedIP) ? "" : " · 出口不一致")"
                 self.renderOverview()
             }
         }
@@ -1125,7 +1141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func renderOverview() {
         let address=ipSummary.stringValue
-        let matched = !coffeeIP.isEmpty && coffeeIP == address
+        let matched = sameIP(coffeeIP,address)
         let mismatch = !coffeeIP.isEmpty && address.first?.isNumber == true && !matched
         let attribute = matched ? propertyValue.stringValue : (mismatch ? "检测出口不一致" : "IP 属性待验证")
         identityLine.stringValue=address

@@ -1,7 +1,8 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),http=require('node:http'),https=require('node:https'),net=require('node:net');
 const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
-const {benchmarkSettings,expectedIP,storedSettings,settingChanges}=require('./preferences.cjs');
+const {benchmarkSettings,expectedIP,settingChanges}=require('./preferences.cjs');
+const {sameIP}=require('./ip-address.js');
 const {selectionOwners}=require('./reconcile.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
@@ -40,7 +41,7 @@ function assessClaude(rows,connections,expectedProxyIP,expectedIP=EXPECTED){
  for(const row of rows){const found=connections.filter(x=>String(x.metadata?.sourcePort)===String(row.LocalPort)&&(!x.metadata.sourceIP||x.metadata.sourceIP===row.LocalAddress));
   if(found.length===1)matched.push({pid:row.OwningProcess,host:found[0].metadata.host,chains:found[0].chains||[]});else other.push({pid:row.OwningProcess,remote:row.RemoteAddress,port:row.RemotePort});}
  const good=matched.filter(x=>x.chains.includes(EXIT)).length,bad=matched.some(x=>x.chains.length&&!x.chains.includes(EXIT));
- return {status:bad?'bad':good>0&&good===rows.length&&expectedProxyIP===expectedIP?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
+ return {status:bad?'bad':good>0&&good===rows.length&&sameIP(expectedProxyIP,expectedIP)?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
 }
 class ClashHTTPError extends Error {
  constructor(status){
@@ -54,8 +55,14 @@ function requestNotSent(error){
   ['ECONNREFUSED','ENOENT','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'].includes(error?.code);
 }
 class Backend{
- constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings=storedSettings();this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
- async init(){await fs.mkdir(this.dataDir,{recursive:true});const saved=await jsonRead(path.join(this.dataDir,'settings.json'));this.settings=storedSettings(saved);this.history=await jsonRead(path.join(this.dataDir,'results.json'),{});return this;}
+ constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
+ async init(){
+  await fs.mkdir(this.dataDir,{recursive:true});
+  const saved=await jsonRead(path.join(this.dataDir,'settings.json'));
+  if(saved&&typeof saved==='object'&&!Array.isArray(saved))this.settings=saved;
+  this.history=await jsonRead(path.join(this.dataDir,'results.json'),{});
+  return this;
+ }
  async saveSettings(values){
  const changes=settingChanges(values);
  const connectionChange='configDir' in changes||'corePath' in changes;
@@ -69,8 +76,10 @@ class Backend{
  this.settingsWrite=write.catch(()=>{});try{await write;}finally{this.pendingSettings--;this.autoRevision++;}
  }
  async powershell(script){const encoded=Buffer.from("[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$ErrorActionPreference='Stop';"+script,'utf16le').toString('base64');const {stdout}=await exec('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{windowsHide:true,timeout:12000,maxBuffer:2e6});return stdout.trim();}
+ connectionPath(key){const value=this.settings[key];return typeof value==='string'?value:'';}
  async config(){
- const roots=this.settings.configDir?[this.settings.configDir]:process.platform==='win32'?[path.join(process.env.APPDATA||'','io.github.clash-verge-rev.clash-verge-rev'),path.join(process.env.LOCALAPPDATA||'','io.github.clash-verge-rev.clash-verge-rev')]:[path.join(os.homedir(),'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev')];
+ const configured=this.connectionPath('configDir');
+ const roots=configured?[configured]:process.platform==='win32'?[path.join(process.env.APPDATA||'','io.github.clash-verge-rev.clash-verge-rev'),path.join(process.env.LOCALAPPDATA||'','io.github.clash-verge-rev.clash-verge-rev')]:[path.join(os.homedir(),'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev')];
  for(const root of roots)for(const name of ['clash-verge.yaml','config.yaml'])try{const c=YAML.parse(await fs.readFile(path.join(root,name),'utf8'));if(c&&Array.isArray(c.proxies)){this.root=root;this.configFile=path.join(root,name);return c;}}catch{}
  throw Error('未找到 Clash Verge 配置。请先启用链式配置，或在设置中选择配置目录。');}
  async discover(){const c=await this.config();const endpoints=[];
@@ -138,7 +147,7 @@ class Backend{
   });
   return {...relay,expectedIP:this.expectedIP,nodes,
    entryOwners,switchable:Object.keys(entryOwners),lastTest:this.history.finishedAt,
-   settings:{...benchmarkSettings(this.settings),configDir:this.root,corePath:this.settings.corePath},
+   settings:{...benchmarkSettings(this.settings),configDir:this.root,corePath:this.connectionPath('corePath')},
    progress:this.progress};
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
@@ -191,11 +200,11 @@ class Backend{
   const exit=config.proxies?.find(n=>n.name===EXIT);
   this.expectedIP=expectedIP(this.settings.expectedIP,exit?.server);
   this.dnsPolicy=Object.fromEntries(Object.entries(config.dns?.['proxy-server-nameserver-policy']||{}).filter(([k])=>!k.startsWith('geosite:')&&!k.startsWith('rule-set:')));
-  if(!exit||!this.expectedIP)throw Error('找不到固定出口配置或有效的预期出口 IP');
+  if(!exit||!net.isIP(this.expectedIP))throw Error('找不到固定出口配置或有效的预期出口 IP');
   if(exit['dialer-proxy']!==ENTRY)throw Error('固定出口的链式上游已变化，未开始测试');
   return {nodes,exit,config};
  }
- async corePath(){if(this.settings.corePath){await fs.access(this.settings.corePath);return this.settings.corePath;}if(process.platform==='darwin')return '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo';
+ async corePath(){const configured=this.connectionPath('corePath');if(configured){await fs.access(configured);return configured;}if(process.platform==='darwin')return '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo';
  try{const raw=await this.powershell("@(Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^(verge-mihomo|mihomo|clash-meta)(-alpha)?\\.exe$'} | Select-Object -ExpandProperty ExecutablePath) | ConvertTo-Json -Compress");const found=JSON.parse(raw||'[]');for(const p of [found].flat())if(p){await fs.access(p);return p;}}catch{}
  for(const base of [process.env.ProgramFiles,process.env.LOCALAPPDATA&&path.join(process.env.LOCALAPPDATA,'Programs')].filter(Boolean))for(const suffix of ['Clash Verge/verge-mihomo.exe','Clash Verge/resources/verge-mihomo.exe']){const p=path.join(base,suffix);try{await fs.access(p);return p;}catch{}}
  throw Error('未找到 Mihomo 内核，请在设置中选择 Clash Verge 自带的 verge-mihomo.exe');}
@@ -210,7 +219,7 @@ class Backend{
  // Validate the temporary listener belongs to exactly our child before sending a probe.
  const owner=await this.powershell(`@(Get-NetTCPConnection -State Listen -LocalPort ${port} | Select-Object -ExpandProperty OwningProcess -Unique) | ConvertTo-Json -Compress`);if(!owner||[JSON.parse(owner)].flat().length!==1||JSON.parse(owner)!==child.pid&&JSON.parse(owner)[0]!==child.pid)throw Error('无法确认临时端口归属');
  if(kind==='chain'){const started=performance.now();try{await this.textRequest('https://www.gstatic.com/generate_204',port,{signal,timeout:8000,accept:[204]});entranceDelay=Math.round(performance.now()-started)}catch{}}
- for(let i=0;i<(kind==='chain'?3:1);i++){if(signal.aborted)throw Error('已停止');const start=performance.now();try{const res=await this.trace(port,signal);if(kind==='chain'&&res.ip!==probe.expectedIP)throw Error('出口不符：'+res.ip);samples.push({ms:Math.round(performance.now()-start),ip:res.ip});}catch(e){if(!samples.length)throw e;}await pause(100);}
+ for(let i=0;i<(kind==='chain'?3:1);i++){if(signal.aborted)throw Error('已停止');const start=performance.now();try{const res=await this.trace(port,signal);if(kind==='chain'&&!sameIP(res.ip,probe.expectedIP))throw Error('出口不符：'+res.ip);samples.push({ms:Math.round(performance.now()-start),ip:res.ip});}catch(e){if(!samples.length)throw e;}await pause(100);}
  if(kind==='chain'&&samples.length<2)throw Error('成功样本不足两次');const times=samples.map(x=>x.ms).sort((a,b)=>a-b);return {delay:Math.round((times[Math.floor((times.length-1)/2)]+times[Math.floor(times.length/2)])/2),samples,status:'done',kind,...(kind==='chain'?{entranceDelay}:{})};
  }catch(e){return {delay:null,status:'failed',kind,error:safeError(e),...(kind==='chain'?{entranceDelay}:{})}}finally{if(child){await this.stopChild(child);this.children.delete(child)}await fs.rm(folder,{recursive:true,force:true}).catch(()=>{});}}
  async benchmark(kind='chain',mayAutoSwitch=null){
@@ -280,7 +289,7 @@ class Backend{
   latestResults:this.progress.results,results:{...this.history.results,...this.progress.results}};
  await writeJSON(historyFile,completedHistory);
  this.history=completedHistory;
- const authorized=()=>mayAutoSwitch?.()&&settingsStable&&!this.pendingSettings&&options.autoRelay&&this.settings.autoRelay&&this.settings.metric===options.metric&&this.settings.hourly&&revision===this.autoRevision&&!abort.signal.aborted;
+ const authorized=()=>mayAutoSwitch?.()&&settingsStable&&!this.pendingSettings&&options.autoRelay&&this.settings.autoRelay===true&&benchmarkSettings(this.settings).metric===options.metric&&this.settings.hourly!==false&&revision===this.autoRevision&&!abort.signal.aborted;
  if(kind==='chain'&&!this.history.reason&&this.progress.completed===this.progress.total&&authorized()){
   const target=autoCandidate(this.progress.results,before.entry,options.metric);
   if(target){

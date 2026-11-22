@@ -1,5 +1,99 @@
 const test=require('node:test'),assert=require('node:assert/strict'),os=require('node:os'),path=require('node:path'),fs=require('node:fs/promises'),http=require('node:http');
 const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED}=require('../backend.cjs');
+const ipComparison=require('../../fixtures/ip-comparison.json');
+test('Claude proxy exit checks compare parsed addresses',()=>{
+ const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1'}];
+ const connections=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽']}];
+ for(const {name,probe,expected,matches} of ipComparison){
+  assert.equal(assessClaude(rows,connections,probe,expected).status,matches?'ok':'warn',name);
+ }
+});
+
+test('Windows chain benchmark compares parsed exit addresses',async t=>{
+ const {EventEmitter}=require('node:events'),net=require('node:net'),vm=require('node:vm');
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-ip-probe-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const child=new EventEmitter();
+ child.pid=123;
+ child.exitCode=null;
+ child.kill=()=>queueMicrotask(()=>{child.exitCode=0;child.emit('exit');});
+ const context=vm.createContext({module:{exports:{}},structuredClone,performance,setTimeout:fn=>queueMicrotask(fn),
+  require(name){
+   if(name==='node:child_process')return {...require(name),spawn:()=>{child.exitCode=null;return child;}};
+   if(name==='node:net')return {...net,connect(){
+    const socket=new EventEmitter();
+    socket.setTimeout=()=>{};
+    socket.destroy=()=>{};
+    queueMicrotask(()=>socket.emit('connect'));
+    return socket;
+   }};
+   return require(name.startsWith('./')?'../'+name.slice(2):name);
+  },
+ });
+ vm.runInContext(await fs.readFile(require.resolve('../backend.cjs'),'utf8'),context);
+ const b=new context.module.exports.Backend(folder);
+ b.freePort=async()=>12345;
+ b.powershell=async()=>String(child.pid);
+ for(const {name,expected,probe,matches} of ipComparison){
+  b.expectedIP=expected;
+  b.textRequest=async()=>`ip=${probe}`;
+  const result=await b.testNode({}, {}, {name:'fixture'}, 'mock.exe', 'chain', new AbortController().signal);
+  assert.equal(result.status,matches?'done':'failed',name);
+  if(matches)assert.equal(result.samples[0].ip,probe,name);
+ }
+});
+
+test('saved Windows exit addresses load verbatim and survive a settings save', async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-exit-settings-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const file=path.join(folder,'settings.json');
+ for(const expectedIP of [ipComparison[1].expected,'example.invalid']){
+  await fs.writeFile(file,JSON.stringify({expectedIP}));
+  const b=await new Backend(folder).init();
+  b.config=async()=>({proxies:[{name:'美国静态家宽',server:'203.0.113.10','dialer-proxy':'中转入口'}]});
+  b.relayState=async()=>({live:[]});
+  b.api=async()=>({});
+  assert.equal((await b.state()).expectedIP,expectedIP);
+  await b.saveSettings({hourly:false});
+  assert.equal(JSON.parse(await fs.readFile(file,'utf8')).expectedIP,expectedIP);
+ }
+});
+
+test('a stale saved connection path fails at the configured path',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-stale-path-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const missing=path.join(folder,'missing');
+ await fs.writeFile(path.join(folder,'settings.json'),JSON.stringify({configDir:missing,corePath:missing}));
+ const b=await new Backend(folder).init();
+ await assert.rejects(b.config(),/未找到 Clash Verge 配置/);
+ await assert.rejects(b.corePath(),{code:'ENOENT',path:missing});
+});
+
+test('an unrelated settings save preserves saved connection paths',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-saved-path-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const file=path.join(folder,'settings.json');
+ await fs.writeFile(file,JSON.stringify({configDir:{invalid:true},corePath:42}));
+ const b=await new Backend(folder).init();
+ const defaultConfig=process.platform==='win32'?folder:path.join(folder,'Library/Application Support');
+ if(process.platform==='win32'){
+  const appData=process.env.APPDATA;
+  process.env.APPDATA=folder;
+  t.after(()=>{if(appData===undefined)delete process.env.APPDATA;else process.env.APPDATA=appData;});
+ }else t.mock.method(os,'homedir',()=>folder);
+ const root=path.join(defaultConfig,'io.github.clash-verge-rev.clash-verge-rev');
+ await fs.mkdir(root,{recursive:true});
+ await fs.writeFile(path.join(root,'config.yaml'),'proxies: []');
+ assert.deepEqual(await b.config(),{proxies:[]});
+ const autoCore=path.join(folder,'mock-core.exe');
+ await fs.writeFile(autoCore,'test');
+ b.powershell=async()=>JSON.stringify(autoCore);
+ assert.equal(await b.corePath(),process.platform==='darwin'?'/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo':autoCore);
+ await b.saveSettings({hourly:false});
+ const saved=JSON.parse(await fs.readFile(file,'utf8'));
+ assert.deepEqual(saved.configDir,{invalid:true});
+ assert.equal(saved.corePath,42);
+});
 test('isolated configuration never enables live control, TUN or mutates inputs',()=>{const a={name:'入口',type:'ss',server:'example.invalid',port:1},b={name:'美国静态家宽',server:EXPECTED,'dialer-proxy':'中转入口'};const before=JSON.stringify([a,b]);for(const kind of ['chain','entrance']){const c=isolatedConfig(a,b,12345,'Wi-Fi',kind);assert.equal(c.tun.enable,false);assert.equal(c['allow-lan'],false);assert.equal(c['external-controller'],'');assert.equal(c['interface-name'],'Wi-Fi');assert.equal(c.proxies[0]['interface-name'],'Wi-Fi');assert.equal(c.profile['store-selected'],false);assert.equal(c.proxies.length,kind==='chain'?2:1);}assert.equal(JSON.stringify([a,b]),before);assert.throws(()=>isolatedConfig({...a,'dialer-proxy':'other'},b,1,'Wi-Fi'));});
 test('IPv6 incomplete probes must never pass',()=>{assert.equal(ipv6Assessment([],[{connected:false},{connected:false}]).status,'ok');assert.equal(ipv6Assessment([],[{},{}]).status,'warn');assert.equal(ipv6Assessment([],[{connected:true},{connected:false}]).status,'warn');assert.equal(ipv6Assessment(['2001:db8::1'],[{connected:false},{connected:false}]).status,'warn');});
 test('Claude connections require exact endpoint evidence and verified proxy exit',()=>{const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1',OwningProcess:123}],cons=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽','GLOBAL']}];assert.equal(assessClaude(rows,cons,EXPECTED).status,'ok');assert.equal(assessClaude(rows,cons,'203.0.113.11').status,'warn');assert.equal(assessClaude([],[],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[...cons,...cons],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[{...cons[0],chains:['DIRECT']}],EXPECTED).status,'bad');});
@@ -50,7 +144,7 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
  b.testNode=async node=>{active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,8));active--;
   const [entranceDelay,delay]={current:[200,400],entrance:[80,260],chain:[90,190],failed:[5,null]}[node.name];return {delay,entranceDelay,status:delay?'done':'failed',kind:'chain'};};
  await Promise.all([b.saveSettings({interval:15,concurrency:2}),b.saveSettings({autoRelay:true,metric:'entrance'})]);
- const restarted=await new Backend(folder).init();assert.deepEqual(restarted.settings,{hourly:true,interval:15,concurrency:2,autoRelay:true,metric:'entrance',configDir:'',corePath:''});
+ const restarted=await new Backend(folder).init();assert.deepEqual(restarted.settings,{interval:15,concurrency:2,autoRelay:true,metric:'entrance'});
  await b.benchmark();assert.equal(peak,2);assert.equal(writes.length,0);
  await b.benchmark('chain',()=>false);assert.equal(writes.length,0);
  const run=await b.benchmark('chain',()=>true);assert.equal(run.switchedTo,'entrance');assert.deepEqual(writes,[['PUT','/proxies/'+encodeURIComponent('中转入口'),'entrance']]);

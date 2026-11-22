@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -7,6 +8,19 @@ import yaml
 import chain_test as c
 
 class SafetyTests(unittest.TestCase):
+    def test_chain_trace_compares_parsed_exit_addresses(self):
+        cases = json.loads((Path(__file__).resolve().parents[2] / 'fixtures/ip-comparison.json').read_text())
+        for case in cases:
+            with self.subTest(case=case['name']), patch.object(c.subprocess, 'Popen') as popen:
+                process = popen.return_value
+                process.poll.return_value = process.returncode = 0
+                process.communicate.return_value = (f"ip={case['probe']}\n__TIMING__200 0.1 0.07".encode(), b'')
+                if case['matches']:
+                    self.assertEqual(c.trace(1234, lambda: False, case['expected'])['ip'], case['probe'])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, '出口不符|测试站返回无效结果'):
+                        c.trace(1234, lambda: False, case['expected'])
+
     def test_isolation_and_no_input_mutation(self):
         entry={'name':'sample','type':'ss','server':'example.invalid'}
         exit={'name':'US','server':'203.0.113.10','dialer-proxy':'live-selector'}

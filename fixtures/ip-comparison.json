@@ -1,0 +1,10 @@
+[
+  {"name": "expanded probe", "expected": "2001:db8::1", "probe": "2001:0DB8:0000:0000:0000:0000:0000:0001", "matches": true},
+  {"name": "expanded expected", "expected": "2001:0DB8:0000:0000:0000:0000:0000:0001", "probe": "2001:db8::1", "matches": true},
+  {"name": "both expanded", "expected": "2001:0DB8:0000:0000:0000:0000:0000:0001", "probe": "2001:0DB8:0000:0000:0000:0000:0000:0001", "matches": true},
+  {"name": "IPv4-mapped IPv6", "expected": "::ffff:203.0.113.10", "probe": "::ffff:cb00:710a", "matches": true},
+  {"name": "different addresses", "expected": "2001:db8::1", "probe": "2001:db8::2", "matches": false},
+  {"name": "different zones", "expected": "fe80::1%fixture1", "probe": "fe80::1%fixture2", "matches": false},
+  {"name": "invalid addresses", "expected": "example.invalid", "probe": "example.invalid", "matches": false},
+  {"name": "missing addresses", "expected": "", "probe": "", "matches": false}
+]

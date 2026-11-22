@@ -1,5 +1,6 @@
 {
   "input": {"hourly": null, "interval": 0, "concurrency": 11, "autoRelay": "true", "metric": "other", "expectedIP": "exit.example.com"},
   "configuredIP": "192.0.2.1",
+  "windowsExpectedIP": "exit.example.com",
   "output": {"hourly": true, "interval": 60, "concurrency": 5, "autoRelay": false, "metric": "chain", "expectedIP": ""}
 }
