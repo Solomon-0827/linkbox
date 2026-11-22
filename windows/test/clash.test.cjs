@@ -238,3 +238,26 @@ test('a rejection after seven seconds still rolls back a Windows reload', async 
  await assert.rejects(reload, /400.*文件已回退/);
  assert.equal(await fs.readFile(file, 'utf8'), original);
 });
+
+test('a concurrent rediscovery of the same controller does not cancel the reload', async t => {
+ const requests = [];
+ let releaseSecond;
+ const secondVersion = new Promise(resolve => { releaseSecond = resolve; });
+ let versions = 0, validate;
+ const {adapter, root} = await fixture(t, {
+  endpoint: undefined,
+  resolveConfig: async () => ({config: {'external-controller': '127.0.0.1:9097'}}),
+  validate: () => validate(),
+  transport: async (_endpoint, method, route, body) => {
+   if (route === '/version') { if (++versions === 2) await secondVersion; return {}; }
+   requests.push([method, route, body]);
+   return {};
+  },
+ });
+ const first = adapter.providers(), second = adapter.connections();
+ await first;
+ // The slower discovery finishes while the reload is validating and replaces the cached endpoint.
+ validate = async () => { releaseSecond(); await second; };
+ await adapter.reload(root, 'proxies: []', () => {}, () => assert.fail('rollback'));
+ assert.deepEqual(requests.at(-1), ['PUT', '/configs?force=false', {payload: 'proxies: []'}]);
+});

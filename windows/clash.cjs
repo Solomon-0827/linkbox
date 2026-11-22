@@ -110,6 +110,7 @@ class Clash {
  #transport;
  #validate;
  #endpoint;
+ #generation = 0;
  #resolveConfig;
  constructor(settings, powershell, {transport = request, validate, endpoint, resolveConfig = () => this.config()} = {}) {
   this.#settings = settings;
@@ -120,7 +121,7 @@ class Clash {
   this.#resolveConfig = resolveConfig;
  }
 
- resetConnection() { this.#endpoint = null; }
+ resetConnection() { this.#endpoint = null; this.#generation += 1; }
 
  async #call(method, route, body, timeout) {
   if (!this.#endpoint) await this.#discover();
@@ -132,7 +133,7 @@ class Clash {
  async switchEntry(name) { await this.#call('PUT', ENTRY_ROUTE, {name}); }
 
  async reload(root, payload, prepare, rollback, validationRoot = () => root) {
-  const endpoint = this.#endpoint;
+  const endpoint = this.#endpoint, generation = this.#generation;
   const temp = await fs.mkdtemp(path.join(root, 'linkbox-validate-'));
   try {
    const file = path.join(temp, 'config.yaml');
@@ -150,7 +151,8 @@ class Clash {
   // Recheck the snapshots and install the files only after validation succeeds.
   await prepare();
   // A settings save can invalidate the controller while the files are being installed.
-  if (!endpoint || this.#endpoint !== endpoint) throw Error(RELOAD_UNCERTAIN);
+  // Rediscovering the same controller is harmless; only a settings reset invalidates it.
+  if (!endpoint || this.#generation !== generation) throw Error(RELOAD_UNCERTAIN);
   try {
    await this.#transport(endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
   } catch (error) {
