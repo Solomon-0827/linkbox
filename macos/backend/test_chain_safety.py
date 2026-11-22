@@ -1,7 +1,7 @@
 import copy
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import yaml
@@ -21,6 +21,28 @@ class SafetyTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(RuntimeError, '出口不符|测试站返回无效结果'):
                         c.trace(1234, lambda: False, case['expected'])
+
+    def test_first_wrong_exit_stops_chain_requests(self):
+        core = Mock()
+        core.poll.return_value = None
+        probe = Mock(returncode=0)
+        probe.poll.return_value = 0
+        expected = '203.0.113.10'
+        probe.communicate.side_effect = [
+            (f'ip={ip}\n__TIMING__200 0.1 0.07'.encode(), b'')
+            for ip in ('203.0.113.11', expected, expected)
+        ]
+        with (patch.object(c.subprocess, 'Popen', side_effect=[core, probe, probe, probe]) as launch,
+              patch.object(c.subprocess, 'run', return_value=Mock(returncode=0)),
+              patch.object(c.socket, 'create_connection'),
+              patch.object(c, 'entrance_delay', return_value=42),
+              patch.object(c.time, 'sleep')):
+            samples, errors, _ = c.test_node({}, {}, {'interface': 'en0'}, lambda: False, expected)
+
+        requests = [call.args[0][-1] for call in launch.call_args_list[1:]]
+        self.assertEqual(requests, [c.TARGET])
+        self.assertEqual(samples, [])
+        self.assertEqual(errors, ['出口不符：203.0.113.11'])
 
     def test_isolation_and_no_input_mutation(self):
         entry={'name':'sample','type':'ss','server':'example.invalid'}

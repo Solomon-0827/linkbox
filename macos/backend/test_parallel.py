@@ -1,4 +1,6 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 import tempfile
@@ -96,6 +98,43 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(recommendation(record,'chain'),'chain')
         record['reason']='cancelled'
         self.assertIsNone(recommendation(record,'chain'))
+
+    def test_automatic_chain_omits_recommendation_after_final_snapshot_changes(self):
+        names = ['current', 'fast']
+        before = {'mode': 'global', 'tun': True, 'entry': 'current', 'exit': g.t.EXIT,
+                  'dialer': g.t.ENTRY, 'live': names}
+        after = {**before, 'tun': False}
+        state = before
+        nodes = {name: {'name': name} for name in names}
+        expected = '203.0.113.10'
+        (g.t.BASE / 'node-policy.json').write_text(json.dumps({'selected_nodes': {'fixture': names}}))
+
+        @contextmanager
+        def pool(**kwargs):
+            nonlocal state
+            with ThreadPoolExecutor(**kwargs) as executor:
+                yield executor
+            state = after
+
+        def measure(node, *_):
+            delay = {'current': 200, 'fast': 80}[node['name']]
+            return [{'ms': delay, 'ip': expected}] * 3, [], {}
+
+        with (patch.object(c, 'ThreadPoolExecutor', pool),
+              patch.object(c, 'active_state', side_effect=lambda: (state, names)),
+              patch.object(c, 'physical_network', return_value={'interface': 'en0'}),
+              patch.object(c, 'load_nodes', return_value=(nodes, {}, expected)),
+              patch.object(c, 'test_node', side_effect=measure),
+              patch.object(g, 'snapshot', side_effect=lambda: state)):
+            result = g.COMMANDS['chain']('1', 'chain')
+
+        record = json.loads((g.t.BASE / 'chain-results.json').read_text())
+        self.assertEqual(record['reason'], '')
+        self.assertEqual(record['before'], before)
+        self.assertEqual(record['after'], after)
+        self.assertEqual({name: row['chain_delay'] for name, row in record['results'].items()},
+                         {'current': 200, 'fast': 80})
+        self.assertNotIn('recommendation', result)
 
     def test_auto_switch_guard_blocks_live_write_after_network_or_node_change(self):
         state={'mode':'global','exit':g.t.EXIT,'dialer':g.t.ENTRY,'entry':'a','nodes':['a','b'],'live':['a','b']}
