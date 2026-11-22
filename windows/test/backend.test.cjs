@@ -50,7 +50,7 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
  b.testNode=async node=>{active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,8));active--;
   const [entranceDelay,delay]={current:[200,400],entrance:[80,260],chain:[90,190],failed:[5,null]}[node.name];return {delay,entranceDelay,status:delay?'done':'failed',kind:'chain'};};
  await Promise.all([b.saveSettings({interval:15,concurrency:2}),b.saveSettings({autoRelay:true,metric:'entrance'})]);
- const restarted=await new Backend(folder).init();assert.deepEqual(restarted.settings,{hourly:true,interval:15,concurrency:2,autoRelay:true,metric:'entrance'});
+ const restarted=await new Backend(folder).init();assert.deepEqual(restarted.settings,{hourly:true,interval:15,concurrency:2,autoRelay:true,metric:'entrance',configDir:'',corePath:''});
  await b.benchmark();assert.equal(peak,2);assert.equal(writes.length,0);
  await b.benchmark('chain',()=>false);assert.equal(writes.length,0);
  const run=await b.benchmark('chain',()=>true);assert.equal(run.switchedTo,'entrance');assert.deepEqual(writes,[['PUT','/proxies/'+encodeURIComponent('中转入口'),'entrance']]);

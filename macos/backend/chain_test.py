@@ -18,6 +18,7 @@ import time
 import yaml
 import toolbox as t
 import runtime
+from settings import benchmark_value
 from reconcile import selection_owners
 
 CORE = '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo'
@@ -224,8 +225,7 @@ def auto_candidate(record, metric):
 
 
 def run(concurrency=runtime.CONCURRENCY):
-    if type(concurrency) is not int or not 1 <= concurrency <= 10:
-        raise ValueError("并发测速量须为 1–10")
+    concurrency = benchmark_value('concurrency', concurrency, strict=True)
     os.umask(0o077)
     with open(t.BASE/'latency.lock','a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

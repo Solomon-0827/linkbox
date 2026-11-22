@@ -58,8 +58,11 @@ $('#hourly').onchange=async()=>{const button=$('#hourly'),hourly=button.checked;
 $('#autoSettingsButton').onclick=async()=>{
  const button=$('#autoSettingsButton');button.disabled=true;
  let settings;try{settings=await call('benchmarkSettings')}catch(e){say(e.message);return}finally{button.disabled=false;}
- $('#testInterval').value=settings.interval??60;$('#testConcurrency').value=settings.concurrency??5;
- $('#autoRelay').checked=settings.autoRelay===true;$('#autoMetric').value=settings.metric||'chain';
+ for(const [id,key] of [['#testInterval','interval'],['#testConcurrency','concurrency']]){
+  const field=$(id),{min,max}=settings.limits[key];
+  field.min=min;field.max=max;field.value=settings[key];
+ }
+ $('#autoRelay').checked=settings.autoRelay;$('#autoMetric').value=settings.metric;
  text('#autoSettingsNotice','');$('#autoSettings').showModal();activity();
 };
 $('#autoSettingsForm').onsubmit=async event=>{
@@ -93,21 +96,9 @@ function choosePickerNode(sources, node) {
  }
 }
 async function loadPicker(){
- const fresh=await call('catalog');
- const changes=new Map((pickerData?.sources||[]).map(source=>[
-  source.id,new Map(source.nodes.filter(node=>node.selected!==node.initialSelected)
-      .map(node=>[node.name,node.selected]))
- ]));
- const explicit=[];
- for(const source of fresh.sources){
-  for(const node of source.nodes){
-   node.initialSelected=node.selected;
-   const changed=changes.get(source.id)?.get(node.name);
-   if(changed===false)node.selected=false;
-   if(changed===true)explicit.push(node);
-  }
- }
- for(const node of explicit)choosePickerNode(fresh.sources,node);
+ const changes=(pickerData?.sources||[]).flatMap(source=>source.nodes
+  .filter(node=>node.selected!==node.initialSelected).map(node=>[source.id,node.name,node.selected]));
+ const fresh=await call('catalog',{changes});
  pickerData=fresh;
  if(!fresh.sources.some(source=>source.id===pickerSource))pickerSource=fresh.sources[0]?.id||'';
  pickerCatalogCurrent=true;

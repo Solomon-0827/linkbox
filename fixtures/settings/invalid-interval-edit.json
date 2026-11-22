@@ -1,0 +1,4 @@
+{
+  "input": {"interval": 1441, "concurrency": 5, "autoRelay": false, "metric": "chain"},
+  "error": "测速间隔须为 1–1440 分钟。"
+}

@@ -1,0 +1,5 @@
+{
+  "input": {"interval": 1, "concurrency": 1, "expectedIP": ""},
+  "configuredIP": "203.0.113.10",
+  "output": {"hourly": true, "interval": 1, "concurrency": 1, "autoRelay": false, "metric": "chain", "expectedIP": "203.0.113.10"}
+}

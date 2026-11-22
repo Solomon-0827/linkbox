@@ -1,0 +1,21 @@
+{
+  "catalog": {
+    "fingerprint": "fresh",
+    "current": "relay",
+    "sources": [
+      {"id": "b", "nodes": [{"name": "z-new", "selected": true}, {"name": "relay", "selected": false}]},
+      {"id": "a", "nodes": [{"name": "relay", "selected": true, "current": true}, {"name": "drop", "selected": true}]},
+      {"id": "c", "nodes": [], "warning": "本地缓存暂不可读，保留原勾选"}
+    ]
+  },
+  "changes": [["a", "drop", false], ["b", "relay", true], ["b", "gone", true], ["gone", "z-new", false]],
+  "output": {
+    "fingerprint": "fresh",
+    "current": "relay",
+    "sources": [
+      {"id": "b", "nodes": [{"name": "z-new", "initialSelected": true, "selected": true}, {"name": "relay", "initialSelected": false, "selected": true}]},
+      {"id": "a", "nodes": [{"name": "relay", "initialSelected": true, "selected": false, "current": true}, {"name": "drop", "initialSelected": true, "selected": false}]},
+      {"id": "c", "nodes": [], "warning": "本地缓存暂不可读，保留原勾选"}
+    ]
+  }
+}

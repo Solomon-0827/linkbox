@@ -1,6 +1,7 @@
 'use strict';
 const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),http=require('node:http'),https=require('node:https'),net=require('node:net');
 const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
+const {benchmarkSettings,expectedIP,storedSettings,settingChanges}=require('./preferences.cjs');
 const {selectionOwners}=require('./reconcile.cjs');
 const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
@@ -11,10 +12,6 @@ function isolatedConfig(entry,exit,port,iface,kind='chain',dnsPolicy={}){
  if(entry['dialer-proxy'])throw Error('该节点自带链式上游，暂不支持隔离测速');
  const a=structuredClone(entry),b=structuredClone(exit);a.name='TEST_ENTRY';a['interface-name']=iface;delete a['routing-mark'];b.name='TEST_EXIT';b['dialer-proxy']='TEST_ENTRY';delete b['interface-name'];delete b['routing-mark'];
  return {'mixed-port':port,'bind-address':'127.0.0.1','allow-lan':false,mode:'rule','log-level':'silent',ipv6:false,'interface-name':iface,'external-controller':'','tun':{enable:false},'find-process-mode':'off',profile:{'store-selected':false,'store-fake-ip':false},dns:{enable:true,ipv6:false,'enhanced-mode':'normal','default-nameserver':['223.5.5.5','119.29.29.29'],nameserver:['https://dns.alidns.com/dns-query'],'proxy-server-nameserver':['https://dns.alidns.com/dns-query'],'nameserver-policy':dnsPolicy,'proxy-server-nameserver-policy':dnsPolicy},proxies:kind==='chain'?[a,b]:[a],'proxy-groups':[],rules:[...(kind==='chain'?['DOMAIN,www.gstatic.com,TEST_ENTRY']:[]),'MATCH,'+(kind==='chain'?'TEST_EXIT':'TEST_ENTRY')]};
-}
-function benchmarkSettings(s){
- const bounded=(value,min,max,fallback)=>Number.isInteger(value)&&value>=min&&value<=max?value:fallback;
- return {interval:bounded(s.interval,1,1440,60),concurrency:bounded(s.concurrency,1,10,5),autoRelay:s.autoRelay===true,metric:s.metric==='entrance'?'entrance':'chain'};
 }
 function autoCandidate(results,current,metric){
  if(!Object.hasOwn(results,current))return null;
@@ -57,16 +54,16 @@ function requestNotSent(error){
   ['ECONNREFUSED','ENOENT','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'].includes(error?.code);
 }
 class Backend{
- constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
- async init(){await fs.mkdir(this.dataDir,{recursive:true});this.settings=await jsonRead(path.join(this.dataDir,'settings.json'),{hourly:true});this.history=await jsonRead(path.join(this.dataDir,'results.json'),{});return this;}
+ constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings=storedSettings();this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.expectedIP='';this.nodePolicy={};this.dnsPolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
+ async init(){await fs.mkdir(this.dataDir,{recursive:true});const saved=await jsonRead(path.join(this.dataDir,'settings.json'));this.settings=storedSettings(saved);this.history=await jsonRead(path.join(this.dataDir,'results.json'),{});return this;}
  async saveSettings(values){
- const connectionChange='configDir' in values||'corePath' in values;
+ const changes=settingChanges(values);
+ const connectionChange='configDir' in changes||'corePath' in changes;
  if(this.busy&&connectionChange)throw Error('请等待当前操作完成后再修改连接设置');
  this.autoRevision++;this.pendingSettings++;
  const write=this.settingsWrite.then(async()=>{
   if(this.busy&&connectionChange)throw Error('请等待当前操作完成后再修改连接设置');
-  const next={...this.settings};
-  for(const key of ['configDir','corePath','hourly','interval','concurrency','autoRelay','metric'])if(Object.hasOwn(values,key))next[key]=values[key];
+  const next={...this.settings,...changes};
   await writeJSON(path.join(this.dataDir,'settings.json'),next);this.settings=next;if(connectionChange)this.endpoint=null;
  });
  this.settingsWrite=write.catch(()=>{});try{await write;}finally{this.pendingSettings--;this.autoRevision++;}
@@ -118,7 +115,7 @@ class Backend{
  async state(timeout){
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
   const cfg=await this.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
-  this.expectedIP=this.settings.expectedIP||(net.isIP(configured||'')?configured:'');
+  this.expectedIP=expectedIP(this.settings.expectedIP,configured);
   const {entryPlan}=require('./subscriptions.cjs');
   const [relay,providers,plan]=await Promise.all([
    this.relayState(timeout),this.api('GET','/providers/proxies',undefined,timeout).catch(()=>({})),
@@ -141,7 +138,7 @@ class Backend{
   });
   return {...relay,expectedIP:this.expectedIP,nodes,
    entryOwners,switchable:Object.keys(entryOwners),lastTest:this.history.finishedAt,
-   settings:{...benchmarkSettings(this.settings),hourly:this.settings.hourly!==false,configDir:this.root,corePath:this.settings.corePath||''},
+   settings:{...benchmarkSettings(this.settings),configDir:this.root,corePath:this.settings.corePath},
    progress:this.progress};
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
@@ -192,9 +189,9 @@ class Backend{
    }
   }
   const exit=config.proxies?.find(n=>n.name===EXIT);
-  this.expectedIP=this.settings.expectedIP||(net.isIP(exit?.server||'')?exit.server:'');
+  this.expectedIP=expectedIP(this.settings.expectedIP,exit?.server);
   this.dnsPolicy=Object.fromEntries(Object.entries(config.dns?.['proxy-server-nameserver-policy']||{}).filter(([k])=>!k.startsWith('geosite:')&&!k.startsWith('rule-set:')));
-  if(!exit||!net.isIP(this.expectedIP))throw Error('找不到固定出口配置或有效的预期出口 IP');
+  if(!exit||!this.expectedIP)throw Error('找不到固定出口配置或有效的预期出口 IP');
   if(exit['dialer-proxy']!==ENTRY)throw Error('固定出口的链式上游已变化，未开始测试');
   return {nodes,exit,config};
  }
@@ -283,7 +280,7 @@ class Backend{
   latestResults:this.progress.results,results:{...this.history.results,...this.progress.results}};
  await writeJSON(historyFile,completedHistory);
  this.history=completedHistory;
- const authorized=()=>mayAutoSwitch?.()&&settingsStable&&!this.pendingSettings&&options.autoRelay&&this.settings.autoRelay===true&&benchmarkSettings(this.settings).metric===options.metric&&this.settings.hourly!==false&&revision===this.autoRevision&&!abort.signal.aborted;
+ const authorized=()=>mayAutoSwitch?.()&&settingsStable&&!this.pendingSettings&&options.autoRelay&&this.settings.autoRelay&&this.settings.metric===options.metric&&this.settings.hourly&&revision===this.autoRevision&&!abort.signal.aborted;
  if(kind==='chain'&&!this.history.reason&&this.progress.completed===this.progress.total&&authorized()){
   const target=autoCandidate(this.progress.results,before.entry,options.metric);
   if(target){
@@ -323,4 +320,4 @@ class Backend{
  const result={time:new Date().toISOString(),expected:this.expectedIP,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,ClashHTTPError,requestNotSent,autoCandidate,benchmarkSettings,isolatedConfig,signature,providerNodes,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,ClashHTTPError,requestNotSent,autoCandidate,isolatedConfig,signature,providerNodes,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};

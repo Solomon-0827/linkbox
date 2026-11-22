@@ -1,0 +1,4 @@
+{
+  "input": {"interval": 60, "concurrency": 5, "autoRelay": false, "metric": "other"},
+  "error": "无效动态测速设置"
+}

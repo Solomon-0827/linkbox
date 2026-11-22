@@ -3,7 +3,7 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
 const {downloadArtifact}=require('@electron/get');
 const electronVersion=require('electron/package.json').version;
 const checksums=require('electron/checksums.json');
-const appFiles=['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js'];
+const appFiles=['main.cjs','backend.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js','preferences.cjs'];
 (async()=>{
  const root=path.resolve(__dirname,'..'),out=path.join(root,'dist'),work=path.join(root,'build/windows'),folder=path.join(work,'LinkBox-Windows-x64');
  await fs.mkdir(out,{recursive:true});await fs.mkdir(work,{recursive:true});
