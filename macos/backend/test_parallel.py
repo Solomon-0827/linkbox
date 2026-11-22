@@ -1,4 +1,7 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
 import tempfile
 import threading
@@ -6,6 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 import yaml
+from benchmark_policy import recommendation
 import clash
 import chain_test as c
 import gui_backend as g
@@ -86,14 +90,51 @@ class ParallelTests(unittest.TestCase):
         record={'before':{'entry':'current'},'reason':'','selection_unchanged':True,'results':{
             'current':{'delay':200,'chain_delay':400},'entrance':{'delay':80,'chain_delay':260},
             'chain':{'delay':90,'chain_delay':190},'failed':{'delay':5,'chain_delay':None}}}
-        self.assertEqual(c.auto_candidate(record,'entrance'),'entrance')
-        self.assertEqual(c.auto_candidate(record,'chain'),'chain')
+        self.assertEqual(recommendation(record,'entrance'),'entrance')
+        self.assertEqual(recommendation(record,'chain'),'chain')
         record['results']['current']['chain_delay']=202
-        self.assertIsNone(c.auto_candidate(record,'chain'))
+        self.assertIsNone(recommendation(record,'chain'))
         record['results']['current']['chain_delay']=None
-        self.assertEqual(c.auto_candidate(record,'chain'),'chain')
+        self.assertEqual(recommendation(record,'chain'),'chain')
         record['reason']='cancelled'
-        self.assertIsNone(c.auto_candidate(record,'chain'))
+        self.assertIsNone(recommendation(record,'chain'))
+
+    def test_automatic_chain_omits_recommendation_after_final_snapshot_changes(self):
+        names = ['current', 'fast']
+        before = {'mode': 'global', 'tun': True, 'entry': 'current', 'exit': g.t.EXIT,
+                  'dialer': g.t.ENTRY, 'live': names}
+        after = {**before, 'tun': False}
+        state = before
+        nodes = {name: {'name': name} for name in names}
+        expected = '203.0.113.10'
+        (g.t.BASE / 'node-policy.json').write_text(json.dumps({'selected_nodes': {'fixture': names}}))
+
+        @contextmanager
+        def pool(**kwargs):
+            nonlocal state
+            with ThreadPoolExecutor(**kwargs) as executor:
+                yield executor
+            state = after
+
+        def measure(node, *_):
+            delay = {'current': 200, 'fast': 80}[node['name']]
+            return [{'ms': delay, 'ip': expected}] * 3, [], {}
+
+        with (patch.object(c, 'ThreadPoolExecutor', pool),
+              patch.object(c, 'active_state', side_effect=lambda: (state, names)),
+              patch.object(c, 'physical_network', return_value={'interface': 'en0'}),
+              patch.object(c, 'load_nodes', return_value=(nodes, {}, expected)),
+              patch.object(c, 'test_node', side_effect=measure),
+              patch.object(g, 'snapshot', side_effect=lambda: state)):
+            result = g.COMMANDS['chain']('1', 'chain')
+
+        record = json.loads((g.t.BASE / 'chain-results.json').read_text())
+        self.assertEqual(record['reason'], '')
+        self.assertEqual(record['before'], before)
+        self.assertEqual(record['after'], after)
+        self.assertEqual({name: row['chain_delay'] for name, row in record['results'].items()},
+                         {'current': 200, 'fast': 80})
+        self.assertNotIn('recommendation', result)
 
     def test_auto_switch_guard_blocks_live_write_after_network_or_node_change(self):
         state={'mode':'global','exit':g.t.EXIT,'dialer':g.t.ENTRY,'entry':'a','nodes':['a','b'],'live':['a','b']}
@@ -106,6 +147,55 @@ class ParallelTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'未自动切换'):
                     g.change('b','a',guard)
                 api.assert_not_called()
+
+    def test_automatic_commands_keep_snapshot_and_switch_reads_in_order(self):
+        names = ['current', 'fast']
+        state = {'mode': 'global', 'tun': True, 'entry': names[0], 'exit': g.t.EXIT,
+                 'dialer': g.t.ENTRY, 'live': names}
+        network = {'interface': 'fixture'}
+        nodes = {name: {'name': name} for name in names}
+        tested = nodes, {}, '203.0.113.10', c.DNS_POLICY
+        report = {'before': state.copy(), 'reason': '', 'selection_unchanged': True, 'network': network,
+                  'results': {'current': {'chain_delay': 200}, 'fast': {'chain_delay': 80}}}
+        (g.t.BASE / 'node-policy.json').write_text(json.dumps({'selected_nodes': {'fixture': names}}))
+        calls = []
+
+        def controller(method, path, payload=None, **_):
+            calls.append((method, path))
+            if path == '/configs':
+                return {'mode': state['mode'], 'tun': {'enable': state['tun']}}
+            if method == 'PUT':
+                state['entry'] = payload['name']
+                return None
+            if path == '/proxies':
+                return {'proxies': {'GLOBAL': {'now': state['exit']}, state['exit']: {'dialer-proxy': state['dialer']},
+                                    state['dialer']: {'now': state['entry'], 'all': names}}}
+            self.assertEqual(path, '/providers/proxies')
+            return {'providers': {}}
+
+        def current_network():
+            calls.append('network')
+            return network
+
+        def current_nodes():
+            calls.append('routing')
+            return tested[:3]
+
+        snapshot = [('GET', '/configs'), ('GET', '/proxies'), ('GET', '/providers/proxies')]
+        with (patch.object(clash, '_request', side_effect=controller),
+              patch.object(g.runtime, 'expected_ip', return_value=tested[2]),
+              patch.object(c, 'run', return_value=('finished', report, tested)),
+              patch.object(c, 'physical_network', side_effect=current_network),
+              patch.object(c, 'load_nodes', side_effect=current_nodes),
+              patch.object(g.t, 'persist_selection', side_effect=lambda name: calls.append(('save', name)))):
+            result = g.COMMANDS['chain']('1', 'chain')
+            self.assertEqual(result['state']['entry'], 'current')
+            self.assertEqual(calls, snapshot)
+            with patch.object(g.sys, 'stdin', StringIO(json.dumps(result['recommendation']))):
+                switched = g.COMMANDS['auto-switch']('fast', 'current')
+            self.assertEqual(switched['state']['entry'], 'fast')
+        self.assertEqual(calls, snapshot + snapshot + ['network', *snapshot[:2], 'routing',
+                         ('PUT', clash._ENTRY_ROUTE), *snapshot, ('save', 'fast')])
 
     def test_manual_and_auto_switch_check_target_membership_before_and_after_put(self):
         state = {'mode': 'global', 'exit': g.t.EXIT, 'dialer': g.t.ENTRY, 'entry': 'current',

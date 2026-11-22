@@ -11,11 +11,12 @@ from pathlib import Path
 import re
 import secrets
 import socket
-import statistics
 import subprocess
 import tempfile
 import time
 import yaml
+import benchmark_policy as policy
+from benchmark_policy import PARAMETERS
 import clash
 from clash import CONFIG_DIR
 import toolbox as t
@@ -42,13 +43,13 @@ def save_benchmark(kind, record):
 
 
 def physical_network():
-    result=subprocess.run(['/usr/sbin/scutil'],input='show State:/Network/Global/IPv4\n',capture_output=True,text=True,timeout=5).stdout
+    result=subprocess.run(['/usr/sbin/scutil'],input='show State:/Network/Global/IPv4\n',capture_output=True,text=True,timeout=PARAMETERS['interface_timeout_seconds']).stdout
     match=re.search(r'PrimaryInterface\s*:\s*(\S+)',result)
     router=re.search(r'Router\s*:\s*(\S+)',result)
     if not match or not re.fullmatch(r'en\d+',match[1]):
         raise RuntimeError('无法确认有线 / Wi-Fi 物理接口，拒绝测速以避免重复经过当前 TUN')
     interface=match[1]
-    addr=subprocess.run(['/usr/sbin/ipconfig','getifaddr',interface],capture_output=True,text=True,timeout=5).stdout.strip()
+    addr=subprocess.run(['/usr/sbin/ipconfig','getifaddr',interface],capture_output=True,text=True,timeout=PARAMETERS['interface_timeout_seconds']).stdout.strip()
     if not addr:raise RuntimeError('物理网络没有 IPv4 地址')
     return {'interface':interface,'address':addr,'router':router[1] if router else ''}
 
@@ -118,21 +119,23 @@ def stop_owned(process):
     # Only the exact Popen child created by this module. Never pkill/killall.
     if process.poll() is None:
         process.terminate()
-        try:process.wait(timeout=2)
-        except subprocess.TimeoutExpired:process.kill();process.wait(timeout=2)
+        timeout=PARAMETERS['child_stop_seconds']
+        try:process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:process.kill();process.wait(timeout=timeout)
 
 
 def trace(port, cancelled, expected):
     command=['/usr/bin/curl','--silent','--show-error','--proxy',f'http://127.0.0.1:{port}',
-             '--noproxy','','--connect-timeout','8','--max-time','12','--max-filesize','16384',
+             '--noproxy','','--connect-timeout',str(PARAMETERS['chain_connect_seconds']),
+             '--max-time',str(PARAMETERS['chain_timeout_seconds']),'--max-filesize','16384',
              '--write-out','\n__TIMING__%{http_code} %{time_total} %{time_starttransfer}',TARGET]
     p=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    deadline=time.monotonic()+14
+    deadline=time.monotonic()+PARAMETERS['chain_deadline_seconds']
     try:
         while p.poll() is None:
             if cancelled() or time.monotonic()>deadline:
                 stop_owned(p);raise RuntimeError('测试取消或请求超时')
-            time.sleep(.1)
+            time.sleep(PARAMETERS['chain_poll_seconds'])
         stdout,stderr=p.communicate()
         if p.returncode:raise RuntimeError('请求失败 / 超时（curl '+str(p.returncode)+'）')
         text=stdout.decode(errors='replace');body,stats=text.rsplit('\n__TIMING__',1)
@@ -145,16 +148,17 @@ def trace(port, cancelled, expected):
 
 def entrance_delay(port,cancelled):
     """The isolated core routes this exact host through TEST_ENTRY only."""
+    timeout=str(PARAMETERS['entrance_timeout_seconds'])
     command=['/usr/bin/curl','--silent','--show-error','--proxy',f'http://127.0.0.1:{port}',
-             '--noproxy','','--connect-timeout','3','--max-time','3','--max-filesize','1024',
+             '--noproxy','','--connect-timeout',timeout,'--max-time',timeout,'--max-filesize','1024',
              '--output','/dev/null','--write-out','%{http_code} %{time_total}',
              'https://www.gstatic.com/generate_204']
     process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     try:
-        deadline=time.monotonic()+4
+        deadline=time.monotonic()+PARAMETERS['entrance_deadline_seconds']
         while process.poll() is None:
             if cancelled() or time.monotonic()>deadline:raise RuntimeError('入口测试取消或超时')
-            time.sleep(.05)
+            time.sleep(PARAMETERS['entrance_poll_seconds'])
         stdout,_=process.communicate()
         if process.returncode:raise RuntimeError('入口请求失败')
         code,total=stdout.decode().split()
@@ -173,26 +177,27 @@ def test_node(node, exit_node, network, cancelled, expected):
         p=subprocess.Popen([clash.CORE,'-d',str(folder),'-f',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
             ready=False
-            for _ in range(40):
+            for _ in range(PARAMETERS['startup_attempts']):
                 if cancelled():raise RuntimeError('测试取消')
                 if p.poll() is not None:raise RuntimeError('隔离内核未能启动')
                 try:
-                    with socket.create_connection(('127.0.0.1',port),timeout=.1):ready=True
+                    with socket.create_connection(('127.0.0.1',port),timeout=PARAMETERS['startup_poll_seconds']):ready=True
                     break
-                except OSError:time.sleep(.1)
+                except OSError:time.sleep(PARAMETERS['startup_poll_seconds'])
             if not ready:raise RuntimeError('隔离端口未就绪')
-            owner=subprocess.run(['/usr/sbin/lsof','-nP','-a','-p',str(p.pid),f'-iTCP:{port}','-sTCP:LISTEN'],capture_output=True,text=True,timeout=3)
+            owner=subprocess.run(['/usr/sbin/lsof','-nP','-a','-p',str(p.pid),f'-iTCP:{port}','-sTCP:LISTEN'],capture_output=True,text=True,timeout=PARAMETERS['listener_timeout_seconds'])
             if owner.returncode!=0:raise RuntimeError('无法确认临时端口归属，已停止测试')
             entrance={'delay':None,'time':dt.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'隔离入口 HTTPS 204 / 3 秒超时','error':''}
             try:entrance['delay']=entrance_delay(port,cancelled)
             except Exception as error:entrance['error']=str(error)
             samples=[];errors=[]
-            for index in range(3):
+            for _ in range(PARAMETERS['chain_probes']):
                 if cancelled():break
                 try:samples.append(trace(port,cancelled,expected))
-                except RuntimeError as error:errors.append(str(error))
-                if errors and not samples:break  # avoid repeatedly probing a failing path
-                time.sleep(.25)
+                except RuntimeError as error:
+                    errors.append(str(error))
+                    if policy.stop_after_probe_failure(samples):break
+                time.sleep(PARAMETERS['probe_pause_seconds'])
             return samples,errors,entrance
         finally:stop_owned(p)
 
@@ -200,28 +205,6 @@ def test_node(node, exit_node, network, cancelled, expected):
 def routing_fingerprint(nodes, exit_node, expected, dns_policy, current, target):
     data=[nodes.get(current),nodes[target],exit_node,dns_policy,expected]
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
-
-
-def auto_candidate(record, metric):
-    if metric not in ('entrance','chain') or record['reason'] or not record['selection_unchanged']:
-        return None
-    current=record['before']['entry']
-    results=record['results']
-    key='delay' if metric=='entrance' else 'chain_delay'
-    def delay(row, field):
-        value=row.get(field)
-        return value if type(value) is int and value>0 else None
-    if current not in results:
-        return None
-    choices=[(delay(row,key),name) for name,row in results.items()
-             if name!=current and delay(row,'chain_delay') and delay(row,key)]
-    if not choices:
-        return None
-    fastest,name=min(choices)
-    baseline=delay(results[current],key)
-    if not delay(results[current],'chain_delay') or (baseline and baseline-fastest>=max(20,baseline*.10)):
-        return name
-    return None
 
 
 def run(concurrency=runtime.CONCURRENCY):
@@ -236,7 +219,7 @@ def run(concurrency=runtime.CONCURRENCY):
         cancelled=lambda:cancel.exists() or os.getppid()!=parent
         before,names=active_state();network=physical_network();nodes,exit_node,expected=load_nodes();dns_policy=DNS_POLICY
         owners = t.relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), before.get('live', []))
-        if before['mode']!='global' or before['exit']!=t.EXIT or before['dialer']!=t.ENTRY:raise RuntimeError('当前链式配置与预期不符，未开始测试')
+        if not policy.chain_allowed(before,t.EXIT,t.ENTRY):raise RuntimeError('当前链式配置与预期不符，未开始测试')
         results={};run_id=secrets.token_hex(8);progress=t.BASE/'chain-progress.json'
         running=[]
         def publish(index,name,message):
@@ -256,9 +239,9 @@ def run(concurrency=runtime.CONCURRENCY):
                 row.update(entrance)
                 row['chain_samples']=samples;row['chain_error']='；'.join(errors)
                 if samples:row['chain_ip']=samples[0]['ip']
-                if len(samples)>=2:
-                    row['chain_delay']=round(statistics.median(x['ms'] for x in samples))
-                    row['chain_status']=f'全链 {len(samples)}/3'
+                row['chain_delay']=policy.sample_delay(samples)
+                if row['chain_delay'] is not None:
+                    row['chain_status']=f"全链 {len(samples)}/{PARAMETERS['chain_probes']}"
                 else:row['chain_status']='不足 2 次' if samples else '全链未通'
             except Exception as e:row['chain_status']='全链未通';row['chain_error']=str(e)
             return row
@@ -267,9 +250,9 @@ def run(concurrency=runtime.CONCURRENCY):
         with ThreadPoolExecutor(max_workers=concurrency,thread_name_prefix='chain-test') as pool:
             try:
                 while True:
-                    if external_cancelled():reason='已停止，保留已完成结果';break
-                    if physical_network()!=network or active_state()[0]!=before:
-                        reason='检测到网络或当前链路变化，已停止；没有恢复或改动用户配置';break
+                    interrupted=external_cancelled()
+                    stable=not interrupted and physical_network()==network and active_state()[0]==before
+                    if reason:=policy.stop_reason(interrupted,stable):break
                     # Only accept results after confirming the original network and chain.
                     for future in list(pending):
                         if future.done():results[pending.pop(future)]=future.result()
@@ -280,7 +263,7 @@ def run(concurrency=runtime.CONCURRENCY):
                     running=list(pending.values())
                     publish(len(results),'、'.join(pending.values()),'正在隔离测速')
                     if not pending:break
-                    wait(pending,timeout=.3,return_when=FIRST_COMPLETED)
+                    wait(pending,timeout=PARAMETERS['chain_wait_seconds'],return_when=FIRST_COMPLETED)
             finally:
                 stop.set()
                 for future in pending:future.cancel()

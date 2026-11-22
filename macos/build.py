@@ -15,7 +15,7 @@ APP = OUT / '链路盒子.app'
 RESOURCES = [ROOT / 'assets/ProxyToolbox.icns', ROOT / 'windows/coffee-extract.js']
 CHECK_PAGE = ROOT / 'macos/backend/check.html'
 IP_COMPARISON = ROOT / 'windows/ip-address.js'
-BACKEND_MODULES = ('clash', 'subscription_update', 'subscription_picker')
+BACKEND_MODULES = ('benchmark_policy', 'clash', 'subscription_update', 'subscription_picker')
 REQUIRED_FILES = (
     'MacOS/ProxyToolbox',
     'Resources/backend/linkbox-backend',

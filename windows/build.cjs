@@ -3,10 +3,10 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
 const {downloadArtifact}=require('@electron/get');
 const electronVersion=require('electron/package.json').version;
 const checksums=require('electron/checksums.json');
-const appFiles=['main.cjs','backend.cjs','clash.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js','preferences.cjs','ip-address.js'];
+const appFiles=['main.cjs','backend.cjs','benchmark-policy.cjs','clash.cjs','preload.cjs','renderer.js','index.html','style.css','icon.png','coffee-extract.js','subscriptions.cjs','reconcile.cjs','icons.js','preferences.cjs','ip-address.js'];
 const requiredZipEntries=['LinkBox.exe','resources/app.asar'];
 const requiredAppEntries=[
- 'coffee-extract.js','package.json','main.cjs','preload.cjs','backend.cjs','clash.cjs','preferences.cjs',
+ 'coffee-extract.js','package.json','main.cjs','preload.cjs','backend.cjs','benchmark-policy.cjs','clash.cjs','preferences.cjs',
  'subscriptions.cjs','reconcile.cjs','index.html','renderer.js','ip-address.js','icons.js','style.css','icon.png',
  'node_modules/yaml/package.json','node_modules/yaml/dist/index.js',
  'node_modules/https-proxy-agent/package.json','node_modules/https-proxy-agent/dist/index.js',

@@ -24,14 +24,17 @@ test('Windows chain benchmark compares parsed exit addresses',async t=>{
  const {EventEmitter}=require('node:events'),net=require('node:net'),vm=require('node:vm');
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-ip-probe-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
- const child=new EventEmitter();
- child.pid=123;
- child.exitCode=null;
- child.kill=()=>queueMicrotask(()=>{child.exitCode=0;child.emit('exit');});
+ const pid=123;
  const context=vm.createContext({module:{exports:{}},structuredClone,performance,AbortController,setInterval,clearInterval,
   setTimeout:fn=>queueMicrotask(fn),
   require(name){
-   if(name==='node:child_process')return {...require(name),spawn:()=>{child.exitCode=null;return child;}};
+   if(name==='node:child_process')return {...require(name),spawn:()=>{
+    const child=new EventEmitter();
+    child.pid=pid;
+    child.exitCode=null;
+    child.kill=()=>queueMicrotask(()=>{child.exitCode=0;child.emit('exit');});
+    return child;
+   }};
    if(name==='node:net')return {...net,connect(){
     const socket=new EventEmitter();
     socket.setTimeout=()=>{};
@@ -45,13 +48,26 @@ test('Windows chain benchmark compares parsed exit addresses',async t=>{
  vm.runInContext(await fs.readFile(require.resolve('../backend.cjs'),'utf8'),context);
  const b=fakeBackend(folder, context.module.exports.Backend);
  b.freePort=async()=>12345;
- b.powershell=async()=>String(child.pid);
+ b.powershell=async()=>String(pid);
  for(const {name,expected,probe,matches} of ipComparison){
   b.textRequest=async()=>`ip=${probe}`;
   const result=await b.testNode({}, {}, {name:'fixture'}, 'mock.exe', 'chain', new AbortController().signal,{expectedIP:expected});
   assert.equal(result.status,matches?'done':'failed',name);
   if(matches)assert.equal(result.samples[0].ip,probe,name);
  }
+ await t.test('a first wrong exit stops chain requests',async()=>{
+  const replies=['203.0.113.11',EXPECTED,EXPECTED];
+  let requests=0;
+  b.textRequest=async (_url,_port,{accept})=>{
+   if(accept?.includes(204))return '';
+   return `ip=${replies[requests++]}`;
+  };
+  const result=await b.testNode({}, {}, {name:'fixture'}, 'mock.exe', 'chain',
+   new AbortController().signal,{expectedIP:EXPECTED});
+  assert.equal(requests,1);
+  assert.equal(result.status,'failed');
+  assert.match(result.error,/出口不符：203\.0\.113\.11/);
+ });
  await t.test('settings changed during probe setup apply to the next benchmark',async()=>{
   const nextIP='203.0.113.11';
   await fs.writeFile(path.join(folder,'node-policy.json'),JSON.stringify({selected_nodes:{fixture:['relay']}}));
@@ -261,6 +277,60 @@ test('automatic relay checks settings commits and fresh subscription definitions
  const saving=b.saveSettings({autoRelay:false});await saveStarted;
  const running=b.benchmark('chain',()=>true);await testsStarted;releaseSave();await saving;releaseTests();
  assert.equal((await running).switchedTo,undefined);assert.equal(b.settings.autoRelay,false);assert.equal(writes,0);stub.mock.restore();
+});
+
+test('automatic benchmark keeps worker and pre-switch reads in order',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-order-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const b=await fakeBackend(folder).init(),names=['current','fast'],calls=[];
+ let entry='current';
+ b.settings={autoRelay:true,concurrency:1};
+ b.clash.corePath=async()=>'/mock';
+ b.state=async()=>{
+  calls.push('state');
+  return {mode:'global',tun:true,entry,exit:EXIT,dialer:ENTRY,live:names,switchable:names,
+   nodes:names.map(name=>({name,providerId:'fixture'})),entryOwners:{current:'fixture',fast:'fixture'}};
+ };
+ b.network=async()=>{calls.push('network');return {name:'fixture'};};
+ b.loadNodes=async()=>{calls.push('routing');return {nodes:new Map(names.map(name=>[name,{name}])),exit:{}};};
+ b.testNode=async node=>{calls.push(node.name);return {delay:node.name==='current'?200:80};};
+ b.controller=async(method,route,body)=>{
+  assert.equal(method,'PUT');assert.equal(route,'/proxies/'+encodeURIComponent(ENTRY));
+  calls.push('switch');entry=body.name;
+ };
+ const result=await b.benchmark('chain',()=>{calls.push('authorize');return true;});
+ assert.equal(result.switchedTo,'fast');
+ assert.deepEqual(calls,['state','network','routing','current','state','network','fast','state','network',
+  'authorize','network','state','authorize','routing','authorize','switch','state']);
+});
+
+test('automatic benchmark does not switch after Clash changes to rule mode',async t=>{
+ const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-mode-'));
+ t.after(()=>fs.rm(folder,{recursive:true,force:true}));
+ const b=await fakeBackend(folder).init();
+ const names=['current','fast'];
+ const nodes=names.map(name=>({name,providerId:'fixture'}));
+ let mode='global';
+ b.settings={autoRelay:true,concurrency:2};
+ b.state=async()=>({mode,tun:true,entry:'current',exit:EXIT,dialer:ENTRY,live:names,
+  switchable:names,nodes,entryOwners:{current:'fixture',fast:'fixture'}});
+ b.network=async()=>({name:'fixture'});
+ b.loadNodes=async()=>({nodes:new Map(nodes.map(node=>[node.name,node])),exit:{}});
+ b.clash.corePath=async()=>'/mock';
+ b.testNode=async node=>({delay:node.name==='current'?200:80});
+ b.controller=async(method,route)=>assert.fail(`Unexpected controller request: ${method} ${route}`);
+
+ const result=await b.benchmark('chain',()=>{
+  assert.deepEqual(b.progress.active,[]);
+  assert.equal(b.progress.completed,names.length);
+  mode='rule';
+  return true;
+ });
+ assert.equal(mode,'rule');
+ assert.equal(result.reason,'');
+ assert.equal(result.latestResults.current.chainDelay,200);
+ assert.equal(result.latestResults.fast.chainDelay,80);
+ assert.equal(result.switchedTo,undefined);
 });
 
 test('benchmark waits for a deferred worker after another post-probe read rejects', async t => {

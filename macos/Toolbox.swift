@@ -967,6 +967,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if automatic && settings.autoRelay { args.append(settings.metric) }
         invoke(.chain,args,message:"准备检测 · \(nodeRows.count) 个节点") { result in
             self.readTestProgress(kind,finished:true);self.showFastestNodes()
+            // Check current UI consent before showing the switch status or starting a backend process.
             guard automatic,self.autoTestsEnabled,self.benchmarkSettings?.autoRelay == true,self.autoRevision==revision,
                   !self.autoSettingsOpen,self.window.attachedSheet == nil,
                   let recommendation=result["recommendation"] as? [String:Any],

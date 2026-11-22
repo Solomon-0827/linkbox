@@ -7,6 +7,7 @@ import urllib.request
 import datetime
 import fcntl
 import os
+import benchmark_policy as policy
 import clash
 import toolbox as t
 import runtime
@@ -69,7 +70,7 @@ def latency():
             row={'owner':owners.get(name),'time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'入口 HTTPS 204，单次 / 3 秒超时','error':''}
             try:
                 d=clash.entry_delay(name, provider)
-                if not isinstance(d,(int,float)) or d<=0:raise RuntimeError('未返回有效延迟')
+                if not policy.entrance_delay_accepted(d):raise RuntimeError('未返回有效延迟')
                 row.update(delay=d,status='实测可达')
             except Exception as e:row.update(delay=None,status='未响应',error=str(e))
             return name,row
@@ -91,7 +92,7 @@ def latency():
                     pending[pool.submit(measure,name)]=name
                 publish()
                 if not pending:break
-                wait(pending,timeout=.2,return_when=FIRST_COMPLETED)
+                wait(pending,timeout=policy.PARAMETERS['entrance_wait_seconds'],return_when=FIRST_COMPLETED)
         after=snapshot(False)
         unchanged=all(before.get(k)==after.get(k) for k in ['mode','entry','exit','dialer','tun','live'])
         save_benchmark('latency', {
@@ -104,30 +105,31 @@ def latency():
 @t.switch_lock()
 def change(target,previous,guard=None):
     s=snapshot()
-    if s['mode']!='global' or s['exit']!=t.EXIT or s['dialer']!=t.ENTRY:
+    if not policy.chain_allowed(s,t.EXIT,t.ENTRY):
         raise RuntimeError('当前全局链路与预期不符，已取消。请先在 Clash 恢复全局 → 美国静态家宽。')
     owners = t.switch_owners(s['live'])
-    if s['entry']!=previous or target not in owners:
+    if not policy.target_available(s['entry'],previous,target,owners):
         raise RuntimeError('节点状态已变化，请刷新后重新选择。')
     owner = owners[target]
     if guard is not None:
         import chain_test
-        if chain_test.physical_network()!=guard['network'] or chain_test.active_state()[0]!=guard['before']:
+        if not policy.switch_allowed(chain_test.physical_network()==guard['network'] and chain_test.active_state()[0]==guard['before']):
             raise RuntimeError('当前网络或节点已变化，未自动切换。')
         nodes,exit_node,expected=chain_test.load_nodes()
-        if (target not in nodes or chain_test.routing_fingerprint(nodes,exit_node,expected,chain_test.DNS_POLICY,previous,target)!=guard.get('routing_fingerprint') or
-                (t.BASE/'chain-cancel').exists()):
+        same_routing = target in nodes and chain_test.routing_fingerprint(
+            nodes,exit_node,expected,chain_test.DNS_POLICY,previous,target)==guard.get('routing_fingerprint')
+        if not policy.switch_allowed(same_routing,cancelled=same_routing and (t.BASE/'chain-cancel').exists()):
             raise RuntimeError('节点配置已变化或测速已停止，未自动切换。')
         fresh_owners = t.switch_owners(s['live'])
-        if target not in fresh_owners or fresh_owners[target] != owner:
+        if not policy.target_owner_matches(fresh_owners,target,owner):
             raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
     clash.switch_entry(target)
     after=snapshot()
-    if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
+    if after['entry']!=target or not policy.chain_allowed(after,t.EXIT,t.ENTRY):
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')
     after_owners = t.switch_owners(after['live'])
-    if target not in after_owners or after_owners[target] != owner:
+    if not policy.target_owner_matches(after_owners,target,owner):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:t.persist_selection(target)
@@ -190,7 +192,7 @@ def chain(concurrency=runtime.CONCURRENCY, metric=None):
     import chain_test
     message, record, tested = chain_test.run(int(concurrency))
     result = {'message': message, 'state': snapshot()}
-    if metric is not None and (target := chain_test.auto_candidate(record, metric)):
+    if metric is not None and (target := policy.recommendation(record, metric)):
         result['recommendation'] = {
             'target': target, 'before': record['before'], 'network': record['network'],
             'routing_fingerprint': chain_test.routing_fingerprint(*tested, record['before']['entry'], target),

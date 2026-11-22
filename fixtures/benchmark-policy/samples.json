@@ -1,0 +1,7 @@
+[
+  {"name":"three successful probes","probes":[110,90,100],"expected":100},
+  {"name":"two successful probes","probes":[90,null,110],"expected":100},
+  {"name":"one successful chain probe","probes":[90,null,null],"expected":null},
+  {"name":"no successful probes","probes":[null,null,null],"expected":null},
+  {"name":"one successful probe with a one-sample minimum","minimumSuccesses":1,"probes":[90],"expected":90}
+]
