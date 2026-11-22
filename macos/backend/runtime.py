@@ -1,14 +1,15 @@
 """Local settings only. No subscriptions, credentials or user IPs ship with the app."""
+from ipaddress import ip_address
 import json
 import os
-import ipaddress
 from pathlib import Path
 import yaml
+import settings
 
 BASE = Path(os.environ.get('LINKBOX_DATA_DIR', Path.home()/'Library/Application Support/ProxyToolbox'))
 BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
 CONFIG_DIR = Path(os.environ.get('LINKBOX_CONFIG_DIR', Path.home()/'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev'))
-CONCURRENCY = 5
+CONCURRENCY = settings.benchmark_value('concurrency', None)
 
 def read_json(name):
     try:
@@ -23,8 +24,16 @@ def expected_ip(config=None):
             if config is None:config=yaml.safe_load((CONFIG_DIR/'clash-verge.yaml').read_text())
             value=next(n.get('server','') for n in config.get('proxies',[]) if n.get('name')=='美国静态家宽')
         except (OSError,ValueError,StopIteration,AttributeError):return ''
-    try:return str(ipaddress.ip_address(value))
+    try:return str(ip_address(value))
     except (ValueError, TypeError):return ''
+
+def same_ip(left, right):
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        return ip_address(left) == ip_address(right)
+    except ValueError:
+        return False
 
 def ssl_context():
     import ssl,certifi

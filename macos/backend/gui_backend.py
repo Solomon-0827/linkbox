@@ -10,6 +10,7 @@ import fcntl
 import os
 import toolbox as t
 import runtime
+from settings import SettingsError, benchmark_settings
 
 def node_rows(p, owners):
     inventory = t.node_inventory(p, owners)
@@ -156,55 +157,98 @@ def ip_info():
             'updated_at':datetime.datetime.now().astimezone().strftime('%H:%M:%S'),
             'source':'https://ipwho.is/'}
 
-def main():
-    action=sys.argv[1]
-    if action=='self-test': result={'concurrency':runtime.CONCURRENCY,'bundled_backend':True}
-    elif action=='status': result={'state':snapshot()}
-    elif action=='startup':
-        import subscription_picker
-        before = t.relay_state()
-        ready = before['mode'] == 'global' and before['exit'] == t.EXIT and before['dialer'] == t.ENTRY
-        result = {'startup_checked': ready}
-        if ready:
-            try:
-                result['initialized'] = subscription_picker.initialize(sys.argv[2])
-                if result['initialized'] and '--refresh' in sys.argv[3:]:
-                    result['message'] = '已刷新 Clash 状态。'
-            except RuntimeError as error:
-                result.update(startup_checked=False, message=str(error))
-        result['state'] = snapshot()
-    elif action=='subscription-catalog':
-        import subscription_picker
-        result={'catalog':subscription_picker.catalog()}
-    elif action=='save-node-selection':
-        import subscription_picker
-        result=subscription_picker.apply(json.load(sys.stdin), sys.argv[2])
-        result['state']=snapshot()
-    elif action=='update-subscriptions':
-        import subscription_picker
-        result=subscription_picker.synchronize(sys.argv[2])
-        result['state']=snapshot()
-    elif action=='remove-list-nodes':result=remove_list_nodes(json.load(sys.stdin), sys.argv[2])
-    elif action=='latency':result=latency()
-    elif action=='chain':
-        import chain_test
-        message,record,tested=chain_test.run(int(sys.argv[2]) if len(sys.argv)>2 else runtime.CONCURRENCY)
-        result={'message':message,'state':snapshot()}
-        if len(sys.argv)>3 and (target:=chain_test.auto_candidate(record,sys.argv[3])):
-            result['recommendation']={'target':target,'before':record['before'],'network':record['network'],
-                                      'routing_fingerprint':chain_test.routing_fingerprint(*tested,record['before']['entry'],target)}
-    elif action=='ip-info':result={'ip_info':ip_info()}
-    elif action=='switch':result=change(sys.argv[2],sys.argv[3])
-    elif action=='auto-switch':result=change(sys.argv[2],sys.argv[3],json.load(sys.stdin))
-    elif action=='check':
-        import network_check,io,contextlib
-        output=io.StringIO()
-        with contextlib.redirect_stdout(output):network_check.main()
-        result={'message':'检查完成；可在检测页面下载报告。','details':output.getvalue()}
-    else:raise RuntimeError('未知操作')
-    print(json.dumps({'ok':True,**result},ensure_ascii=False))
+def startup(metric, *flags):
+    import subscription_picker
+    before = t.relay_state()
+    ready = before['mode'] == 'global' and before['exit'] == t.EXIT and before['dialer'] == t.ENTRY
+    result = {'startup_checked': ready}
+    if ready:
+        try:
+            result['initialized'] = subscription_picker.initialize(metric)
+            if result['initialized'] and '--refresh' in flags:
+                result['message'] = '已刷新 Clash 状态。'
+        except RuntimeError as error:
+            result.update(startup_checked=False, message=str(error))
+    result['state'] = snapshot()
+    return result
 
-if __name__=='__main__':
-    try:main()
-    except Exception as e:
-        print(json.dumps({'ok':False,'error':str(e)},ensure_ascii=False));sys.exit(1)
+
+def catalog(*flags):
+    import subscription_picker
+    changes = json.load(sys.stdin) if '--draft' in flags else []
+    return {'catalog': subscription_picker.merge_selection_draft(subscription_picker.catalog(), changes)}
+
+
+def save_selection(metric):
+    import subscription_picker
+    return {**subscription_picker.apply(json.load(sys.stdin), metric), 'state': snapshot()}
+
+
+def update_subscriptions(metric):
+    import subscription_picker
+    return {**subscription_picker.synchronize(metric), 'state': snapshot()}
+
+
+def chain(concurrency=runtime.CONCURRENCY, metric=None):
+    import chain_test
+    message, record, tested = chain_test.run(int(concurrency))
+    result = {'message': message, 'state': snapshot()}
+    if metric is not None and (target := chain_test.auto_candidate(record, metric)):
+        result['recommendation'] = {
+            'target': target, 'before': record['before'], 'network': record['network'],
+            'routing_fingerprint': chain_test.routing_fingerprint(*tested, record['before']['entry'], target),
+        }
+    return result
+
+
+def check():
+    import network_check
+    import io
+    import contextlib
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        network_check.main()
+    return {'message': '检查完成；可在检测页面下载报告。', 'details': output.getvalue()}
+
+
+def read_benchmark_settings(*flags):
+    return {'settings': benchmark_settings(json.load(sys.stdin), strict='--save' in flags)}
+
+
+COMMANDS = {
+    'startup': startup,
+    'subscription-catalog': catalog,
+    'save-node-selection': save_selection,
+    'update-subscriptions': update_subscriptions,
+    'remove-list-nodes': lambda metric: remove_list_nodes(json.load(sys.stdin), metric),
+    'chain': chain,
+    'ip-info': lambda: {'ip_info': ip_info()},
+    'switch': lambda target, previous: change(target, previous),
+    'auto-switch': lambda target, previous: change(target, previous, json.load(sys.stdin)),
+    'check': check,
+    'benchmark-settings': read_benchmark_settings,
+    # These commands remain available for packaging and direct backend use.
+    'self-test': lambda: {'concurrency': runtime.CONCURRENCY, 'bundled_backend': True},
+    'status': lambda: {'state': snapshot()},
+    'latency': latency,
+}
+
+
+def main():
+    action, *args = sys.argv[1:]
+    command = COMMANDS.get(action)
+    if command is None:
+        raise RuntimeError('未知操作')
+    result = command(*args)
+    print(json.dumps({'ok': True, **result}, ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except SettingsError as error:
+        print(json.dumps({'ok': False, 'error': str(error), 'field': error.field}, ensure_ascii=False))
+        sys.exit(1)
+    except Exception as error:
+        print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
+        sys.exit(1)

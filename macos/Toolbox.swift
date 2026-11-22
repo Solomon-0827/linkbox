@@ -1,6 +1,22 @@
 import AppKit
 import WebKit
 
+private func sameIP(_ left:String,_ right:String) -> Bool {
+    func parsed(_ value:String) -> Data? {
+        let parts=value.components(separatedBy:"%")
+        guard !value.contains("\0"),parts.count <= 2 else { return nil }
+        var ipv4=in_addr(), ipv6=in6_addr()
+        if parts.count == 1,inet_pton(AF_INET,value,&ipv4) == 1 {
+            return withUnsafeBytes(of:ipv4) { Data($0) }
+        }
+        let scope=parts.count == 2 ? parts[1] : ""
+        guard (parts.count == 1 || !scope.isEmpty),inet_pton(AF_INET6,parts[0],&ipv6) == 1 else { return nil }
+        return withUnsafeBytes(of:ipv6) { Data($0) } + Data(scope.utf8)
+    }
+    guard let address=parsed(left) else { return false }
+    return address == parsed(right)
+}
+
 private let ink = NSColor(calibratedRed: 0.122, green: 0.161, blue: 0.216, alpha: 1)
 private let muted = NSColor(calibratedRed: 0.349, green: 0.396, blue: 0.475, alpha: 1)
 private let accent = NSColor(calibratedRed: 0.145, green: 0.388, blue: 0.922, alpha: 1)
@@ -58,6 +74,64 @@ final class SoftButton: NSButton {
     }
 }
 
+enum BackendCommand: String {
+    case startup = "startup"
+    case catalog = "subscription-catalog"
+    case saveSelection = "save-node-selection"
+    case updateSubscriptions = "update-subscriptions"
+    case removeNodes = "remove-list-nodes"
+    case chain = "chain"
+    case ipInfo = "ip-info"
+    case switchNode = "switch"
+    case autoSwitch = "auto-switch"
+    case check = "check"
+    case benchmarkSettings = "benchmark-settings"
+}
+
+enum BenchmarkPreferences {
+    static let keys = [
+        "hourly": "hourlyTestsEnabled", "interval": "benchmarkInterval",
+        "concurrency": "benchmarkConcurrency", "autoRelay": "benchmarkAutoRelay",
+        "metric": "benchmarkMetric"
+    ]
+
+    static func read() -> [String:Any] {
+        let defaults = UserDefaults.standard
+        var values = [String:Any]()
+        for (field,key) in keys where defaults.object(forKey:key) != nil {
+            switch field {
+            case "hourly", "autoRelay": values[field] = defaults.bool(forKey:key)
+            case "interval", "concurrency": values[field] = defaults.integer(forKey:key)
+            default: values[field] = defaults.string(forKey:key)
+            }
+        }
+        return values
+    }
+
+    static func write(_ values:[String:Any]) {
+        for (field,value) in values {
+            if let key=keys[field] { UserDefaults.standard.set(value,forKey:key) }
+        }
+    }
+}
+
+struct BenchmarkSettings {
+    var hourly:Bool
+    let interval:Int
+    let concurrency:Int
+    let autoRelay:Bool
+    let metric:String
+
+    init?(_ result:[String:Any]) {
+        guard let values=result["settings"] as? [String:Any],
+              let hourly=values["hourly"] as? Bool,let interval=values["interval"] as? Int,
+              let concurrency=values["concurrency"] as? Int,let autoRelay=values["autoRelay"] as? Bool,
+              let metric=values["metric"] as? String else { return nil }
+        self.hourly=hourly;self.interval=interval;self.concurrency=concurrency
+        self.autoRelay=autoRelay;self.metric=metric
+    }
+}
+
 final class BenchmarkSettingsSheet: NSObject {
     let panel=NSPanel(contentRect:NSRect(x:0,y:0,width:490,height:382),styleMask:[.titled],backing:.buffered,defer:false)
     let interval:NSTextField
@@ -65,7 +139,8 @@ final class BenchmarkSettingsSheet: NSObject {
     let replace=NSSwitch()
     let metric=NSPopUpButton(frame:.zero,pullsDown:false)
     let validation=NSTextField(labelWithString:"")
-    var onSave:((Int,Int,Bool,String)->Void)?
+    var saving=false
+    var onSave:(([String:Any], @escaping ([String:Any])->Void)->Void)?
 
     init(minutes:Int,parallel:Int,automatic:Bool,ranking:String) {
         interval=NSTextField(string:String(minutes))
@@ -130,16 +205,29 @@ final class BenchmarkSettingsSheet: NSObject {
         panel.initialFirstResponder=interval
     }
 
-    @objc func cancel() { panel.sheetParent?.endSheet(panel) }
+    @objc func cancel() { if !saving { panel.sheetParent?.endSheet(panel) } }
     @objc func save() {
-        func number(_ field:NSTextField,_ range:ClosedRange<Int>,_ message:String) -> Int? {
-            if let value=Int(field.stringValue.trimmingCharacters(in:.whitespaces)),range.contains(value) { return value }
-            validation.stringValue=message;panel.makeFirstResponder(field);field.selectText(nil);return nil
+        guard !saving, let onSave else { return }
+        func number(_ field:NSTextField) -> Any {
+            let value=field.stringValue.trimmingCharacters(in:.whitespaces)
+            if let integer=Int(value) { return integer }
+            return NSNull()
         }
-        guard let minutes=number(interval,1...1440,"测速间隔须为 1–1440 分钟。"),
-              let parallel=number(concurrency,1...10,"并发测速量须为 1–10 条。") else { return }
-        onSave?(minutes,parallel,replace.state == .on,metric.indexOfSelectedItem == 1 ? "entrance" : "chain")
-        panel.sheetParent?.endSheet(panel)
+        saving=true
+        onSave(["interval":number(interval),"concurrency":number(concurrency),
+                "autoRelay":replace.state == .on,"metric":metric.indexOfSelectedItem == 1 ? "entrance" : "chain"]) {
+            [weak self] result in
+            guard let self else { return }
+            self.saving=false
+            if result["ok"] as? Bool == true {
+                self.panel.sheetParent?.endSheet(self.panel)
+            } else {
+                self.validation.stringValue=result["error"] as? String ?? "无法读取动态测速设置。"
+                if let name=result["field"] as? String,let field=["interval":self.interval,"concurrency":self.concurrency][name] {
+                    self.panel.makeFirstResponder(field);field.selectText(nil)
+                }
+            }
+        }
     }
 }
 
@@ -158,15 +246,16 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     let scroll=NSScrollView()
     let document=Canvas(frame:.zero)
     var checks:[NSButton]=[]
-    var groups:[String:[NSButton]]=[:]
-    var sourceIDs:[String]=[]
-    var sourceNames:[String:String]=[:]
-    var nodeNames:[Int:String]=[:]
-    var warnings:[String:String]=[:]
-    var activeSource:String=""
+    // NSString distinguishes exact Clash names and IDs that Swift String considers equivalent.
+    var groups:[NSString:[NSButton]]=[:]
+    var sourceIDs:[NSString]=[]
+    var sourceNames:[NSString:String]=[:]
+    var nodeNames:[Int:NSString]=[:]
+    var warnings:[NSString:String]=[:]
+    var activeSource:NSString=""
     private var fingerprint=""
     private var currentEntry=""
-    private var duplicates:[String:[NSButton]]=[:]
+    private var duplicates:[NSString:[NSButton]]=[:]
     private var initialChecks=Set<Int>()
     private var currentChecks=Set<Int>()
     private var updateButton:SoftButton!
@@ -213,42 +302,37 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         (saveButton as? SoftButton)?.primary=true
         loadCatalog(catalog)
     }
-    func loadCatalog(_ catalog:[String:Any]) {
-        let previousSource=activeSource
-        var changes=[String:[String:Bool]]()
-        for (id, buttons) in groups {
-            for button in buttons {
+    func draftChanges() -> [[Any]] {
+        sourceIDs.flatMap { id in
+            (groups[id] ?? []).compactMap { button -> [Any]? in
                 let checked=button.state == .on
-                if checked != initialChecks.contains(button.tag), let name=nodeNames[button.tag] {
-                    changes[id,default:[:]][name]=checked
-                }
+                guard checked != initialChecks.contains(button.tag), let name=nodeNames[button.tag] else { return nil }
+                return [id,name,checked]
             }
         }
+    }
+    func loadCatalog(_ catalog:[String:Any]) {
+        let previousSource=activeSource
         checks.removeAll();groups.removeAll();sourceIDs.removeAll();sourceNames.removeAll()
         nodeNames.removeAll();warnings.removeAll();initialChecks.removeAll();currentChecks.removeAll();duplicates.removeAll()
         fingerprint=catalog["fingerprint"] as? String ?? ""
         currentEntry=catalog["current"] as? String ?? ""
         catalogCurrent=true
         for source in catalog["sources"] as? [[String:Any]] ?? [] {
-            guard let id=source["id"] as? String else { continue }
-            sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? id;groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
+            guard let id=source["id"] as? NSString else { continue }
+            sourceIDs.append(id);sourceNames[id]=source["name"] as? String ?? (id as String);groups[id]=[];warnings[id]=source["warning"] as? String ?? ""
             for node in source["nodes"] as? [[String:Any]] ?? [] {
-                guard let name=node["name"] as? String else { continue }
+                guard let name=node["name"] as? NSString else { continue }
                 let current=node["current"] as? Bool ?? false
                 let b=NSButton(checkboxWithTitle:"",target:self,action:#selector(toggled(_:)));b.tag=checks.count
                 let selected=node["selected"] as? Bool ?? false
-                if selected { initialChecks.insert(b.tag) }
+                if node["initialSelected"] as? Bool == true { initialChecks.insert(b.tag) }
                 if current { currentChecks.insert(b.tag) }
-                b.state=(changes[id]?[name] == false || !selected) ? .off : .on
+                b.state=selected ? .on : .off
                 b.isEnabled = !updating
-                b.setAccessibilityLabel(name+(current ? "，当前入口" : ""))
+                b.setAccessibilityLabel((name as String)+(current ? "，当前入口" : ""))
                 checks.append(b);groups[id,default:[]].append(b);nodeNames[b.tag]=name
                 duplicates[name,default:[]].append(b)
-            }
-        }
-        for id in sourceIDs {
-            for button in groups[id] ?? [] where changes[id]?[nodeNames[button.tag] ?? ""] == true {
-                choose(button)
             }
         }
         activeSource=sourceIDs.contains(previousSource) ? previousSource : sourceIDs.first ?? ""
@@ -277,7 +361,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
         let id=sourceIDs[row],items=groups[id] ?? []
         let cell=Canvas(frame:NSRect(x:0,y:0,width:190,height:60))
-        let name=NSTextField(wrappingLabelWithString:sourceNames[id] ?? id);name.frame=NSRect(x:12,y:8,width:166,height:24);name.font = .systemFont(ofSize:13,weight:.medium);name.textColor=ink;cell.addSubview(name)
+        let name=NSTextField(wrappingLabelWithString:sourceNames[id] ?? (id as String));name.frame=NSRect(x:12,y:8,width:166,height:24);name.font = .systemFont(ofSize:13,weight:.medium);name.textColor=ink;cell.addSubview(name)
         let count=NSTextField(labelWithString:"已选 \(items.filter{$0.state == .on}.count) / \(items.count)");count.frame=NSRect(x:12,y:35,width:166,height:18);count.font = .systemFont(ofSize:11);count.textColor=muted;cell.addSubview(count)
         return cell
     }
@@ -294,7 +378,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
         for b in items {
             let current=currentChecks.contains(b.tag)
             let name=nodeNames[b.tag] ?? ""
-            let value=name+(current ? "  · 当前入口" : "")+((duplicates[name]?.count ?? 0) > 1 ? "  · 另一订阅有同名节点" : "")
+            let value=(name as String)+(current ? "  · 当前入口" : "")+((duplicates[name]?.count ?? 0) > 1 ? "  · 另一订阅有同名节点" : "")
             let label=NSTextField(wrappingLabelWithString:value);label.font = .systemFont(ofSize:12);label.textColor=current ? accent : ink
             let measured=(value as NSString).boundingRect(with:NSSize(width:476,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:NSFont.systemFont(ofSize:12)])
             let height=max(CGFloat(40),ceil(measured.height)+20)
@@ -350,7 +434,7 @@ final class SubscriptionPicker: NSObject, NSTableViewDataSource, NSTableViewDele
     @objc func cancel() { if !updating { onCancel() } }
     @objc func save() {
         guard !updating,catalogCurrent else { return }
-        var selected=[String:[String]]()
+        var selected=[NSString:[NSString]]()
         for id in sourceIDs { selected[id]=(groups[id] ?? []).filter{$0.state == .on}.compactMap{nodeNames[$0.tag]} }
         onSave(["fingerprint":fingerprint,"current":currentEntry,"selected":selected])
     }
@@ -433,15 +517,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     let autoSwitch = NSSwitch()
     var autoSettingsOpen=false
     var autoRevision=UUID()
-    var testInterval:Int { benchmarkNumber("benchmarkInterval",default:60,range:1...1440) }
-    var testConcurrency:Int { benchmarkNumber("benchmarkConcurrency",default:5,range:1...10) }
-    var autoRelay:Bool { UserDefaults.standard.bool(forKey:"benchmarkAutoRelay") }
-    var autoMetric:String { UserDefaults.standard.string(forKey:"benchmarkMetric") == "entrance" ? "entrance" : "chain" }
-    func benchmarkNumber(_ key:String,default fallback:Int,range:ClosedRange<Int>)->Int {
-        let value=UserDefaults.standard.integer(forKey:key)
-        return range.contains(value) ? value : fallback
-    }
-    var autoTestsEnabled:Bool { UserDefaults.standard.object(forKey:"hourlyTestsEnabled") == nil || UserDefaults.standard.bool(forKey:"hourlyTestsEnabled") }
+    var benchmarkSettings:BenchmarkSettings?
+    var autoTestsEnabled:Bool { benchmarkSettings?.hourly == true }
     var coffee: CoffeeReader?
     var generation = UUID()
     let identityType = NSTextField(labelWithString:"属性待验证")
@@ -481,7 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var chainRunning=false
 
     var expectedIP = ""
-    var current = ""
+    var current:NSString = ""
     var busy = false
     var controls: [NSControl] = []
     var nodePicker:SubscriptionPicker?
@@ -493,7 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var deleteButton:NSButton!
     var refreshingOnline=Set<String>()
     var editingNodes=false
-    var selectedNodes=Set<String>()
+    var selectedNodes=Set<NSString>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named:.aqua)
@@ -592,7 +669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         toolbarText(NSTextField(labelWithString:"动态测速"),72,52,12,740)
         rule(179,729,1,22)
         toolbarText(lastTestLabel,198,410,11,740);refreshLastTestTime()
-        autoSwitch.setAccessibilityLabel("动态测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.state=autoTestsEnabled ? .on : .off;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
+        autoSwitch.setAccessibilityLabel("动态测速");autoSwitch.frame=NSRect(x:24,y:727,width:38,height:26);autoSwitch.controlSize = .small;autoSwitch.isEnabled=false;autoSwitch.target=self;autoSwitch.action=#selector(toggleAutoTests);canvas.addSubview(autoSwitch)
         func iconButton(_ label:String,_ symbol:String,_ action:Selector,_ x:CGFloat,_ y:CGFloat)->NSButton {
             let b=button("",action);b.frame=NSRect(x:x,y:y,width:28,height:28);b.setAccessibilityLabel(label);b.toolTip=label;(b as? SoftButton)?.plain=true;(b as? SoftButton)?.symbolName=symbol;canvas.addSubview(b);return b
         }
@@ -616,39 +693,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let quitItem=NSMenuItem(title:"退出链路盒子",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"");quitItem.target=NSApp;trayMenu.addItem(quitItem)
         tray.menu=trayMenu;statusItem=tray
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        invoke(["startup",autoMetric],message:"正在读取 Clash 状态…") { result in
-            self.refreshOnline()
-            if result["startup_checked"] as? Bool == true && result["initialized"] as? Bool != true { self.startAutomaticTest() }
+        loadBenchmarkSettings()
+    }
+    func loadBenchmarkSettings() {
+        let message="正在读取 Clash 状态…"
+        let input=try? JSONSerialization.data(withJSONObject:BenchmarkPreferences.read())
+        invoke(.benchmarkSettings,message:message,input:input) { result in
+            guard let settings=BenchmarkSettings(result) else {
+                self.feedback.stringValue="无法读取动态测速设置。";return
+            }
+            self.benchmarkSettings=settings
+            self.autoSwitch.state=settings.hourly ? .on : .off
+            self.autoSwitch.isEnabled=true
+            self.invoke(.startup,[settings.metric],message:message) { result in
+                self.refreshOnline()
+                if result["startup_checked"] as? Bool == true && result["initialized"] as? Bool != true { self.startAutomaticTest() }
+            }
+            self.configureAutoTests()
         }
-        configureAutoTests()
     }
     func configureAutoTests() {
         hourlyTestTimer?.invalidate();hourlyTestTimer=nil
-        guard autoTestsEnabled else { return }
-        let timer=Timer(timeInterval:TimeInterval(testInterval*60),repeats:true) { [weak self] _ in
+        guard let benchmarkSettings,benchmarkSettings.hourly else { return }
+        let timer=Timer(timeInterval:TimeInterval(benchmarkSettings.interval*60),repeats:true) { [weak self] _ in
             self?.startAutomaticTest()
         }
         hourlyTestTimer=timer;RunLoop.main.add(timer,forMode:.common)
     }
     func startAutomaticTest() {
         guard autoTestsEnabled,!nodeRows.isEmpty,!busy,nodePicker == nil,!editingNodes,!autoSettingsOpen,window.attachedSheet == nil else { return }
-        beginTest("chain",automatic:true)
+        beginTest(automatic:true)
     }
     @objc func toggleAutoTests() {
         autoRevision=UUID()
-        UserDefaults.standard.set(autoSwitch.state == .on,forKey:"hourlyTestsEnabled")
+        let enabled=autoSwitch.state == .on
+        BenchmarkPreferences.write(["hourly":enabled]);benchmarkSettings?.hourly=enabled
         configureAutoTests()
     }
     @objc func showAutoSettings() {
-        guard !autoSettingsOpen,window.attachedSheet == nil else { return }
+        guard let settings=benchmarkSettings,!autoSettingsOpen,window.attachedSheet == nil else { return }
         autoSettingsOpen=true
-        let sheet=BenchmarkSettingsSheet(minutes:testInterval,parallel:testConcurrency,automatic:autoRelay,ranking:autoMetric)
-        sheet.onSave={ [weak self] minutes, parallel, automatic, ranking in
-            guard let self else { return }
-            let defaults=UserDefaults.standard
-            defaults.set(minutes,forKey:"benchmarkInterval");defaults.set(parallel,forKey:"benchmarkConcurrency")
-            defaults.set(automatic,forKey:"benchmarkAutoRelay");defaults.set(ranking,forKey:"benchmarkMetric")
-            self.autoRevision=UUID();self.configureAutoTests()
+        let sheet=BenchmarkSettingsSheet(minutes:settings.interval,parallel:settings.concurrency,automatic:settings.autoRelay,ranking:settings.metric)
+        sheet.onSave={ [weak self] values, finish in
+            guard let self,let hourly=self.benchmarkSettings?.hourly,
+                  let input=try? JSONSerialization.data(withJSONObject:values.merging(["hourly":hourly]) { current,_ in current }) else { return }
+            self.runBackend(.benchmarkSettings,["--save"],input:input) { result in
+                if let validated=BenchmarkSettings(result),let hourly=self.benchmarkSettings?.hourly {
+                    self.benchmarkSettings=validated;self.benchmarkSettings?.hourly=hourly
+                    if let normalized=result["settings"] as? [String:Any] {
+                        BenchmarkPreferences.write(normalized.filter { $0.key != "hourly" })
+                    }
+                    self.autoRevision=UUID();self.configureAutoTests()
+                }
+                finish(result)
+            }
         }
         window.beginSheet(sheet.panel) { [weak self, sheet] _ in
             sheet.onSave=nil
@@ -675,11 +773,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func render(_ s: [String:Any]) {
         expectedIP = s["expected_ip"] as? String ?? ""
-        current = s["entry"] as? String ?? ""
-        entry.stringValue = current
+        current = s["entry"] as? NSString ?? ""
+        entry.stringValue = current as String
         exitLabel.stringValue = s["exit"] as? String ?? "未知"
         modeLabel.stringValue = "●  \((s["mode"] as? String) == "global" ? "全局代理" : (s["mode"] as? String ?? "未知"))  ·  TUN \((s["tun"] as? Bool ?? false) ? "开启" : "关闭")"
-        picker.removeAllItems(); picker.addItems(withTitles: s["nodes"] as? [String] ?? []); picker.selectItem(withTitle: current)
+        picker.removeAllItems()
+        // Adding titles through NSPopUpButton replaces items with equivalent titles.
+        for name in s["nodes"] as? [String] ?? [] {
+            picker.menu?.addItem(NSMenuItem(title:name,action:nil,keyEquivalent:""))
+        }
+        selectRelay(current)
         nodeRows=s["node_rows"] as? [[String:Any]] ?? (s["nodes"] as? [String] ?? []).map{["name":$0,"status":"未验证"]}
         let sortKey=nodeRows.contains{ $0["chain_delay"] as? Double != nil } ? "chain_delay" : "delay"
         nodeRows.sort { a,b in
@@ -690,6 +793,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         selectedNodes.removeAll();updateEditingControls()
         nodeTable.reloadData()
         nodeTable.deselectAll(nil)
+    }
+    private func selectRelay(_ name:NSString) {
+        picker.selectItem(at:picker.itemArray.firstIndex { ($0.title as NSString) == name } ?? -1)
     }
     func updateEditingControls() {
         deleteButton?.title="删除已选（\(selectedNodes.count)）"
@@ -705,13 +811,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nodeTable.reloadData()
     }
     @objc func selectNodeForRemoval(_ sender:NSButton) {
-        guard editingNodes,!busy,sender.tag<nodeRows.count,let name=nodeRows[sender.tag]["name"] as? String,name != current else { return }
+        guard editingNodes,!busy,sender.tag<nodeRows.count,let name=nodeRows[sender.tag]["name"] as? NSString,name != current else { return }
         if sender.state == .on { selectedNodes.insert(name) } else { selectedNodes.remove(name) }
         updateEditingControls()
     }
     @objc func removeSelectedNodes() {
-        guard !busy,editingNodes,!selectedNodes.isEmpty,let data=try? JSONSerialization.data(withJSONObject:["names":Array(selectedNodes),"entry":current]) else { return }
-        invoke(["remove-list-nodes",autoMetric],message:"正在更新节点列表…",input:data) { _ in self.selectedNodes.removeAll();self.updateEditingControls() }
+        guard let settings=benchmarkSettings,!busy,editingNodes,!selectedNodes.isEmpty,let data=try? JSONSerialization.data(withJSONObject:["names":Array(selectedNodes),"entry":current]) else { return }
+        invoke(.removeNodes,[settings.metric],message:"正在更新节点列表…",input:data) { _ in self.selectedNodes.removeAll();self.updateEditingControls() }
     }
     func showFastestNodes() {
         guard !nodeRows.isEmpty else { return }
@@ -720,58 +826,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     @objc func doubleClickNode() {
         let row=nodeTable.clickedRow
-        guard !busy,!editingNodes,row>=0,row<nodeRows.count,let name=nodeRows[row]["name"] as? String else { return }
-        picker.selectItem(withTitle:name)
+        guard !busy,!editingNodes,row>=0,row<nodeRows.count,let name=nodeRows[row]["name"] as? NSString else { return }
+        selectRelay(name)
         switchNode()
     }
-    func invoke(_ args: [String], message: String, input:Data? = nil,
-                failed: ((String)->Void)? = nil, complete: @escaping ([String:Any]) -> Void) {
-        guard !busy else { return }
-        setBusy(true,message)
-        let reportFailure: (String)->Void = { error in
-            self.finishRefresh("status")
-            self.current=""
-            self.setBusy(false,error)
-            if args.first == "switch" || args.first == "auto-switch" { self.refreshOnline() }
-            failed?(error)
-        }
-        let script = Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend").path
-        DispatchQueue.global(qos: .userInitiated).async {
-            let p = Process(); p.executableURL = URL(fileURLWithPath: script); p.arguments = args
-            let out = Pipe(); let err = Pipe(); p.standardOutput = out; p.standardError = err
+    func runBackend(_ command:BackendCommand,_ args:[String] = [],input:Data? = nil,
+                    reply:@escaping ([String:Any])->Void) {
+        let script = Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend")
+        DispatchQueue.global(qos:.userInitiated).async {
+            let p=Process();p.executableURL=script;p.arguments=[command.rawValue]+args
+            let out=Pipe();p.standardOutput=out;p.standardError=FileHandle.nullDevice
+            let stdin=Pipe();if input != nil { p.standardInput=stdin }
+            let result:[String:Any]
             do {
-                let stdin=Pipe();if input != nil { p.standardInput=stdin }
                 try p.run()
-                if let input=input { stdin.fileHandleForWriting.write(input);try? stdin.fileHandleForWriting.close() }
-                let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
-                let parsed = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
-                DispatchQueue.main.async {
-                    guard let result = parsed else { reportFailure("操作未完成：未收到有效结果，请确认工具文件完整。"); return }
-                    if result["ok"] as? Bool != true {
-                        reportFailure(result["error"] as? String ?? "操作失败");return
-                    }
-                    if let state = result["state"] as? [String:Any] { self.render(state) }
-                    self.setBusy(false,result["message"] as? String ?? "状态已更新。没有修改代理配置。")
-                    if args.first == "chain" || args.first == "latency" || args.first == "status" || args.first == "startup" { self.showFastestNodes() }
-                    complete(result)
-                }
+                if let input { stdin.fileHandleForWriting.write(input);try? stdin.fileHandleForWriting.close() }
+                let data=out.fileHandleForReading.readDataToEndOfFile();p.waitUntilExit()
+                result=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any]
+                    ?? ["error":"操作未完成：未收到有效结果，请确认工具文件完整。"]
             } catch {
-                DispatchQueue.main.async { reportFailure("无法启动工具：\(error.localizedDescription)") }
+                result=["error":"无法启动工具：\(error.localizedDescription)"]
             }
+            DispatchQueue.main.async { reply(result) }
         }
     }
-    func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { let v=LightRow();v.currentNode=nodeRows[row]["name"] as? String == current;return v }
+    func invoke(_ command:BackendCommand,_ args:[String] = [],message:String,input:Data? = nil,
+                failed:((String)->Void)? = nil,complete:@escaping ([String:Any])->Void) {
+        guard !busy else { return }
+        setBusy(true,message)
+        runBackend(command,args,input:input) { result in
+            guard result["ok"] as? Bool == true else {
+                let error=result["error"] as? String ?? "操作失败"
+                self.finishRefresh("status")
+                self.current=""
+                self.setBusy(false,error)
+                if command == .switchNode || command == .autoSwitch { self.refreshOnline() }
+                failed?(error)
+                return
+            }
+            if let state=result["state"] as? [String:Any] { self.render(state) }
+            self.setBusy(false,result["message"] as? String ?? "状态已更新。没有修改代理配置。")
+            if command == .chain || command == .startup { self.showFastestNodes() }
+            complete(result)
+        }
+    }
+    func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { let v=LightRow();v.currentNode=nodeRows[row]["name"] as? NSString == current;return v }
     func numberOfRows(in tableView:NSTableView)->Int { nodeRows.count }
     func tableView(_ tableView:NSTableView,shouldSelectRow row:Int)->Bool { false }
     func tableViewSelectionDidChange(_ notification:Notification) {
         let index=nodeTable.selectedRow
-        if index>=0,index<nodeRows.count,let name=nodeRows[index]["name"] as? String { picker.selectItem(withTitle:name) }
+        if index>=0,index<nodeRows.count,let name=nodeRows[index]["name"] as? NSString { selectRelay(name) }
     }
     func tableView(_ tableView:NSTableView,viewFor tableColumn:NSTableColumn?,row:Int)->NSView? {
         guard row<nodeRows.count,let key=tableColumn?.identifier.rawValue else{return nil}
         if key == "rank",editingNodes {
-            let name=nodeRows[row]["name"] as? String ?? ""
-            let cell=NSTableCellView();let check=NSButton(checkboxWithTitle:"",target:self,action:#selector(selectNodeForRemoval(_:)));check.tag=row;check.state=selectedNodes.contains(name) ? .on : .off;check.isEnabled = !busy && name != current;check.setAccessibilityLabel(name == current ? "当前入口，保留" : "选择删除 " + name);cell.addSubview(check);check.translatesAutoresizingMaskIntoConstraints=false
+            let name=nodeRows[row]["name"] as? NSString ?? ""
+            let cell=NSTableCellView();let check=NSButton(checkboxWithTitle:"",target:self,action:#selector(selectNodeForRemoval(_:)));check.tag=row;check.state=selectedNodes.contains(name) ? .on : .off;check.isEnabled = !busy && name != current;check.setAccessibilityLabel(name == current ? "当前入口，保留" : "选择删除 " + (name as String));cell.addSubview(check);check.translatesAutoresizingMaskIntoConstraints=false
             NSLayoutConstraint.activate([check.centerXAnchor.constraint(equalTo:cell.centerXAnchor),check.centerYAnchor.constraint(equalTo:cell.centerYAnchor)])
             return cell
         }
@@ -781,7 +891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case "rank":label.stringValue="\(row+1)";label.textColor=muted;label.font = .monospacedDigitSystemFont(ofSize:11,weight:.regular)
         case "name":
             let name=item["name"] as? String ?? "";label.stringValue=name
-            if name==current { label.textColor=accent;label.setAccessibilityLabel(name + "，当前使用");label.font = .systemFont(ofSize:13,weight:.semibold) }
+            if (name as NSString)==current { label.textColor=accent;label.setAccessibilityLabel(name + "，当前使用");label.font = .systemFont(ofSize:13,weight:.semibold) }
         case "delay":label.stringValue=(item["delay"] as? Int).map{"\($0) ms"} ?? "—";label.textColor = (item["delay"] as? Int) != nil ? ink : muted
         case "chain_delay":label.stringValue=(item[key] as? Int).map{"\($0) ms"} ?? "—";label.textColor = (item[key] as? Int) != nil ? ink : muted
         case "test_state":
@@ -825,15 +935,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func readTestProgress(_ kind:String,finished:Bool=false) {
         guard let data=try? Data(contentsOf:base.appendingPathComponent("\(kind)-progress.json")),
               let p=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else { return }
-        let running=Set(p["running"] as? [String] ?? [])
-        let results=p["results"] as? [String:[String:Any]] ?? [:]
+        let running=Set(p["running"] as? [NSString] ?? [])
+        let results=p["results"] as? [NSString:[String:Any]] ?? [:]
         for i in nodeRows.indices {
-            let name=nodeRows[i]["name"] as? String ?? ""
+            let name=nodeRows[i]["name"] as? NSString ?? ""
             if let row=results[name] {
                 nodeRows[i].merge(row){ _,new in new };nodeRows[i]["test_state"]="已完成"
             } else {
                 nodeRows[i]["test_state"]=finished ? "已停止" : running.contains(name) ? "检测中" : "待检测"
-                nodeRows[i][kind == "chain" ? "chain_delay" : "delay"]=NSNull()
+                nodeRows[i]["chain_delay"]=NSNull()
             }
         }
         nodeTable.reloadData()
@@ -842,28 +952,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if !finished { refreshLastTestTime();lastTestLabel.stringValue=lastTestLabel.stringValue.replacingOccurrences(of:"\(nodeRows.count) 个节点",with:"\(count)/\(total)") }
         feedback.stringValue=finished && count != total ? "测速已停止" : ""
     }
-    func beginTest(_ kind:String,automatic:Bool=false) {
-        guard !busy else { return }
+    func beginTest(automatic:Bool=false) {
+        guard let settings=benchmarkSettings,!busy else { return }
+        let kind=BackendCommand.chain.rawValue
         try? FileManager.default.removeItem(at:base.appendingPathComponent("\(kind)-progress.json"))
         for i in nodeRows.indices {
             nodeRows[i]["test_state"]="待检测"
-            nodeRows[i][kind == "chain" ? "chain_delay" : "delay"]=NSNull()
+            nodeRows[i]["chain_delay"]=NSNull()
         }
         nodeTable.reloadData()
-        chainRunning=kind == "chain"
+        chainRunning=true
         let revision=autoRevision
-        var args=kind == "chain" ? [kind,String(testConcurrency)] : [kind]
-        if automatic && autoRelay { args.append(autoMetric) }
-        invoke(args,message:"准备检测 · \(nodeRows.count) 个节点") { result in
+        var args=[String(settings.concurrency)]
+        if automatic && settings.autoRelay { args.append(settings.metric) }
+        invoke(.chain,args,message:"准备检测 · \(nodeRows.count) 个节点") { result in
             self.readTestProgress(kind,finished:true);self.showFastestNodes()
-            guard automatic,self.autoTestsEnabled,self.autoRelay,self.autoRevision==revision,
+            guard automatic,self.autoTestsEnabled,self.benchmarkSettings?.autoRelay == true,self.autoRevision==revision,
                   !self.autoSettingsOpen,self.window.attachedSheet == nil,
                   let recommendation=result["recommendation"] as? [String:Any],
                   let target=recommendation["target"] as? String,
                   let before=recommendation["before"] as? [String:Any],
-                  let previous=before["entry"] as? String,self.current==previous,
+                  let previous=before["entry"] as? String,self.current==(previous as NSString),
                   let input=try? JSONSerialization.data(withJSONObject:recommendation) else { return }
-            self.invoke(["auto-switch",target,previous],message:"正在自动切换中转入口…",input:input) { outcome in
+            self.invoke(.autoSwitch,[target,previous],message:"正在自动切换中转入口…",input:input) { outcome in
                 self.refreshOnline()
                 let message=outcome["message"] as? String ?? ""
                 self.feedback.stringValue=message.hasPrefix("实时切换成功，但") ? message : "已自动切换至 \(target)"
@@ -878,17 +989,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             try? Data().write(to:base.appendingPathComponent("chain-cancel"))
             chainButton.isEnabled=false;return
         }
-        beginTest("chain")
+        beginTest()
     }
     @objc func manageNodes() {
-        invoke(["subscription-catalog"],message:"正在读取 Clash Verge 订阅…") { [weak self] result in
+        invoke(.catalog,message:"正在读取 Clash Verge 订阅…") { [weak self] result in
             guard let self=self else { return }
             guard let catalog=result["catalog"] as? [String:Any] else { return }
             let picker=SubscriptionPicker(catalog:catalog,save:{ [weak self] selection in
-                guard let self=self,let picker=self.nodePicker,let data=try? JSONSerialization.data(withJSONObject:selection) else { return }
+                guard let self=self,let settings=self.benchmarkSettings,let picker=self.nodePicker,let data=try? JSONSerialization.data(withJSONObject:selection) else { return }
                 picker.setUpdating(true,message:"正在保存节点选择…")
                 let previous=self.current
-                self.invoke(["save-node-selection",self.autoMetric],message:"正在保存节点选择…",input:data,failed:{ error in
+                self.invoke(.saveSelection,[settings.metric],message:"正在保存节点选择…",input:data,failed:{ error in
                     picker.setUpdating(false,message:error)
                 }) { _ in
                     self.window.endSheet(picker.panel);self.nodePicker=nil
@@ -905,7 +1016,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     private func updatePickerSubscriptions(_ picker:SubscriptionPicker) {
-        guard !busy,nodePicker === picker else { return }
+        guard let settings=benchmarkSettings,!busy,nodePicker === picker else { return }
         picker.setUpdating(true,message:"正在更新全部订阅…")
         let reloadCatalog: (String)->Void = { message in
             picker.catalogCurrent=false
@@ -913,7 +1024,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let readFailed: (String)->Void = { error in
                 picker.setUpdating(false,message:"\(message) 列表读取失败。\(error)")
             }
-            self.invoke(["subscription-catalog"],message:"正在读取最新节点…",failed:readFailed) { updated in
+            guard let input=try? JSONSerialization.data(withJSONObject:picker.draftChanges()) else {
+                readFailed("节点选择无效，请重新打开管理节点。");return
+            }
+            self.invoke(.catalog,["--draft"],message:"正在读取最新节点…",input:input,failed:readFailed) { updated in
                 guard let catalog=updated["catalog"] as? [String:Any] else {
                     readFailed("请关闭后重新打开管理节点。")
                     return
@@ -922,7 +1036,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 picker.setUpdating(false,message:message)
             }
         }
-        invoke(["update-subscriptions",autoMetric],message:"正在更新全部订阅…",failed:{ error in
+        invoke(.updateSubscriptions,[settings.metric],message:"正在更新全部订阅…",failed:{ error in
             if error.hasPrefix("订阅里已没有你勾选的节点") { reloadCatalog(error) }
             else { picker.setUpdating(false,message:error) }
         }) { result in
@@ -932,19 +1046,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
     @objc func updateSubscriptions() {
-        guard !busy,!editingNodes else { return }
+        guard let settings=benchmarkSettings,!busy,!editingNodes else { return }
         (updateButton as? SoftButton)?.spinning=true
-        invoke(["update-subscriptions",autoMetric],message:"正在更新全部订阅…") { _ in
+        invoke(.updateSubscriptions,[settings.metric],message:"正在更新全部订阅…") { _ in
             self.refreshOnline()
             self.showFastestNodes()
         }
     }
     @objc func refresh() {
         guard !busy else{return}
+        guard let settings=benchmarkSettings else { loadBenchmarkSettings();return }
         resetOnline()
         refreshingOnline=["status"]
         (refreshButton as? SoftButton)?.spinning=true
-        invoke(["startup",autoMetric,"--refresh"],message:"正在刷新状态…") { _ in
+        invoke(.startup,[settings.metric,"--refresh"],message:"正在刷新状态…") { _ in
             self.refreshOnline()
         }
     }
@@ -959,12 +1074,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         menu.popUp(positioning:nil,at:NSPoint(x:0,y:checkButton.bounds.maxY+4),in:checkButton)
     }
-    @objc func check() { invoke(["check"],message:"正在检查；浏览器会打开结果页。不会改变代理或 Claude 任务。") { _ in } }
+    @objc func check() { invoke(.check,message:"正在检查；浏览器会打开结果页。不会改变代理或 Claude 任务。") { _ in } }
     @objc func switchNode() {
-        guard !busy, let target = picker.titleOfSelectedItem, !current.isEmpty else { return }
-        if target == current { feedback.stringValue = "已经是该节点，没有修改。"; return }
+        guard !busy, let target = picker.titleOfSelectedItem, current.length > 0 else { return }
+        if (target as NSString) == current { feedback.stringValue = "已经是该节点，没有修改。"; return }
         resetOnline()
-        invoke(["switch",target,current],message:"正在切换中转入口…") { _ in self.refreshOnline() }
+        invoke(.switchNode,[target,current as String],message:"正在切换中转入口…") { _ in self.refreshOnline() }
     }
 
     @objc func showIP() { NSWorkspace.shared.open(URL(string:"https://ip.net.coffee/claude/")!) }
@@ -988,7 +1103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         coffee?.start()
         DispatchQueue.global(qos:.userInitiated).async {
-            let p=Process();p.executableURL=Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend");p.arguments=["ip-info"]
+            let p=Process();p.executableURL=Bundle.main.resourceURL!.appendingPathComponent("backend/linkbox-backend");p.arguments=[BackendCommand.ipInfo.rawValue]
             let pipe=Pipe();p.standardOutput=pipe;p.standardError=FileHandle.nullDevice
             var data:[String:Any]=[:]
             do { try p.run();let bytes=pipe.fileHandleForReading.readDataToEndOfFile();p.waitUntilExit();data=(try? JSONSerialization.jsonObject(with:bytes)) as? [String:Any] ?? [:] } catch { data=["error":error.localizedDescription] }
@@ -1005,7 +1120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.ipSummary.stringValue=address
                 self.locationLine.stringValue=[info["city"],info["country"]].compactMap{$0 as? String}.joined(separator:" · ").replacingOccurrences(of:"United States",with:"美国").replacingOccurrences(of:"Los Angeles",with:"洛杉矶")
                 self.providerLine.stringValue="\(connection["isp"] as? String ?? "未知运营商") · AS\(connection["asn"] ?? "未知")"
-                self.ipTime.stringValue="ipwho.is \(info["updated_at"] as? String ?? "")\(address == self.expectedIP ? "" : " · 出口不一致")"
+                self.ipTime.stringValue="ipwho.is \(info["updated_at"] as? String ?? "")\(sameIP(address,self.expectedIP) ? "" : " · 出口不一致")"
                 self.renderOverview()
             }
         }
@@ -1035,7 +1150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
     func renderOverview() {
         let address=ipSummary.stringValue
-        let matched = !coffeeIP.isEmpty && coffeeIP == address
+        let matched = sameIP(coffeeIP,address)
         let mismatch = !coffeeIP.isEmpty && address.first?.isNumber == true && !matched
         let attribute = matched ? propertyValue.stringValue : (mismatch ? "检测出口不一致" : "IP 属性待验证")
         identityLine.stringValue=address

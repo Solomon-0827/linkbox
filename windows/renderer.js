@@ -16,8 +16,8 @@ function renderRows(){if(!state)return;const q=$('#search').value.trim().toLower
 function renderFooter(){text('#testCount',progress.running?`· ${progress.completed||0}/${progress.total||0} · 全链路`:`· ${state?.nodes.length||0} 个节点 · 全链路`);$('#mode').hidden=editing;$('#deleteNodes').hidden=!editing;$('#deleteNodes').disabled=!selected.size;text('#deleteNodes',`移除所选${selected.size?'（'+selected.size+'）':''}`)}
 async function refresh({skipInfo=false,generation=null,initialize=false}={}){try{const old=state?.entry,next=await call('state',{initialize});if(generation!==null&&generation!==refreshGeneration)return false;state=next;progress=state.progress||{};render();if(state.selectionError)say(state.selectionError);if(!skipInfo&&old&&old!==state.entry)refreshInfo();return true}catch(e){text('#connection','未连接 Clash');$('#settingsButton').classList.add('off');text('#relay','请先启动 Clash Verge');say(e.message);return false}}
 async function refreshInfo(generation=++refreshGeneration){if(generation!==refreshGeneration)return;$('#refresh').classList.add('spinning');await Promise.allSettled([
- call('ip').then(v=>{if(generation!==refreshGeneration)return;text('#exitIP',v.ip);text('#geo',[v.country,v.region,v.city].filter(Boolean).join(' / '));text('#isp',`AS${v.asn||'—'} · ${v.isp||'—'}`);if(v.ip!==E)say('出口不是预期美国静态家宽，请核对 GLOBAL 选择。')}).catch(e=>{if(generation===refreshGeneration){text('#exitIP','未验证');text('#geo',e.message)}}),
- call('coffee').then(v=>{if(generation!==refreshGeneration)return;const same=v.ip===E;text('#score',v.score&&same?v.score+' / 100':'未验证');text('#property',Object.entries(v.props||{}).find(([k])=>/类型|属性|usage|type/i.test(k))?.[1]||'类型待验证');const verdict=rows=>Object.entries(rows||{}).find(([k,v])=>/泄漏|泄露|结论|状态|结果/.test(k)&&v)?.[1]||'未验证';text('#dnsResult','DNS · '+verdict(v.dns));text('#udpResult','UDP · '+verdict(v.udp));text('#scoreNote',same?'Net.Coffee':'出口未匹配');text('#updatedTime',new Date(v.time).toLocaleTimeString('zh-CN',{hour12:false}));text('#updatedNote',same?'检测已完成':'待核对出口')}).catch(()=>{if(generation===refreshGeneration){text('#score','未验证');text('#property','暂未取得');text('#updatedNote','Net.Coffee 暂不可用')}})
+ call('ip').then(v=>{if(generation!==refreshGeneration)return;text('#exitIP',v.ip);text('#geo',[v.country,v.region,v.city].filter(Boolean).join(' / '));text('#isp',`AS${v.asn||'—'} · ${v.isp||'—'}`);if(!sameIP(v.ip,E))say('出口不是预期美国静态家宽，请核对 GLOBAL 选择。')}).catch(e=>{if(generation===refreshGeneration){text('#exitIP','未验证');text('#geo',e.message)}}),
+ call('coffee').then(v=>{if(generation!==refreshGeneration)return;const same=sameIP(v.ip,E);text('#score',v.score&&same?v.score+' / 100':'未验证');text('#property',Object.entries(v.props||{}).find(([k])=>/类型|属性|usage|type/i.test(k))?.[1]||'类型待验证');const verdict=rows=>Object.entries(rows||{}).find(([k,v])=>/泄漏|泄露|结论|状态|结果/.test(k)&&v)?.[1]||'未验证';text('#dnsResult','DNS · '+verdict(v.dns));text('#udpResult','UDP · '+verdict(v.udp));text('#scoreNote',same?'Net.Coffee':'出口未匹配');text('#updatedTime',new Date(v.time).toLocaleTimeString('zh-CN',{hour12:false}));text('#updatedNote',same?'检测已完成':'待核对出口')}).catch(()=>{if(generation===refreshGeneration){text('#score','未验证');text('#property','暂未取得');text('#updatedNote','Net.Coffee 暂不可用')}})
  ]);if(generation===refreshGeneration)$('#refresh').classList.remove('spinning');}
 async function switchNode(name){if(!state||name===state.entry||progress.running||editing)return;try{state=await call('switch',{name,previous:state.entry});render();say('中转入口已切换，美国静态出口保持不变。');refreshInfo()}catch(e){say(e.message)}}
 async function benchmark(){if(testing||progress.running){await call('cancel');return}testing=true;progress={running:true,kind:'chain',total:state?.nodes.length||0,completed:0,results:{},active:[]};renderRows();say('');try{const r=await call('benchmark','chain');say(r.reason||'');}catch(e){say(e.message)}finally{testing=false;await refresh();$('#tableWrap').scrollTop=0}}
@@ -58,14 +58,14 @@ $('#hourly').onchange=async()=>{const button=$('#hourly'),hourly=button.checked;
 $('#autoSettingsButton').onclick=async()=>{
  const button=$('#autoSettingsButton');button.disabled=true;
  let settings;try{settings=await call('benchmarkSettings')}catch(e){say(e.message);return}finally{button.disabled=false;}
- $('#testInterval').value=settings.interval??60;$('#testConcurrency').value=settings.concurrency??5;
- $('#autoRelay').checked=settings.autoRelay===true;$('#autoMetric').value=settings.metric||'chain';
+ $('#testInterval').value=settings.interval;$('#testConcurrency').value=settings.concurrency;
+ $('#autoRelay').checked=settings.autoRelay;$('#autoMetric').value=settings.metric;
  text('#autoSettingsNotice','');$('#autoSettings').showModal();activity();
 };
 $('#autoSettingsForm').onsubmit=async event=>{
  event.preventDefault();const save=$('#saveAutoSettings');if(save.disabled)return;save.disabled=true;
- const values={interval:$('#testInterval').valueAsNumber,concurrency:$('#testConcurrency').valueAsNumber,autoRelay:$('#autoRelay').checked,metric:$('#autoMetric').value};
- try{await call('settings',values);if(state)Object.assign(state.settings,values);$('#autoSettings').close();say('动态测速设置已保存');}
+ const values={interval:$('#testInterval').value,concurrency:$('#testConcurrency').value,autoRelay:$('#autoRelay').checked,metric:$('#autoMetric').value};
+ try{const changes=await call('settings',values);if(state)Object.assign(state.settings,changes);$('#autoSettings').close();say('动态测速设置已保存');}
  catch(e){text('#autoSettingsNotice',e.message)}finally{save.disabled=false;}
 };
 function renderProviders(){const names=['all',...new Set(state.nodes.map(n=>n.provider))];if(!names.includes(filter))filter='all';$('.segments').replaceChildren(...names.map(name=>{const b=document.createElement('button');b.textContent=name==='all'?'全部':name;b.className=name===filter?'selected':'';b.onclick=()=>{filter=name;renderProviders();renderRows()};return b}))}
@@ -93,21 +93,9 @@ function choosePickerNode(sources, node) {
  }
 }
 async function loadPicker(){
- const fresh=await call('catalog');
- const changes=new Map((pickerData?.sources||[]).map(source=>[
-  source.id,new Map(source.nodes.filter(node=>node.selected!==node.initialSelected)
-      .map(node=>[node.name,node.selected]))
- ]));
- const explicit=[];
- for(const source of fresh.sources){
-  for(const node of source.nodes){
-   node.initialSelected=node.selected;
-   const changed=changes.get(source.id)?.get(node.name);
-   if(changed===false)node.selected=false;
-   if(changed===true)explicit.push(node);
-  }
- }
- for(const node of explicit)choosePickerNode(fresh.sources,node);
+ const changes=(pickerData?.sources||[]).flatMap(source=>source.nodes
+  .filter(node=>node.selected!==node.initialSelected).map(node=>[source.id,node.name,node.selected]));
+ const fresh=await call('catalog',{changes});
  pickerData=fresh;
  if(!fresh.sources.some(source=>source.id===pickerSource))pickerSource=fresh.sources[0]?.id||'';
  pickerCatalogCurrent=true;
@@ -185,10 +173,11 @@ async function fetchIP(url,trace=false){const ac=new AbortController(),timer=set
 function rtc(){return new Promise(resolve=>{let pc,timer,done=false;const ips=new Set();const end=error=>{if(done)return;done=true;clearTimeout(timer);pc?.close();resolve({ips:[...ips],error});};try{pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]});timer=setTimeout(()=>end('采样结束'),10000);pc.onicecandidate=e=>{if(!e.candidate){end();return;}const ip=e.candidate.address||e.candidate.candidate.split(' ')[4];if(!ip||ip.endsWith('.local'))return;const v4=/^\d+\.\d+\.\d+\.\d+$/.test(ip),v6=ip.includes(':');if((v4&&!/^(10\.|127\.|0\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip))||(v6&&!/^(fe[89ab]|f[cd]|::)/i.test(ip)))ips.add(ip);};pc.createDataChannel('network-check');pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>end('未验证'));}catch{end('浏览器不支持')}})}
 function card(title,status,detail){const div=document.createElement('div');div.className='check-card '+status;const strong=document.createElement('strong');strong.textContent=title;const badge=document.createElement('span');badge.className='status';badge.textContent=status==='ok'?'符合预期':status==='bad'?'出口不一致':'未验证 / 待核对';const p=document.createElement('p');p.textContent=detail;div.append(strong,badge,p);$('#checkRows').append(div);}
 $('#check').onclick=async()=>{if(checking){$('#report').showModal();return;}checking=true;activity();$('#networkMenu').hidden=true;$('#downloadReport').hidden=true;lastReport=null;$('#check').disabled=true;$('#report').showModal();$('#checkRows').replaceChildren();text('#checkSummary','正在独立检查，不修改代理或 Claude Code。');try{
- const [native,http4,claude,http6,webrtc]=await Promise.all([call('check').catch(e=>({error:e.message})),fetchIP('https://api.ipify.org?format=json'),fetchIP('https://claude.ai/cdn-cgi/trace',true),fetchIP('https://api6.ipify.org?format=json'),rtc()]);const rows=[];
- const add=(t,s,d)=>{rows.push(s);card(t,s,d)},ipCard=(t,v)=>add(t,v?.ip?(v.ip===E?'ok':'bad'):'warn',v?.ip||v?.error||'未取得结果');
+ const expectedAtStart=E;
+ const [native,http4,claude,http6,webrtc]=await Promise.all([call('check').catch(e=>({error:e.message})),fetchIP('https://api.ipify.org?format=json'),fetchIP('https://claude.ai/cdn-cgi/trace',true),fetchIP('https://api6.ipify.org?format=json'),rtc()]);const rows=[],expected=native.expected??expectedAtStart;
+ const add=(t,s,d)=>{rows.push(s);card(t,s,d)},ipCard=(t,v)=>add(t,v?.ip?(sameIP(v.ip,expected)?'ok':'bad'):'warn',v?.ip||v?.error||'未取得结果');
  if(native.error)add('系统检查','warn',native.error);else{if(native.stable===false)add('检查期间网络变化','warn','网络或所选节点已变化，请在连接稳定后重新检查');ipCard('系统 TUN 出口',native.tun);ipCard('Clash 显式代理出口',native.proxy);add('本地 IPv6 绕过',native.ipv6.status,native.ipv6.detail);add('Claude Code 当前连接',native.claude.status,native.claude.detail);}
- ipCard('本应用浏览器出口',http4);ipCard('本应用访问 Claude 出口',claude);add('浏览器 IPv6','warn',http6.ip?'返回 '+http6.ip+'，需核对出口归属':'未取得 IPv6 地址，请结合本地检查判断');const other=webrtc.ips.filter(x=>x!==E);add('浏览器 WebRTC',other.length?'bad':webrtc.ips.includes(E)?'ok':'warn',webrtc.ips.length?webrtc.ips.join('、'):'没有公网候选，未验证');text('#checkSummary',rows.includes('bad')?'检测完成：发现出口不一致，请核对。':'检测完成 · '+fmt(new Date())+' · 未验证不等于通过');
+ ipCard('本应用浏览器出口',http4);ipCard('本应用访问 Claude 出口',claude);add('浏览器 IPv6','warn',http6.ip?'返回 '+http6.ip+'，需核对出口归属':'未取得 IPv6 地址，请结合本地检查判断');const other=webrtc.ips.filter(ip=>!sameIP(ip,expected));add('浏览器 WebRTC',other.length?'bad':webrtc.ips.length?'ok':'warn',webrtc.ips.length?webrtc.ips.join('、'):'没有公网候选，未验证');text('#checkSummary',rows.includes('bad')?'检测完成：发现出口不一致，请核对。':'检测完成 · '+fmt(new Date())+' · 未验证不等于通过');
  lastReport={native,browser:{http4,claude,http6,webrtc},time:new Date().toISOString()};$('#downloadReport').hidden=false;
  }catch(e){text('#checkSummary',e.message)}finally{checking=false;activity();$('#check').disabled=false;}};
 

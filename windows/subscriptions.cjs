@@ -126,7 +126,32 @@ async function entrySeedOwners(b, config, sources) {
  return new Map([...owners].filter(([, owner]) => owner !== undefined));
 }
 
-async function catalog(b) {
+function mergeSelectionDraft(catalog, changes){
+ if(!Array.isArray(changes)||changes.some(row=>!Array.isArray(row)||row.length!==3||
+    typeof row[0]!=='string'||typeof row[1]!=='string'||typeof row[2]!=='boolean')){
+  throw Error('节点选择无效，请重新打开管理节点');
+ }
+ const edits=new Map(),explicit=new Map();
+ for(const [source,name,selected] of changes){
+  if(!edits.has(source))edits.set(source,new Map());
+  edits.get(source).set(name,selected);
+ }
+ const sources=catalog.sources.map(source=>({...source,nodes:source.nodes.map(node=>{
+  const changed=edits.get(source.id)?.get(node.name);
+  const row={...node,initialSelected:node.selected,selected:changed??node.selected};
+  if(changed===true)explicit.set(node.name,row);
+  return row;
+ })}));
+ for(const {nodes} of sources){
+  for(const node of nodes){
+   const owner=explicit.get(node.name);
+   if(owner)node.selected=node===owner;
+  }
+ }
+ return {...catalog,sources};
+}
+
+async function catalog(b, changes=[]) {
  const {sources, fingerprint} = await discover(b);
  const state = await b.state();
  const owners = selectionOwners(reconcile({sources: inventoryFor(sources),
@@ -134,7 +159,7 @@ async function catalog(b) {
  const current = state.entry;
  const currentOwner = owners.get(current) ?? sources.find(({document}) =>
   document?.proxies.some(n => n.name === current))?.source.name;
- return {fingerprint, current, sources: sources.map(({source, document}) => ({
+ const fresh = {fingerprint, current, sources: sources.map(({source, document}) => ({
   id: source.name, name: source.display_name,
   warning: document ? (document.proxies.length ? '' : '本地暂无可用缓存，请先在 Clash Verge 更新此订阅') :
    '本地缓存暂不可读，保留原勾选',
@@ -143,6 +168,7 @@ async function catalog(b) {
    selected: owners.get(n.name) === source.name,
   })),
  }))};
+ return mergeSelectionDraft(fresh,changes);
 }
 
 function validateSelection(discovered, request, saved) {
@@ -585,4 +611,4 @@ async function remove(b, request) {
  return run(b, null, {removal: request});
 }
 
-module.exports = {discover, catalog, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan};
+module.exports = {discover, catalog, mergeSelectionDraft, run, remove, initialize, startup, validateSelection, sourceKey, entryPlan};

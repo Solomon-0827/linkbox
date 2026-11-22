@@ -1,0 +1,4 @@
+{
+  "input": {"interval": 60, "concurrency": 2.5, "autoRelay": false, "metric": "chain"},
+  "error": "并发测速量须为 1–10 条。"
+}

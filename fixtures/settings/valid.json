@@ -1,0 +1,6 @@
+{
+  "input": {"hourly": false, "interval": 1440, "concurrency": 10, "autoRelay": true, "metric": "entrance", "expectedIP": "2001:0DB8:0:0:0:0:0:12"},
+  "configuredIP": "192.0.2.1",
+  "windowsExpectedIP": "2001:0DB8:0:0:0:0:0:12",
+  "output": {"hourly": false, "interval": 1440, "concurrency": 10, "autoRelay": true, "metric": "entrance", "expectedIP": "2001:db8::12"}
+}

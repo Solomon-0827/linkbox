@@ -18,6 +18,7 @@ import time
 import yaml
 import toolbox as t
 import runtime
+from settings import benchmark_value
 from reconcile import selection_owners
 
 CORE = '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo'
@@ -137,7 +138,7 @@ def trace(port, cancelled, expected):
         text=stdout.decode(errors='replace');body,stats=text.rsplit('\n__TIMING__',1)
         code,total,ttfb=stats.split();values=dict(x.split('=',1) for x in body.splitlines() if '=' in x)
         if code!='200' or not values.get('ip'):raise RuntimeError('测试站返回无效结果')
-        if values['ip']!=expected:raise RuntimeError('出口不符：'+values['ip'])
+        if not runtime.same_ip(values['ip'], expected):raise RuntimeError('出口不符：'+values['ip'])
         return {'ms':round(float(total)*1000),'ttfb_ms':round(float(ttfb)*1000),'ip':values['ip']}
     finally:stop_owned(p)
 
@@ -224,8 +225,7 @@ def auto_candidate(record, metric):
 
 
 def run(concurrency=runtime.CONCURRENCY):
-    if type(concurrency) is not int or not 1 <= concurrency <= 10:
-        raise ValueError("并发测速量须为 1–10")
+    concurrency = benchmark_value('concurrency', concurrency, strict=True)
     os.umask(0o077)
     with open(t.BASE/'latency.lock','a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

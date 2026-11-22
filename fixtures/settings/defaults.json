@@ -1,0 +1,4 @@
+{
+  "input": {},
+  "output": {"hourly": true, "interval": 60, "concurrency": 5, "autoRelay": false, "metric": "chain", "expectedIP": ""}
+}

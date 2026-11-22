@@ -139,6 +139,32 @@ def catalog():
     return {'sources': result, 'fingerprint': fingerprint, 'current': current}
 
 
+def merge_selection_draft(catalog, changes):
+    if not isinstance(changes, list) or any(
+            not isinstance(row, list) or len(row) != 3 or not isinstance(row[0], str)
+            or not isinstance(row[1], str) or type(row[2]) is not bool for row in changes):
+        raise ValueError('节点选择无效，请重新打开管理节点')
+    edits = {(source, name): selected for source, name, selected in changes}
+    explicit = {}
+    sources = []
+    for source in catalog['sources']:
+        nodes = []
+        for node in source['nodes']:
+            changed = edits.get((source['id'], node['name']))
+            row = {**node, 'initialSelected': node['selected'],
+                   'selected': changed if changed is not None else node['selected']}
+            if changed is True:
+                explicit[node['name']] = row
+            nodes.append(row)
+        sources.append({**source, 'nodes': nodes})
+    for source in sources:
+        for node in source['nodes']:
+            owner = explicit.get(node['name'])
+            if owner is not None:
+                node['selected'] = node is owner
+    return {**catalog, 'sources': sources}
+
+
 def validate_selection(sources, fingerprint, request, saved):
     if request.get('fingerprint') != fingerprint or 'current' not in request:
         raise RuntimeError('订阅或筛选已变化，请重新打开管理节点')
