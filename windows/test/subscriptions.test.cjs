@@ -8,7 +8,7 @@ const {EventEmitter} = require('node:events');
 const http = require('node:http');
 const vm = require('node:vm');
 const YAML = require('yaml');
-const {Backend, safeError} = require('../backend.cjs');
+const {Backend} = require('../backend.cjs');
 const {Clash, ClashHTTPError, ENTRY, EXIT} = require('../clash.cjs');
 const sub = require('../subscriptions.cjs');
 
@@ -278,19 +278,6 @@ test('same-name owner move with connection refused rolls back', async t => {
  assert.equal(connections,4);
  assert.deepEqual(state,active);
  assert.deepEqual(YAML.parse(requests[0].body.payload)['proxy-groups'][0].use, ['a']);
-});
-
-test('subscription catalog and save errors omit URL credentials and cache source', async t => {
- const {b, root, items, write, apply} = await fixture(t);
- const badURL = 'https://fixture-user:fixture-pass@example.invalid／bad/path?key=fixture-query';
- await write('profiles.yaml', {current: 'a', items: [{...items[0], url: badURL}, items[1]]});
- await assert.rejects(sub.catalog(b), error => safeError(error) === 'Invalid URL');
-
- await write('profiles.yaml', {current: 'a', items});
- await apply({a:['current'], b:['other']});
- await fs.writeFile(path.join(root, 'profiles/b.yaml'), 'proxies: [');
- await fs.writeFile(path.join(root, 'providers/linkbox/b.yaml'), 'proxies: [{password: fixture-cache}');
- await assert.rejects(apply({a:['fast'], b:[]}), error => safeError(error) === '代理缓存不完整，未修改');
 });
 
 test('saving another subscription keeps unreadable cache selection and provider', async t => {
@@ -811,7 +798,7 @@ test('redirected reload reports HTTP status and keeps the new files', async t =>
   if (args[2] === '/configs?force=false') throw new ClashHTTPError(302);
   return controller(...args);
  };
- await assert.rejects(apply({a:['fast'], b:[]}), /302.*Clash 未确认/);
+ await assert.rejects(apply({a:['fast'], b:[]}), {message: 'Clash 控制接口返回 302。已写入新配置，Clash 未确认，请刷新状态核对'});
  assert.notDeepEqual(await fs.readFile(file), original);
  assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
 });

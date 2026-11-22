@@ -62,7 +62,7 @@ test('HTTP errors ignore response content and classify explicit reload rejection
   });
   return req;
  });
- await assert.rejects(adapter.providers(), {message: 'Clash API 返回 401', rejected: true});
+ await assert.rejects(adapter.providers(), {message: 'Clash 控制接口返回 401', rejected: true});
  assert.equal(requests[0].headers.Authorization, 'Bearer local-test');
  status = 200;
  await assert.rejects(adapter.connections(), {message: 'Clash 返回无效数据'});
@@ -70,24 +70,24 @@ test('HTTP errors ignore response content and classify explicit reload rejection
  for (body of ['password: fixture-only', '']) {
   let rolledBack = false;
   await assert.rejects(adapter.reload('proxies: []', () => {}, () => { rolledBack = true; }),
-   {message: 'Clash API 返回 400，文件已回退；请刷新状态后重试'});
+   {message: 'Clash 控制接口返回 400，文件已回退；请刷新状态后重试'});
   assert.ok(rolledBack);
  }
 });
 
-test('a connected controller failure hides transport details and leaves the reload unconfirmed', async t => {
+test('a connected controller failure preserves the transport error and leaves the reload unconfirmed', async t => {
  const {adapter} = await fixture(t, {validate: () => {}});
  t.mock.method(http, 'request', () => {
   const req = new EventEmitter();
   req.write = () => {};
   req.end = () => queueMicrotask(() => {
    req.emit('socket', {connecting: false});
-   req.emit('error', Object.assign(Error('token: fixture-only'), {code: 'ECONNRESET'}));
+   req.emit('error', Object.assign(Error('read ECONNRESET'), {code: 'ECONNRESET'}));
    req.emit('close');
   });
   return req;
  });
- await assert.rejects(adapter.relayState(), {message: '无法读取 Clash 控制接口响应'});
+ await assert.rejects(adapter.relayState(), {message: 'read ECONNRESET'});
  await assert.rejects(adapter.reload('proxies: []', () => {}, () => assert.fail('rollback')),
   {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
 });

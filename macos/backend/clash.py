@@ -1,6 +1,5 @@
 """LinkBox's operations on the local Clash controller and Verge files."""
 import datetime
-import errno
 import http.client
 import json
 import os
@@ -25,18 +24,13 @@ _RELOAD_UNCERTAIN = '已写入新配置，Clash 未确认，请刷新状态核�
 
 
 class ClashHTTPError(RuntimeError):
-    def __init__(self, status):
-        super().__init__(f'Clash API 返回 {status}')
+    def __init__(self, status, *, expected_status=None):
+        super().__init__(f'Clash API HTTP {status}' if expected_status == 200 else f'Clash API 返回 {status}')
         self.rejected = 400 <= status < 600
 
 
 class ClashRequestNotSent(OSError):
     pass
-
-
-def _request_not_sent(error):
-    return isinstance(error, (ClashRequestNotSent, socket.gaierror)) or getattr(error, 'errno', None) in (
-        errno.ECONNREFUSED, errno.ENOENT, errno.ENETUNREACH, errno.EHOSTUNREACH)
 
 
 def _request(method, path, payload=None, *, timeout=6, expected_status=None):
@@ -46,8 +40,10 @@ def _request(method, path, payload=None, *, timeout=6, expected_status=None):
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self.sock.settimeout(timeout)
                 self.sock.connect(_SOCKET)
-            except OSError:
-                raise ClashRequestNotSent('无法连接 Clash 控制接口') from None
+            except OSError as error:
+                if expected_status == 200:
+                    raise
+                raise ClashRequestNotSent('无法连接 Clash 控制接口') from error
 
     conn = Connection('localhost')
     try:
@@ -55,15 +51,9 @@ def _request(method, path, payload=None, *, timeout=6, expected_status=None):
                      {'Content-Type': 'application/json'})
         response = conn.getresponse()
         if not 200 <= response.status < 300 or expected_status not in (None, response.status):
-            raise ClashHTTPError(response.status)
+            raise ClashHTTPError(response.status, expected_status=expected_status)
         body = response.read()
-        return json.loads(body) if body else None
-    except (ClashRequestNotSent, ClashHTTPError):
-        raise
-    except TimeoutError:
-        raise TimeoutError('Clash 控制接口超时') from None
-    except (ValueError, http.client.HTTPException, OSError):
-        raise OSError('无法读取 Clash 控制接口响应') from None
+        return json.loads(body) if body or expected_status == 200 else None
     finally:
         conn.close()
 
@@ -108,7 +98,7 @@ def reload(payload, prepare, rollback):
     try:
         _request('PUT', '/configs?force=false', {'payload': payload.decode()})
     except Exception as error:
-        unsent = _request_not_sent(error)
+        unsent = isinstance(error, ClashRequestNotSent)
         if unsent or (isinstance(error, ClashHTTPError) and error.rejected):
             rollback()
             message = _RELOAD_NOT_SENT if unsent else str(error)
@@ -150,11 +140,9 @@ def read_file(path):
         return None
 
 
-def read_config():
-    try:
-        return yaml.safe_load(config_file().read_bytes())
-    except (ValueError, yaml.YAMLError):
-        raise ValueError('无法读取 Clash Verge 配置') from None
+def read_config(*, text=True):
+    path = config_file()
+    return yaml.safe_load(path.read_text() if text else path.read_bytes())
 
 
 def write_file(path, data, *, expected=None, conflict=None):
@@ -179,13 +167,9 @@ def restore_files(written, originals):
 
 
 def update_selector(index, name, *, include_exit=False):
-    if not isinstance(index, dict):
-        raise RuntimeError('无法读取 Clash Verge 订阅选择，未修改')
-    if not index.get('current'):
-        if include_exit:
-            raise RuntimeError('找不到当前订阅，未修改持久化设置')
-        return False
-    profile = next((item for item in index.get('items', []) if item.get('uid') == index['current']), None)
+    current = index.get('current')
+    profile = next((item for item in index.get('items', [])
+                    if (include_exit or current) and item.get('uid') == current), None)
     if profile is None:
         if include_exit:
             raise RuntimeError('找不到当前订阅，未修改持久化设置')
@@ -205,15 +189,11 @@ def update_selector(index, name, *, include_exit=False):
 
 def persist_selection(name, *, backup_dir=None):
     path = profiles_file()
-    original = read_file(path)
-    try:
-        index = yaml.safe_load(original or b'')
-        changed = update_selector(index, name, include_exit=backup_dir is not None)
-        if not changed and backup_dir is None:
-            return
-        output = yaml.safe_dump(index, allow_unicode=True, sort_keys=False).encode()
-    except (AttributeError, TypeError, ValueError, yaml.YAMLError):
-        raise RuntimeError('无法读取 Clash Verge 订阅选择，未修改') from None
+    original = path.read_bytes()
+    index = yaml.safe_load(original)
+    if not update_selector(index, name, include_exit=backup_dir is not None) and backup_dir is None:
+        return
+    output = yaml.safe_dump(index, allow_unicode=True, sort_keys=False).encode()
     if backup_dir is not None:
         backup_dir.mkdir(exist_ok=True, mode=0o700)
         backup = backup_dir / ('profiles-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.yaml')

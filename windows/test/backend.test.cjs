@@ -1,5 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),os=require('node:os'),path=require('node:path'),fs=require('node:fs/promises');
-const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED,safeError}=require('../backend.cjs');
+const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED}=require('../backend.cjs');
 const {Clash, ENTRY, EXIT}=require('../clash.cjs');
 const ipComparison=require('../../fixtures/ip-comparison.json');
 function fakeBackend(folder, Constructor=Backend) {
@@ -9,13 +9,6 @@ function fakeBackend(folder, Constructor=Backend) {
  });
  return b;
 }
-test('UI error formatting hides quoted URL credentials and YAML source lines', () => {
- const address = 'HTTPS://fixture-user:fixture pass@example.invalid/path?key=fixture-query';
- assert.equal(safeError(Error(`打不开 "${address}"`)), '打不开 [网络地址]');
- assert.throws(() => require('yaml').parse('proxies: [{password: fixture-cache}'), error =>
-  safeError(error) === '无法解析 YAML 配置');
-});
-
 test('Claude proxy exit checks compare parsed addresses',()=>{
  const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1'}];
  const connections=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽']}];

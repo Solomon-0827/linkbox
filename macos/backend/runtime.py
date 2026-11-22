@@ -3,26 +3,12 @@ from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
-import re
-
-import yaml
-
 import clash
 import settings
 
 BASE = Path(os.environ.get('LINKBOX_DATA_DIR', Path.home()/'Library/Application Support/ProxyToolbox'))
 BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
 CONCURRENCY = settings.benchmark_value('concurrency', None)
-
-def safe_error(error):
-    if isinstance(error, yaml.YAMLError):
-        return '无法解析 YAML 配置'
-    message = str(error)
-    # urllib can quote the raw authority without the URL scheme.
-    if isinstance(error, ValueError) and message.startswith('netloc '):
-        return '订阅地址包含无效字符'
-    # Quoted malformed URLs can contain spaces and cannot be parsed reliably.
-    return re.sub(r"""(?i)(['"])https?://(?:\\.|(?!\1)[^\\\r\n])*\1|https?://\S+""", '[网络地址]', message)
 
 def read_json(name):
     try:

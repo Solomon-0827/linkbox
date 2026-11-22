@@ -4,16 +4,12 @@ const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqua
 const {benchmarkSettings,expectedIP,settingChanges}=require('./preferences.cjs');
 const {sameIP}=require('./ip-address.js');
 const {selectionOwners}=require('./reconcile.cjs');
-const {Clash, ENTRY, EXIT, parseYAML, readFile}=require('./clash.cjs');
+const {Clash, ENTRY, EXIT, readFile}=require('./clash.cjs');
 const EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function jsonRead(p,fallback={}){try{return JSON.parse(await fs.readFile(p,'utf8'));}catch{return fallback;}}
 async function writeJSON(p,v){await fs.mkdir(path.dirname(p),{recursive:true});const tmp=p+'.tmp';await fs.writeFile(tmp,JSON.stringify(v,null,2),{mode:0o600});await fs.rename(tmp,p);}
-function safeError(error) {
- if (error instanceof YAML.YAMLError) return '无法解析 YAML 配置';
- // Quoted malformed URLs can contain spaces and cannot be parsed reliably.
- return String(error.message || error).replace(/(['"])https?:\/\/(?:\\.|(?!\1)[^\\\r\n])*\1|https?:\/\/\S+/gi, '[网络地址]').slice(0,250);
-}
+function safeError(e){return String(e.message||e).replace(/https?:\/\/[^\s]+/g,'[网络地址]').slice(0,250);}
 function isolatedConfig(entry,exit,port,iface,kind='chain',dnsPolicy={}){
  if(entry['dialer-proxy'])throw Error('该节点自带链式上游，暂不支持隔离测速');
  const a=structuredClone(entry),b=structuredClone(exit);a.name='TEST_ENTRY';a['interface-name']=iface;delete a['routing-mark'];b.name='TEST_EXIT';b['dialer-proxy']='TEST_ENTRY';delete b['interface-name'];delete b['routing-mark'];
@@ -138,7 +134,7 @@ class Backend{
    const provider=Object.hasOwn(providers,owner)?providers[owner]??{}:{};
    let list=provider.payload;
    if(provider.path){
-    try{list=parseYAML((await readFile(this.clash.providerFile(provider.path)))?.toString() || '')?.proxies;}
+    try{list=YAML.parse((await readFile(this.clash.providerFile(provider.path)))?.toString() || '')?.proxies;}
     catch{continue;}
    }
    if(!Array.isArray(list))continue;

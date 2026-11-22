@@ -184,12 +184,12 @@ def test_node(node, exit_node, network, cancelled, expected):
             if owner.returncode!=0:raise RuntimeError('无法确认临时端口归属，已停止测试')
             entrance={'delay':None,'time':dt.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'隔离入口 HTTPS 204 / 3 秒超时','error':''}
             try:entrance['delay']=entrance_delay(port,cancelled)
-            except Exception as error:entrance['error']=runtime.safe_error(error)
+            except Exception as error:entrance['error']=str(error)
             samples=[];errors=[]
             for index in range(3):
                 if cancelled():break
                 try:samples.append(trace(port,cancelled,expected))
-                except RuntimeError as error:errors.append(runtime.safe_error(error))
+                except RuntimeError as error:errors.append(str(error))
                 if errors and not samples:break  # avoid repeatedly probing a failing path
                 time.sleep(.25)
             return samples,errors,entrance
@@ -259,7 +259,7 @@ def run(concurrency=runtime.CONCURRENCY):
                     row['chain_delay']=round(statistics.median(x['ms'] for x in samples))
                     row['chain_status']=f'全链 {len(samples)}/3'
                 else:row['chain_status']='不足 2 次' if samples else '全链未通'
-            except Exception as e:row['chain_status']='全链未通';row['chain_error']=runtime.safe_error(e)
+            except Exception as e:row['chain_status']='全链未通';row['chain_error']=str(e)
             return row
         # Coordinator alone checks state and writes progress; workers own their children.
         pending={};remaining=iter(names)

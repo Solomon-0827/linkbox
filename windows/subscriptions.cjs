@@ -3,16 +3,16 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
 const {reconcile, selectionOwners}=require('./reconcile.cjs');
 const {isDeepStrictEqual}=require('node:util');
 const {signature: sig, providerNodes}=require('./backend.cjs');
-const {ENTRY, EXIT, equal, parseYAML, readFile, writeFile, restoreFiles, updateSelector}=require('./clash.cjs');
+const {ENTRY, EXIT, equal, readFile, writeFile, restoreFiles, updateSelector}=require('./clash.cjs');
 const MARK='// BEGIN LINKBOX MANAGED PROVIDERS',NOTICE=/剩余流量|重置剩余|套餐到期|官网续费|务必加Q群/;
 const PREVIEW='subscription-preview.yaml', NO_SELECTION='订阅里已没有你勾选的节点，请先在管理节点里勾选';
 const INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改';
 const hash=v=>crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const digest=raw=>raw && crypto.createHash('sha256').update(raw).digest('hex');
-async function doc(p){const r=await readFile(p);return r?parseYAML(r.toString())||{}:{}}
+async function doc(p){const r=await readFile(p);return r?YAML.parse(r.toString())||{}:{}}
 async function policy(b){return doc(path.join(b.dataDir,'node-policy.json'))}
 function parseProfile(raw){
- try { return raw ? parseYAML(raw.toString()) : null; }
+ try { return raw ? YAML.parse(raw.toString()) : null; }
  catch (error) { if (!(error instanceof YAML.YAMLParseError)) throw error; return null; }
 }
 function sourceKey(url){const u=new URL(url);return /\/(client|subscribe)\/[A-Za-z0-9_-]{20,}$/.test(u.pathname)?u.pathname+'?'+u.search.slice(1):url}
@@ -410,7 +410,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    const downloads = new Map();
    for (const {source} of sources) {
     try {
-     const raw = parseYAML(await b.textRequest(source.url, before.mixedPort, {timeout: 45000, max: 8*1024*1024}));
+     const raw = YAML.parse(await b.textRequest(source.url, before.mixedPort, {timeout: 45000, max: 8*1024*1024}));
      const document = clean(raw);
      if (!document) throw Error();
      refreshed.push({source, document});
@@ -491,7 +491,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   if (desired === null) throw Error(NO_SELECTION);
   const selectedNames = selectionOwners(selected);
   const plannedEntry = selectedNames.has(before.entry) ? before.entry : desired;
-  const index = parseYAML(baselines.get(profiles).toString());
+  const index = YAML.parse(baselines.get(profiles).toString());
   if (updateSelector(index, plannedEntry)) {
    updates.set(profiles, YAML.stringify(index));
   }

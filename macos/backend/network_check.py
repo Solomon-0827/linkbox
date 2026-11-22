@@ -28,7 +28,7 @@ def safe(fn):
     try:
         return fn()
     except Exception as e:
-        return {'error': runtime.safe_error(e)}
+        return {'error': str(e)}
 
 def http_exit(proxy=None):
     handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {})
@@ -66,7 +66,7 @@ def ipv6_probe(ip):
         s.connect((ip, 443))
         return {'target': ip, 'connected': True, 'local': s.getsockname()[0]}
     except OSError as e:
-        return {'target': ip, 'connected': False, 'reason': runtime.safe_error(e)}
+        return {'target': ip, 'connected': False, 'reason': str(e)}
     finally:
         s.close()
 

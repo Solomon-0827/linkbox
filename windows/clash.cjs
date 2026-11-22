@@ -14,16 +14,11 @@ const RELOAD_UNCERTAIN = '已写入新配置，Clash 未确认，请刷新状态
 
 class ClashHTTPError extends Error {
  constructor(status){
-  super('Clash API 返回 '+status);
+  super('Clash 控制接口返回 '+status);
   this.rejected = status >= 400 && status < 600;
  }
 }
 class ClashRequestNotSent extends Error {}
-class ClashResponseError extends Error {}
-function requestNotSent(error){
- return error instanceof ClashRequestNotSent ||
-  ['ECONNREFUSED','ENOENT','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'].includes(error?.code);
-}
 
 function request(endpoint, method, route, body, timeout = 6000) {
  return new Promise((resolve, reject) => {
@@ -33,8 +28,6 @@ function request(endpoint, method, route, body, timeout = 6000) {
    ...(secret ? {Authorization: 'Bearer ' + secret} : {}),
    ...(payload ? {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload)} : {}),
   };
-  const noConnection = () => new ClashRequestNotSent('无法连接 Clash 控制接口');
-  const unreadable = () => new ClashResponseError('无法读取 Clash 控制接口响应');
   let req;
   try {
    req = http.request({...options, method, path: route, headers}, response => {
@@ -48,17 +41,17 @@ function request(endpoint, method, route, body, timeout = 6000) {
     let size = 0;
     response.on('data', chunk => {
      size += chunk.length;
-     if (size > 12e6) req.destroy(new ClashResponseError('响应过大'));
+     if (size > 12e6) req.destroy(Error('响应过大'));
      else chunks.push(chunk);
     });
-    response.on('error', () => reject(unreadable()));
+    response.on('error', reject);
     response.on('end', () => {
      try { resolve(size ? JSON.parse(Buffer.concat(chunks).toString()) : {}); }
      catch { reject(Error('Clash 返回无效数据')); }
     });
    });
-  } catch {
-   reject(noConnection());
+  } catch (error) {
+   reject(new ClashRequestNotSent(error.message, {cause: error}));
    return;
   }
   let connected = false;
@@ -66,17 +59,12 @@ function request(endpoint, method, route, body, timeout = 6000) {
    if (socket.connecting) socket.once('connect', () => { connected = true; });
    else connected = true;
   });
-  const timer = setTimeout(() => req.destroy(new ClashResponseError('Clash 控制接口超时')), timeout);
+  const timer = setTimeout(() => req.destroy(Error('Clash 控制接口超时')), timeout);
   req.on('close', () => clearTimeout(timer));
-  req.on('error', error => reject(connected ?
-   (error instanceof ClashResponseError ? error : unreadable()) : noConnection()));
+  req.on('error', error => reject(connected ? error : new ClashRequestNotSent('无法连接 Clash 控制接口', {cause: error})));
   if (payload) req.write(payload);
   req.end();
  });
-}
-
-function parseYAML(raw) {
- return YAML.parse(raw, {logLevel: 'error', prettyErrors: false});
 }
 
 async function readFile(file) {
@@ -107,12 +95,9 @@ async function restoreFiles(written, originals) {
 }
 
 function updateSelector(index, name) {
- const profile = index.current && index.items?.find(item => item.uid === index.current);
+ const profile = index.items.find(item => index.current && item.uid === index.current);
  if (!profile) return false;
- const choices = profile.selected ??= [];
- if (!Array.isArray(choices) || choices.some(choice => !choice || typeof choice !== 'object' || Array.isArray(choice))) {
-  throw Error('无法读取 Clash Verge 订阅选择，未修改');
- }
+ const choices = profile.selected ||= [];
  const choice = choices.find(item => item.name === ENTRY);
  if (!choice) choices.push({name: ENTRY, now: name});
  else if (choice.now !== name) choice.now = name;
@@ -166,7 +151,7 @@ class Clash {
   try {
    await this.#call('PUT', '/configs?force=false', {payload}, 30000);
   } catch (error) {
-   const unsent = requestNotSent(error);
+   const unsent = error instanceof ClashRequestNotSent;
    if (unsent || (error instanceof ClashHTTPError && error.rejected)) {
     await rollback();
     const message = unsent ? RELOAD_NOT_SENT : error.message;
@@ -192,8 +177,7 @@ class Clash {
  async persistSelection(name) {
   const file = this.profilesFile();
   const original = await readFile(file);
-  const index = parseYAML(original?.toString() || '');
-  if (!index || typeof index !== 'object' || Array.isArray(index)) throw Error('无法读取 Clash Verge 订阅选择，未修改');
+  const index = YAML.parse(original.toString());
   if (updateSelector(index, name)) {
    await writeFile(file, YAML.stringify(index), {
     expected: original, conflict: '配置或节点已被其他操作改变，已取消更新',
@@ -216,7 +200,7 @@ class Clash {
    for (const name of ['clash-verge.yaml', 'config.yaml']) {
     const file = path.join(root, name);
     try {
-     const config = parseYAML((await readFile(file))?.toString() || '');
+     const config = YAML.parse((await readFile(file))?.toString() || '');
      if (Array.isArray(config?.proxies)) {
       this.root = root;
       this.configFile = file;
@@ -260,7 +244,9 @@ class Clash {
     if (['127.0.0.1', 'localhost', '0.0.0.0', '[::1]', '[::]'].includes(address.hostname)) {
      endpoints.push({hostname: '127.0.0.1', port: Number(address.port), secret: config.secret});
     }
-   } catch {}
+   } catch (error) {
+    throw new ClashRequestNotSent(error.message, {cause: error});
+   }
   }
   for (const endpoint of endpoints) {
    try {
@@ -308,4 +294,4 @@ class Clash {
   throw Error('未找到 Mihomo 内核，请在设置中选择 Clash Verge 自带的 verge-mihomo.exe');
  }
 }
-module.exports = {Clash, ClashHTTPError, ENTRY, EXIT, equal, parseYAML, readFile, writeFile, restoreFiles, updateSelector};
+module.exports = {Clash, ClashHTTPError, ENTRY, EXIT, equal, readFile, writeFile, restoreFiles, updateSelector};

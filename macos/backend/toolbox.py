@@ -33,11 +33,12 @@ def relay_owners(selection, live):
     if selection is not None:
         return selection_owners(selection)
 
+    import yaml
     from subscription_update import entry_plan
 
     try:
-        config = clash.read_config()
-    except (OSError, ValueError):
+        config = clash.read_config(text=False)
+    except (OSError, ValueError, yaml.YAMLError):
         config = None
     if not isinstance(config, dict):
         config = {}

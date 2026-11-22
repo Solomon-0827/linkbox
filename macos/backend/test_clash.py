@@ -38,22 +38,15 @@ class ClashAdapterTests(unittest.TestCase):
         self.assertEqual(transport.call_args_list[-1],
                          call('PUT', '/proxies/' + quote(clash.ENTRY, safe=''), {'name': 'a/b?c'}))
 
-    def test_read_errors_expose_status_or_safe_text(self):
+    def test_http_errors_report_status_without_reading_the_body(self):
         connection = http.client.HTTPConnection
-        with (patch.object(connection, 'request') as send,
+        with (patch.object(connection, 'request'),
               patch.object(connection, 'getresponse') as receive):
             receive.return_value.status = 401
-            self.assertEqual(network_check.safe(network_check.local_state), {'error': 'Clash API 返回 401'})
+            self.assertEqual(network_check.safe(network_check.local_state), {'error': 'Clash API HTTP 401'})
+            with self.assertRaisesRegex(clash.ClashHTTPError, '^Clash API 返回 401$'):
+                clash.providers()
             receive.return_value.read.assert_not_called()
-            send.assert_called_once()
-
-            receive.return_value.status = 200
-            receive.return_value.read.return_value = b'password: fixture-only'
-            self.assertEqual(network_check.safe(network_check.local_state),
-                             {'error': '无法读取 Clash 控制接口响应'})
-
-            receive.side_effect = TimeoutError('token: fixture-only')
-            self.assertEqual(network_check.safe(network_check.local_state), {'error': 'Clash 控制接口超时'})
 
     def test_diagnostics_report_empty_no_content_status(self):
         connection = http.client.HTTPConnection
@@ -64,7 +57,8 @@ class ClashAdapterTests(unittest.TestCase):
             receive.return_value.read.return_value = b''
             for diagnostic in (network_check.local_state, network_check.claude_connections):
                 with self.subTest(diagnostic=diagnostic.__name__):
-                    self.assertEqual(network_check.safe(diagnostic), {'error': 'Clash API 返回 204'})
+                    self.assertEqual(network_check.safe(diagnostic), {'error': 'Clash API HTTP 204'})
+            receive.return_value.read.assert_not_called()
 
     def test_reload_validates_the_exact_payload_before_guard_and_write(self):
         payload = b'proxies: []'
@@ -100,12 +94,10 @@ class ClashAdapterTests(unittest.TestCase):
             profiles.write_bytes(original)
 
             def read_with_change(path):
-                if path == profiles and read_with_change.called:
+                if path == profiles:
                     profiles.write_bytes(concurrent)
-                read_with_change.called = True
                 return path.read_bytes()
 
-            read_with_change.called = False
             with (patch.object(clash, 'CONFIG_DIR', root),
                   patch.object(clash, 'read_file', side_effect=read_with_change)):
                 with self.assertRaisesRegex(RuntimeError, '同时更新'):
