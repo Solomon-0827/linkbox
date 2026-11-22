@@ -1,0 +1,8 @@
+{
+  "evidence": {"processCount": 0, "matched": []},
+  "expected": {
+    "macos": {"claude": ["warn", "当前没有 Claude Code 进程，未验证"]},
+    "windows": {"claude": ["warn", "当前无可核验的 Claude Code 连接，未验证"]},
+    "counts": "9 项符合预期 / 2 项待核对"
+  }
+}

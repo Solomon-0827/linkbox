@@ -1,0 +1,10 @@
+{
+  "platform": "macos",
+  "evidence": {"macosDialer": "DIRECT"},
+  "expected": {
+    "macos": {
+      "clash": ["warn", "global / TUN 开启 / 入口 fixture relay / GLOBAL 美国静态家宽"]
+    },
+    "counts": "9 项符合预期 / 2 项待核对"
+  }
+}

@@ -1,5 +1,6 @@
 const test=require('node:test'),assert=require('node:assert/strict'),os=require('node:os'),path=require('node:path'),fs=require('node:fs/promises');
-const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED}=require('../backend.cjs');
+const {Backend,isolatedConfig,matchClaudeConnections,EXPECTED}=require('../backend.cjs');
+const {networkVerdict,ipv6Assessment,assessClaude}=require('../network-verdict.js');
 const {Clash, ENTRY, EXIT}=require('../clash.cjs');
 const ipComparison=require('../../fixtures/ip-comparison.json');
 function fakeBackend(folder, Constructor=Backend) {
@@ -16,7 +17,7 @@ test('Claude proxy exit checks compare parsed addresses',()=>{
  const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1'}];
  const connections=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽']}];
  for(const {name,probe,expected,matches} of ipComparison){
-  assert.equal(assessClaude(rows,connections,probe,expected).status,matches?'ok':'warn',name);
+  assert.equal(assessClaude(matchClaudeConnections(rows,connections),probe,expected).status,matches?'ok':'warn',name);
  }
 });
 
@@ -150,7 +151,17 @@ test('an unrelated settings save preserves saved connection paths',async t=>{
 });
 test('isolated configuration never enables live control, TUN or mutates inputs',()=>{const a={name:'入口',type:'ss',server:'example.invalid',port:1},b={name:'美国静态家宽',server:EXPECTED,'dialer-proxy':'中转入口'};const before=JSON.stringify([a,b]);for(const kind of ['chain','entrance']){const c=isolatedConfig(a,b,12345,'Wi-Fi',kind);assert.equal(c.tun.enable,false);assert.equal(c['allow-lan'],false);assert.equal(c['external-controller'],'');assert.equal(c['interface-name'],'Wi-Fi');assert.equal(c.proxies[0]['interface-name'],'Wi-Fi');assert.equal(c.profile['store-selected'],false);assert.equal(c.proxies.length,kind==='chain'?2:1);}assert.equal(JSON.stringify([a,b]),before);assert.throws(()=>isolatedConfig({...a,'dialer-proxy':'other'},b,1,'Wi-Fi'));});
 test('IPv6 incomplete probes must never pass',()=>{assert.equal(ipv6Assessment([],[{connected:false},{connected:false}]).status,'ok');assert.equal(ipv6Assessment([],[{},{}]).status,'warn');assert.equal(ipv6Assessment([],[{connected:true},{connected:false}]).status,'warn');assert.equal(ipv6Assessment(['2001:db8::1'],[{connected:false},{connected:false}]).status,'warn');});
-test('Claude connections require exact endpoint evidence and verified proxy exit',()=>{const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1',OwningProcess:123}],cons=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽','GLOBAL']}];assert.equal(assessClaude(rows,cons,EXPECTED).status,'ok');assert.equal(assessClaude(rows,cons,'203.0.113.11').status,'warn');assert.equal(assessClaude([],[],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[...cons,...cons],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[{...cons[0],chains:['DIRECT']}],EXPECTED).status,'bad');});
+test('Claude connections require exact endpoint evidence and verified proxy exit',()=>{
+ const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1',OwningProcess:123}];
+ const connection={metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'example.com'},chains:['美国静态家宽','GLOBAL']};
+ const status=(rows,connections,probe=EXPECTED)=>assessClaude(matchClaudeConnections(rows,connections),probe,EXPECTED).status;
+ assert.equal(status(rows,[connection]),'ok');
+ assert.equal(status(rows,[connection],'203.0.113.11'),'warn');
+ assert.equal(status([],[]),'warn');
+ assert.equal(status(rows,[connection,connection]),'warn');
+ assert.equal(status(rows,[{...connection,metadata:{...connection.metadata,sourceIP:'203.0.113.44'}}]),'warn');
+ assert.equal(status(rows,[{...connection,chains:['DIRECT']}]),'bad');
+});
 test('switch validates stale state before writes and writes only entrance',async()=>{
  const b=fakeBackend('/tmp');
  const state={mode:'global',tun:true,entry:'a',exit:EXIT,dialer:ENTRY,live:['a','b'],
@@ -183,14 +194,16 @@ test('a cancelled benchmark never runs remaining nodes',async()=>{const dir=awai
 test('network report uses the diagnostic deadline and records changes without mutations',async t=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-'));
  t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ t.mock.method(os,'networkInterfaces',()=>({}));
  const b=fakeBackend(dir);
  let calls=0;
  b.state=async timeout=>{
   assert.equal(timeout,6000);
-  return {mode:'global',tun:true,entry:++calls===1?'WiFi relay':'Ethernet relay',exit:EXIT,dialer:ENTRY,mixedPort:7897};
+  return {mode:'global',tun:true,entry:++calls===1?'WiFi relay':'Ethernet relay',exit:EXIT,dialer:ENTRY,mixedPort:7897,expectedIP:EXPECTED};
  };
  b.trace=async()=>({ip:EXPECTED});
  b.ipv6Probe=async()=>({connected:false});
+ b.powershell=async()=>JSON.stringify({connections:[]});
  b.controller=async (method,route,body,timeout)=>{
   assert.deepEqual([method,route,body,timeout],['GET','/connections',undefined,6000]);
   return {connections:[]};
@@ -198,7 +211,9 @@ test('network report uses the diagnostic deadline and records changes without mu
  const report=await b.networkCheck();
  assert.equal(report.stable,false);
  assert.equal(report.proxy.ip,EXPECTED);
- assert.equal(report.claude.status,'warn');
+ const {cards,nativeAssessments}=networkVerdict({native:report,browser:{},finishedAt:'fixture time'});
+ assert.equal(cards[0].title,'检查期间网络变化');
+ assert.equal(nativeAssessments.claude.status,'warn');
  assert.deepEqual(await fs.readdir(dir),[]);
 });
 test('network report uses the expected IP from before its probes',async t=>{

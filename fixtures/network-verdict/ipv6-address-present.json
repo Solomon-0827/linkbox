@@ -1,0 +1,8 @@
+{
+  "evidence": {"ipv6Addresses": ["2001:db8::2"]},
+  "expected": {
+    "macos": {"ipv6": ["warn", "发现公网 IPv6 地址，但两次连接未成功，仍需核对"]},
+    "windows": {"ipv6": ["warn", "网卡有公网 IPv6 地址，探测未连通，仍需核对"]},
+    "counts": "9 项符合预期 / 2 项待核对"
+  }
+}

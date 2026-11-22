@@ -1,0 +1,17 @@
+{
+  "evidence": {
+    "ipv6Probes": [{"connected": false}, {"connected": true, "local": "2001:db8::2"}],
+    "http6": {"ip": "2001:db8::2"}
+  },
+  "expected": {
+    "macos": {
+      "ipv6": ["warn", "存在可用 IPv6 通路，需核实其出口；不能仅凭连接成功认定泄漏"],
+      "http6": ["warn", "返回 2001:db8::2，需核对是否属于代理出口"]
+    },
+    "windows": {
+      "ipv6": ["warn", "存在 IPv6 通路，需核实出口；连接成功本身不等于泄漏"],
+      "http6": ["warn", "返回 2001:db8::2，需核对出口归属"]
+    },
+    "counts": "9 项符合预期 / 2 项待核对"
+  }
+}

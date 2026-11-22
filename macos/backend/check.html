@@ -10,29 +10,43 @@
 <details><summary>完整诊断数据 · IP、连接域名和进程 PID</summary><pre id="raw"></pre></details>
 <footer><span>PROXY TOOLBOX · 本地生成，无报告上传</span><span id="updated">正在检测，请保持页面打开约 25 秒</span></footer>
 <script src="ip-address.js"></script>
+<script src="network-verdict.js"></script>
 <script>
 const root=location.pathname, rows=document.querySelector('#checks'); let report={expected_ip:__EXPECTED_IP__,browser:null,native:null};
-function line(text,cls){const li=document.createElement('li');li.className=cls;const head=document.createElement('div');head.className='check-head';const title=document.createElement('span');title.className='check-title';const split=text.indexOf('：');title.textContent=split<0?text:text.slice(0,split);const badge=document.createElement('span');badge.className='badge';badge.textContent=cls==='ok'?'符合预期':cls==='bad'?'出口异常':'待核对';head.append(title,badge);const value=document.createElement('div');value.className='value';value.textContent=split<0?'':text.slice(split+1).replaceAll('TimeoutError','请求超时').replaceAll('TypeError: Failed to fetch','浏览器请求失败');li.append(head,value);rows.append(li);return cls;}
-function draw(){rows.replaceChildren();let flags=[];const put=(s,c)=>flags.push(line(s,c));const e=report.expected_ip,n=report.native,b=report.browser;document.querySelector('#expected').textContent=e;
-if(!n)put('系统与 Claude 连接：检测中…','warn');else{
-for(const [k,label] of [['https_tun','系统 HTTPS 出口'],['https_proxy','Clash 显式代理出口'],['stun_google','系统 Google STUN'],['stun_cloudflare','系统 Cloudflare STUN']]){const v=n[k];put(label+'：'+(v?.ip||'未验证 · '+(v?.error||'无结果')),v?.ip?(sameIP(v.ip,e)?'ok':'bad'):'warn');}
-const c=n.clash;put('Clash：'+(c?.error||`${c?.mode} / TUN ${c?.tun?'开启':'关闭'} / 入口 ${c?.groups?.['中转入口']?.now||'未知'} / GLOBAL ${c?.groups?.GLOBAL?.now||'未知'}`),c?.mode==='global'&&c?.tun&&c?.groups?.GLOBAL?.now==='美国静态家宽'&&c?.groups?.['美国静态家宽']?.['dialer-proxy']==='中转入口'?'ok':'warn');
-const v6=n.ipv6_assessment;put('本地 IPv6 绕过检查：'+(v6?.text||'未取得完整结果'),v6?.status||'warn');
-const cc=n.claude,matched=cc?.matched||[],verified=matched.filter(x=>x.chains?.includes('美国静态家宽')),other=cc?.other_sockets?.length||0;
-const mismatch=matched.filter(x=>Array.isArray(x.chains)&&x.chains.length&&!x.chains.includes('美国静态家宽'));
-const proven=verified.length>0&&verified.length===matched.length&&!other&&sameIP(n.https_proxy?.ip,e);
-put('Claude Code 现有连接：'+(cc?.error||(!cc?.process_count?'当前没有 Claude Code 进程，未验证':!matched.length&&!other?'进程当前没有可核验的网络连接，未验证':`${verified.length}/${matched.length} 条代理连接匹配美国静态家宽；${other} 条其他连接待核对。`+(proven?'同一代理实测出口 '+e:'仅快照证据，未匹配的连接不判定为泄漏'))),mismatch.length?'bad':proven?'ok':'warn');
-
+function renderCard({title,status,badge,detail}){
+ const li=document.createElement('li');
+ li.className=status;
+ const head=document.createElement('div');
+ head.className='check-head';
+ const label=document.createElement('span');
+ label.className='check-title';
+ label.textContent=title;
+ const badgeElement=document.createElement('span');
+ badgeElement.className='badge';
+ badgeElement.textContent=badge;
+ head.append(label,badgeElement);
+ const value=document.createElement('div');
+ value.className='value';
+ value.textContent=detail;
+ li.append(head,value);
+ rows.append(li);
 }
-if(!b)put('浏览器 WebRTC / IP：检测中…','warn');else{
-put('浏览器普通网页出口：'+(b.http4.ip||'未验证 · '+b.http4.error),b.http4.ip?(sameIP(b.http4.ip,e)?'ok':'bad'):'warn');
-const ai=b.claude;put('浏览器访问 Claude 出口：'+(ai?.ip||'未验证 · '+(ai?.error||'未取得结果')),ai?.ip?(sameIP(ai.ip,e)?'ok':'bad'):'warn');
-const pub=b.webrtc.public_ips||[],other=pub.filter(ip=>!sameIP(ip,e));put('浏览器 WebRTC：'+(other.length?'发现非预期公网地址 '+other.join(', '):pub.length?'公网候选只有预期美国出口 '+e:'未验证：没有公网 ICE 候选；'+(b.webrtc.error||'可能被阻止或网络超时')),other.length?'bad':pub.length?'ok':'warn');
-put('浏览器 IPv6 专用请求：'+(b.http6.ip?'返回 '+b.http6.ip+'，需核对是否属于代理出口':'未获得 IPv6 地址；浏览器请求失败，需结合系统结果判断'),'warn');
+function draw(){
+ const {cards,headline,counts,ipv6Assessment}=networkVerdict(report);
+ const {native,browser}=report;
+ // Keep the derived assessment in the raw and downloaded reports.
+ if(native)native.ipv6_assessment=ipv6Assessment;
+ rows.replaceChildren();
+ cards.forEach(renderCard);
+ document.querySelector('#expected').textContent=report.expected_ip;
+ document.querySelector('#headline').textContent=headline;
+ document.querySelector('#raw').textContent=JSON.stringify(report,null,2);
+ document.querySelector('#route').textContent=native?.clash?.groups?.['中转入口']?.now||'未验证';
+ document.querySelector('#counts').textContent=counts;
+ document.querySelector('#updated').textContent=native&&browser?'本轮检测完成 · '+new Date().toLocaleTimeString():'正在检测，请保持页面打开…';
 }
-document.querySelector('#headline').textContent=!n||!b?'正在检测…':flags.includes('bad')?'发现出口不一致，请查看红色项目':flags.includes('warn')?'检测完成：部分项目需核对或未验证':'检测完成：本次未发现出口异常';document.querySelector('#raw').textContent=JSON.stringify(report,null,2);document.querySelector('#route').textContent=n?.clash?.groups?.['中转入口']?.now||'未验证';document.querySelector('#counts').textContent=`${flags.filter(x=>x==='ok').length} 项符合预期 / ${flags.filter(x=>x!=='ok').length} 项待核对`;document.querySelector('#updated').textContent=n&&b?'本轮检测完成 · '+new Date().toLocaleTimeString():'正在检测，请保持页面打开…';}
 async function ip(url,trace=false){const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),10000);try{const r=await fetch(url,{signal:ac.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=trace?Object.fromEntries((await r.text()).split('\n').filter(x=>x.includes('=')).map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)]})):await r.json();if(!d.ip)throw Error('未返回出口 IP');return {ip:d.ip};}catch(e){return {error:String(e)}}finally{clearTimeout(timer)}}
 function rtc(){return new Promise(resolve=>{let pc,timer;const candidates=[],publicIPs=new Set();let finished=false;const end=(error)=>{if(finished)return;finished=true;clearTimeout(timer);if(pc)pc.close();resolve({public_ips:[...publicIPs],candidates,error:error||null});};try{pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]});timer=setTimeout(()=>end(),15000);pc.onicecandidate=ev=>{if(!ev.candidate){end();return;}const c=ev.candidate,parts=c.candidate.split(' '),addr=c.address||parts[4],type=c.type||parts[7];candidates.push({address:addr,type,protocol:c.protocol||parts[2]});const private4=/^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(addr);const private6=/^(fe[89ab]|f[cd])/i.test(addr)||addr==='::1';if(addr&&!addr.endsWith('.local')&&addr!=='0.0.0.0'&&addr!=='::'&&!private4&&!private6)publicIPs.add(addr);};pc.createDataChannel('diagnostic');pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(e=>end(String(e)));}catch(e){end(String(e))}})}
-async function main(){draw();const poll=setInterval(async()=>{try{const r=await fetch(root+'results');const d=await r.json();report={...d,browser:report.browser||d.browser};draw();if(d.native&&report.browser)clearInterval(poll)}catch(e){}},1000);const [http4,http6,webrtc,claude]=await Promise.all([ip('https://api.ipify.org?format=json'),ip('https://api6.ipify.org?format=json'),rtc(),ip('https://claude.ai/cdn-cgi/trace',true)]);report.browser={time:new Date().toISOString(),user_agent:navigator.userAgent,http4,http6,webrtc,claude};draw();try{await fetch(root+'browser',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report.browser)});}catch(e){line('结果回传失败，本页结果仍可下载。','warn');}}
+async function main(){draw();const poll=setInterval(async()=>{try{const r=await fetch(root+'results');const d=await r.json();report={...d,browser:report.browser||d.browser};draw();if(d.native&&report.browser)clearInterval(poll)}catch(e){}},1000);const [http4,http6,webrtc,claude]=await Promise.all([ip('https://api.ipify.org?format=json'),ip('https://api6.ipify.org?format=json'),rtc(),ip('https://claude.ai/cdn-cgi/trace',true)]);report.browser={time:new Date().toISOString(),user_agent:navigator.userAgent,http4,http6,webrtc,claude};draw();try{await fetch(root+'browser',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report.browser)});}catch(e){renderCard({title:'结果回传失败，本页结果仍可下载。',status:'warn',badge:'待核对',detail:''});}}
 document.querySelector('#download').onclick=()=>{const a=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}));a.href=url;a.download='proxy-check-'+new Date().toISOString().replaceAll(':','-')+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),2000)};main();
 </script></html>

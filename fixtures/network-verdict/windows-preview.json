@@ -1,0 +1,18 @@
+{
+  "platform": "windows",
+  "evidence": {"windowsPreview": true},
+  "expected": {
+    "windows": {
+      "tun": ["warn", "未取得结果"],
+      "proxy": ["warn", "未取得结果"],
+      "ipv6": null,
+      "claude": null,
+      "http4": null,
+      "browserClaude": null,
+      "http6": null,
+      "webrtc": null
+    },
+    "summary": "Cannot read properties of undefined (reading 'status')",
+    "downloadable": false
+  }
+}

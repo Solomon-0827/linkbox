@@ -1,0 +1,12 @@
+{
+  "evidence": {"matched": [{"chains": ["美国静态家宽"]}, {"chains": ["DIRECT"]}]},
+  "expected": {
+    "macos": {
+      "claude": ["bad", "1/2 条代理连接匹配美国静态家宽；0 条其他连接待核对。仅快照证据，未匹配的连接不判定为泄漏"]
+    },
+    "windows": {"claude": ["bad", "1/2 条 Claude Code 连接匹配美国静态家宽；0 条未匹配"]},
+    "headline": "发现出口不一致，请查看红色项目",
+    "counts": "9 项符合预期 / 2 项待核对",
+    "summary": "检测完成：发现出口不一致，请核对。"
+  }
+}

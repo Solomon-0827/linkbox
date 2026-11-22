@@ -171,14 +171,28 @@ $('#saveSelection').onclick=async()=>{if(pickerSaving||pickerBusy||!pickerCatalo
 window.linkbox.onProgress(v=>{const finished=progress.running&&!v.running;progress=v;renderRows();if(finished){$('#tableWrap').scrollTop=0;refresh()}});window.linkbox.onAutomatic(async v=>{if(v.error){await refresh();say('自动测速：'+v.error)}else{await refresh();if(v.switchedTo){say('已自动切换至 '+v.switchedTo);refreshInfo();}}});
 async function fetchIP(url,trace=false){const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),10000);try{const r=await fetch(url,{signal:ac.signal,cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const raw=await r.text();let ip=trace?raw.split('\n').find(x=>x.startsWith('ip='))?.slice(3):JSON.parse(raw).ip;if(!ip)throw Error('未返回地址');return {ip};}catch(e){return {error:e.name==='AbortError'?'请求超时':'浏览器请求失败或跨域限制'}}finally{clearTimeout(timer)}}
 function rtc(){return new Promise(resolve=>{let pc,timer,done=false;const ips=new Set();const end=error=>{if(done)return;done=true;clearTimeout(timer);pc?.close();resolve({ips:[...ips],error});};try{pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]});timer=setTimeout(()=>end('采样结束'),10000);pc.onicecandidate=e=>{if(!e.candidate){end();return;}const ip=e.candidate.address||e.candidate.candidate.split(' ')[4];if(!ip||ip.endsWith('.local'))return;const v4=/^\d+\.\d+\.\d+\.\d+$/.test(ip),v6=ip.includes(':');if((v4&&!/^(10\.|127\.|0\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip))||(v6&&!/^(fe[89ab]|f[cd]|::)/i.test(ip)))ips.add(ip);};pc.createDataChannel('network-check');pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>end('未验证'));}catch{end('浏览器不支持')}})}
-function card(title,status,detail){const div=document.createElement('div');div.className='check-card '+status;const strong=document.createElement('strong');strong.textContent=title;const badge=document.createElement('span');badge.className='status';badge.textContent=status==='ok'?'符合预期':status==='bad'?'出口不一致':'未验证 / 待核对';const p=document.createElement('p');p.textContent=detail;div.append(strong,badge,p);$('#checkRows').append(div);}
+function card({title,status,badge,detail}){
+ const div=document.createElement('div');
+ div.className='check-card '+status;
+ const strong=document.createElement('strong');
+ strong.textContent=title;
+ const badgeElement=document.createElement('span');
+ badgeElement.className='status';
+ badgeElement.textContent=badge;
+ const p=document.createElement('p');
+ p.textContent=detail;
+ div.append(strong,badgeElement,p);
+ $('#checkRows').append(div);
+}
 $('#check').onclick=async()=>{if(checking){$('#report').showModal();return;}checking=true;activity();$('#networkMenu').hidden=true;$('#downloadReport').hidden=true;lastReport=null;$('#check').disabled=true;$('#report').showModal();$('#checkRows').replaceChildren();text('#checkSummary','正在独立检查，不修改代理或 Claude Code。');try{
  const expectedAtStart=E;
- const [native,http4,claude,http6,webrtc]=await Promise.all([call('check').catch(e=>({error:e.message})),fetchIP('https://api.ipify.org?format=json'),fetchIP('https://claude.ai/cdn-cgi/trace',true),fetchIP('https://api6.ipify.org?format=json'),rtc()]);const rows=[],expected=native.expected??expectedAtStart;
- const add=(t,s,d)=>{rows.push(s);card(t,s,d)},ipCard=(t,v)=>add(t,v?.ip?(sameIP(v.ip,expected)?'ok':'bad'):'warn',v?.ip||v?.error||'未取得结果');
- if(native.error)add('系统检查','warn',native.error);else{if(native.stable===false)add('检查期间网络变化','warn','网络或所选节点已变化，请在连接稳定后重新检查');ipCard('系统 TUN 出口',native.tun);ipCard('Clash 显式代理出口',native.proxy);add('本地 IPv6 绕过',native.ipv6.status,native.ipv6.detail);add('Claude Code 当前连接',native.claude.status,native.claude.detail);}
- ipCard('本应用浏览器出口',http4);ipCard('本应用访问 Claude 出口',claude);add('浏览器 IPv6','warn',http6.ip?'返回 '+http6.ip+'，需核对出口归属':'未取得 IPv6 地址，请结合本地检查判断');const other=webrtc.ips.filter(ip=>!sameIP(ip,expected));add('浏览器 WebRTC',other.length?'bad':webrtc.ips.length?'ok':'warn',webrtc.ips.length?webrtc.ips.join('、'):'没有公网候选，未验证');text('#checkSummary',rows.includes('bad')?'检测完成：发现出口不一致，请核对。':'检测完成 · '+fmt(new Date())+' · 未验证不等于通过');
- lastReport={native,browser:{http4,claude,http6,webrtc},time:new Date().toISOString()};$('#downloadReport').hidden=false;
+ const [native,http4,claude,http6,webrtc]=await Promise.all([call('check').catch(e=>({error:e.message})),fetchIP('https://api.ipify.org?format=json'),fetchIP('https://claude.ai/cdn-cgi/trace',true),fetchIP('https://api6.ipify.org?format=json'),rtc()]);
+ const browser={http4,claude,http6,webrtc};
+ const {cards,summary,nativeAssessments,downloadable}=networkVerdict({native,browser,expectedAtStart,finishedAt:fmt(new Date())});
+ cards.forEach(card);
+ text('#checkSummary',summary);
+ if(!downloadable)return;
+ lastReport={native:{...native,...nativeAssessments},browser,time:new Date().toISOString()};$('#downloadReport').hidden=false;
  }catch(e){text('#checkSummary',e.message)}finally{checking=false;activity();$('#check').disabled=false;}};
 
 $('#downloadReport').onclick=async()=>{if(!lastReport)return;try{await call('downloadReport',lastReport)}catch(e){text('#checkSummary',e.message)}};

@@ -1,0 +1,8 @@
+{
+  "evidence": {"ipv6Addresses": null},
+  "expected": {
+    "macos": {"ipv6": ["warn", "IPv6 检查未完整取得结果，未验证"]},
+    "windows": {"ipv6": ["warn", "结果不完整，IPv6 未验证"]},
+    "counts": "9 项符合预期 / 2 项待核对"
+  }
+}

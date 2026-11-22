@@ -1,0 +1,28 @@
+{
+  "evidence": {
+    "expected": "2001:db8::1",
+    "tun": {"ip": "2001:0DB8:0000:0000:0000:0000:0000:0001"},
+    "proxy": {"ip": "2001:0db8::1"},
+    "http4": {"ip": "2001:db8:0:0:0:0:0:1"},
+    "browserClaude": {"ip": "2001:DB8::1"},
+    "stunGoogle": {"error": "TimeoutError"},
+    "stunCloudflare": {"error": "TimeoutError"},
+    "ice": ["2001:0DB8::1"]
+  },
+  "expected": {
+    "shared": {
+      "tun": ["ok", "2001:0DB8:0000:0000:0000:0000:0000:0001"],
+      "proxy": ["ok", "2001:0db8::1"],
+      "http4": ["ok", "2001:db8:0:0:0:0:0:1"],
+      "browserClaude": ["ok", "2001:DB8::1"]
+    },
+    "macos": {
+      "stunGoogle": ["warn", "未验证 · 请求超时"],
+      "stunCloudflare": ["warn", "未验证 · 请求超时"],
+      "claude": ["ok", "1/1 条代理连接匹配美国静态家宽；0 条其他连接待核对。同一代理实测出口 2001:db8::1"],
+      "webrtc": ["ok", "公网候选只有预期美国出口 2001:db8::1"]
+    },
+    "windows": {"webrtc": ["ok", "2001:0DB8::1"]},
+    "counts": "8 项符合预期 / 3 项待核对"
+  }
+}

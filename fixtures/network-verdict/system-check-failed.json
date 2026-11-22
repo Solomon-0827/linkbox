@@ -1,0 +1,13 @@
+{
+  "platform": "windows",
+  "evidence": {"windowsError": "Clash 控制接口超时", "expectedAtStart": "203.0.113.10"},
+  "expected": {
+    "windows": {
+      "systemError": ["warn", "Clash 控制接口超时"],
+      "tun": null,
+      "proxy": null,
+      "ipv6": null,
+      "claude": null
+    }
+  }
+}

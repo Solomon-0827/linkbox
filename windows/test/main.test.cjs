@@ -33,10 +33,9 @@ function loadRenderer(call, setInterval=()=>{}, globals={}) {
   window:{linkbox:{call,onProgress(){},onAutomatic(){}}},setInterval,URL,...globals,
  });
  const html=fs.readFileSync(require.resolve('../index.html'),'utf8');
- if(html.includes('<script src="ip-address.js"></script>')){
-  vm.runInContext(fs.readFileSync(require.resolve('../ip-address.js'),'utf8'),context);
+ for(const [,src] of html.matchAll(/<script src="([^"]+)"><\/script>/g)){
+  vm.runInContext(fs.readFileSync(require.resolve('../'+src),'utf8'),context);
  }
- vm.runInContext(fs.readFileSync(require.resolve('../renderer.js'),'utf8'),context);
  return {select, context};
 }
 
@@ -71,7 +70,7 @@ test('network check cards compare parsed browser and system addresses',async()=>
  for(const {name,expected,probe,matches} of require('../../fixtures/ip-comparison.json')){
   const {select}=loadRenderer(async action=>{
    if(action==='check')return {ok:true,data:{expected,tun:{ip:probe},proxy:{ip:probe},
-    ipv6:{status:'warn'},claude:{status:'warn'}}};
+    ipv6:{addresses:[],probes:[{},{}]},claude:{matched:[],other:[]}}};
    return {ok:false,error:'offline'};
   },undefined,{AbortController,setTimeout,clearTimeout,fetch:async url=>({ok:true,text:async()=>
    url.includes('trace')?'ip='+probe:JSON.stringify({ip:probe})})});
@@ -106,6 +105,30 @@ test('browser probes keep their initial expected IP if the system check fails',a
  probe.resolve(priorIP);
  await pending;
  assert.deepEqual(cards.slice(0,3),['check-card warn','check-card ok','check-card ok']);
+});
+
+test('network report downloads still include the native assessments alongside the evidence',async()=>{
+ const ip='203.0.113.10';
+ const ipv6={addresses:[],probes:[{connected:false},{connected:false}]};
+ const claude={matched:[{chains:['美国静态家宽']}],other:[]};
+ const native={expected:ip,stable:true,tun:{ip},proxy:{ip},ipv6,claude};
+ let downloaded;
+ const {select}=loadRenderer(async(action,value)=>{
+  if(action==='check')return {ok:true,data:native};
+  if(action==='downloadReport'){downloaded=JSON.parse(JSON.stringify(value));return {ok:true};}
+  return {ok:false,error:'offline'};
+ },undefined,{AbortController,setTimeout,clearTimeout,fetch:async url=>({ok:true,text:async()=>
+  url.includes('trace')?'ip='+ip:JSON.stringify({ip})})});
+ select('#report').showModal=()=>{};
+
+ await select('#check').onclick();
+ assert.equal(select('#downloadReport').hidden,false);
+ await select('#downloadReport').onclick();
+ assert.deepEqual(downloaded.native,{
+  ...native,
+  ipv6:{status:'ok',detail:'无公网 IPv6 地址，两个公网目标均连接失败；本轮未发现绕过通路',...ipv6},
+  claude:{status:'ok',detail:'1/1 条 Claude Code 连接匹配美国静态家宽；0 条未匹配',...claude},
+ });
 });
 
 test('only startup and manual Refresh retry transient initialization failures', async () => {

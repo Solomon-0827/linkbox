@@ -1,0 +1,7 @@
+{
+  "platform": "windows",
+  "evidence": {"stable": false},
+  "expected": {
+    "windows": {"unstable": ["warn", "网络或所选节点已变化，请在连接稳定后重新检查"]}
+  }
+}
