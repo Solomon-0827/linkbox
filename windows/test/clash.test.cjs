@@ -8,6 +8,7 @@ const {EventEmitter} = require('node:events');
 const YAML = require('yaml');
 const {Clash, ENTRY, EXIT} = require('../clash.cjs');
 const {Backend} = require('../backend.cjs');
+const {assessClaude} = require('../network-verdict.js');
 
 async function fixture(t, options = {}) {
  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-clash-'));
@@ -210,7 +211,9 @@ test('Windows Network Check can verify a controller response after five seconds'
  });
  const report = await b.networkCheck();
  assert.equal(report.stable, true);
- assert.equal(report.claude.status, 'ok');
+ assert.deepEqual(report.claude.matched.map(({chains}) => chains), [[EXIT]]);
+ assert.deepEqual(report.claude.other, []);
+ assert.equal(assessClaude(report.claude, report.proxy.ip, report.expected).status, 'ok');
  assert.deepEqual(deadlines, Array(7).fill(6000));
 });
 

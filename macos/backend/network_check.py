@@ -111,17 +111,6 @@ def claude_connections():
             'note': '仅核对现有 socket 与 Clash 连接记录；空闲或无法匹配不算通过。未向 Claude Code 注入请求。'}
 
 
-def ipv6_assessment(results):
-    addresses = results.get('global_ipv6_addresses')
-    probes = [results.get('ipv6_google', {}), results.get('ipv6_cloudflare', {})]
-    if any(p.get('connected') is True for p in probes):
-        return {'status': 'warn', 'text': '存在可用 IPv6 通路，需核实其出口；不能仅凭连接成功认定泄漏'}
-    if not isinstance(addresses, list) or any(p.get('connected') is not False for p in probes):
-        return {'status': 'warn', 'text': 'IPv6 检查未完整取得结果，未验证'}
-    if addresses:
-        return {'status': 'warn', 'text': '发现公网 IPv6 地址，但两次连接未成功，仍需核对'}
-    return {'status': 'ok', 'text': '无公网 IPv6 地址，两个独立 IPv6 目标均连接失败；本轮未发现绕过通路'}
-
 def native_checks():
     jobs = {'clash': local_state, 'https_tun': http_exit,
             'https_proxy': lambda: http_exit('http://127.0.0.1:7897'),
@@ -144,7 +133,6 @@ def native_checks():
             if ipaddress.ip_address(value).is_global:
                 addresses.append(value)
     results['global_ipv6_addresses'] = addresses if interface_result.returncode == 0 else None
-    results['ipv6_assessment'] = ipv6_assessment(results)
     return results
 
 def main():
@@ -169,6 +157,8 @@ def main():
                 self.send((ASSETS / 'check.html').read_text().replace('__EXPECTED_IP__', expected).encode(), 'text/html')
             elif self.path == '/' + token + '/ip-address.js':
                 self.send(IP_COMPARISON.read_bytes(), 'text/javascript')
+            elif self.path == '/' + token + '/network-verdict.js':
+                self.send((ASSETS / 'network-verdict.js').read_bytes(), 'text/javascript')
             elif self.path == '/' + token + '/results':
                 with lock:
                     self.send(json.dumps(report, ensure_ascii=False).encode())

@@ -23,18 +23,11 @@ function providerNodes(response){
   .filter(([,provider])=>Array.isArray(provider?.proxies))
   .map(([owner,provider])=>[owner,provider.proxies.filter(node=>typeof node?.name==='string'&&node.name)]));
 }
-function ipv6Assessment(addresses,probes){
- if(probes.some(x=>x.connected))return {status:'warn',detail:'存在 IPv6 通路，需核实出口；连接成功本身不等于泄漏'};
- if(!Array.isArray(addresses)||probes.some(x=>x.connected!==false))return {status:'warn',detail:'结果不完整，IPv6 未验证'};
- if(addresses.length)return {status:'warn',detail:'网卡有公网 IPv6 地址，探测未连通，仍需核对'};
- return {status:'ok',detail:'无公网 IPv6 地址，两个公网目标均连接失败；本轮未发现绕过通路'};
-}
-function assessClaude(rows,connections,expectedProxyIP,expectedIP=EXPECTED){
+function matchClaudeConnections(rows,connections){
  const matched=[],other=[];
  for(const row of rows){const found=connections.filter(x=>String(x.metadata?.sourcePort)===String(row.LocalPort)&&(!x.metadata.sourceIP||x.metadata.sourceIP===row.LocalAddress));
   if(found.length===1)matched.push({pid:row.OwningProcess,host:found[0].metadata.host,chains:found[0].chains||[]});else other.push({pid:row.OwningProcess,remote:row.RemoteAddress,port:row.RemotePort});}
- const good=matched.filter(x=>x.chains.includes(EXIT)).length,bad=matched.some(x=>x.chains.length&&!x.chains.includes(EXIT));
- return {status:bad?'bad':good>0&&good===rows.length&&sameIP(expectedProxyIP,expectedIP)?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
+ return {matched,other};
 }
 class Backend{
  constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.clash=new Clash(()=>this.settings,script=>this.powershell(script),{resolveConfig:()=>this.resolveConfig()});this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.nodePolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
@@ -266,9 +259,10 @@ class Backend{
  const raw=await this.powershell("$p=@(Get-Process -Name claude -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id);$c=@(Get-NetTCPConnection -State Established | Where-Object {$p -contains $_.OwningProcess} | Select-Object OwningProcess,LocalAddress,LocalPort,RemoteAddress,RemotePort);[pscustomobject]@{processCount=$p.Count;connections=$c} | ConvertTo-Json -Depth 5 -Compress");return JSON.parse(raw);
  }),safe(()=>this.clash.connections(timeout))]);
  const addresses=Object.values(os.networkInterfaces()).flat().filter(x=>x&&x.family==='IPv6'&&!x.internal&&!/^(fe[89ab]|f[cd]|::)/i.test(x.address)).map(x=>x.address);
- const claude=claudeRaw.error||connectionSnapshot.error?{status:'warn',detail:'Claude Code 连接未验证：'+(claudeRaw.error||connectionSnapshot.error)}:assessClaude(claudeRaw.connections||[],connectionSnapshot.connections||[],proxy.ip,expected);
+ const claudeError=claudeRaw.error||connectionSnapshot.error;
+ const claude=claudeError?{error:claudeError}:matchClaudeConnections(claudeRaw.connections||[],connectionSnapshot.connections||[]);
  let stable=false;try{stable=signature(await this.state(timeout))===signature(s)&&JSON.stringify(os.networkInterfaces())===interfacesBefore;}catch{}
- const result={time:new Date().toISOString(),expected,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
+ const result={time:new Date().toISOString(),expected,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,isolatedConfig,signature,providerNodes,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,isolatedConfig,signature,providerNodes,matchClaudeConnections,EXPECTED,ENTRY,EXIT,writeJSON,safeError};

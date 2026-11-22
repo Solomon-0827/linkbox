@@ -1,0 +1,31 @@
+{
+  "evidence": {
+    "expected": "::ffff:203.0.113.10",
+    "tun": {"ip": "::ffff:cb00:710a"},
+    "proxy": {"ip": "::ffff:cb00:710a"},
+    "http4": {"ip": "::ffff:cb00:710a"},
+    "browserClaude": {"ip": "203.0.113.10"},
+    "stunGoogle": {"ip": "203.0.113.10"},
+    "stunCloudflare": {"ip": "203.0.113.10"},
+    "ice": ["203.0.113.10"],
+    "macosIce": ["::ffff:cb00:710a"]
+  },
+  "expected": {
+    "shared": {
+      "tun": ["ok", "::ffff:cb00:710a"],
+      "proxy": ["ok", "::ffff:cb00:710a"],
+      "http4": ["ok", "::ffff:cb00:710a"],
+      "browserClaude": ["bad", "203.0.113.10"]
+    },
+    "macos": {
+      "stunGoogle": ["bad", "203.0.113.10"],
+      "stunCloudflare": ["bad", "203.0.113.10"],
+      "claude": ["ok", "1/1 条代理连接匹配美国静态家宽；0 条其他连接待核对。同一代理实测出口 ::ffff:203.0.113.10"],
+      "webrtc": ["ok", "公网候选只有预期美国出口 ::ffff:203.0.113.10"]
+    },
+    "windows": {"webrtc": ["bad", "203.0.113.10"]},
+    "headline": "发现出口不一致，请查看红色项目",
+    "counts": "7 项符合预期 / 4 项待核对",
+    "summary": "检测完成：发现出口不一致，请核对。"
+  }
+}

@@ -20,9 +20,13 @@ class ReportTests(unittest.TestCase):
             with opener.open(urls[0],timeout=3) as response:
                 page=response.read().decode();self.assertIn('下载报告',page);self.assertIn('URL.createObjectURL',page)
                 self.assertIn('<script src="ip-address.js"></script>', page)
+                self.assertIn('<script src="network-verdict.js"></script>', page)
             with opener.open(urls[0]+'ip-address.js',timeout=3) as response:
                 self.assertEqual(response.headers.get_content_type(), 'text/javascript')
                 self.assertIn(b'function sameIP(', response.read())
+            with opener.open(urls[0]+'network-verdict.js',timeout=3) as response:
+                self.assertEqual(response.headers.get_content_type(), 'text/javascript')
+                self.assertIn(b'function networkVerdict(', response.read())
             req=urllib.request.Request(urls[0]+'browser',data=b'{"test":true}',headers={'Content-Type':'application/json'})
             with opener.open(req,timeout=3):pass
             worker.join(5);self.assertFalse(worker.is_alive())

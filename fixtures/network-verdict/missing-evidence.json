@@ -1,0 +1,42 @@
+{
+  "evidence": {
+    "tun": {"error": "请求超时"},
+    "proxy": {},
+    "http4": {"error": "浏览器请求失败或跨域限制"},
+    "macosHttp4": {"error": "TypeError: Failed to fetch"},
+    "browserClaude": {"error": "请求超时"},
+    "macosBrowserClaude": {"error": "TimeoutError"},
+    "ice": [],
+    "iceError": "浏览器不支持",
+    "ipv6Addresses": [],
+    "ipv6Probes": [{}, {"connected": false}],
+    "claudeError": "连接记录请求超时",
+    "stunGoogle": {"error": "TimeoutError"},
+    "stunCloudflare": {},
+    "macosClashError": "Clash API HTTP 401"
+  },
+  "expected": {
+    "macos": {
+      "tun": ["warn", "未验证 · 请求超时"],
+      "proxy": ["warn", "未验证 · 无结果"],
+      "http4": ["warn", "未验证 · 浏览器请求失败"],
+      "browserClaude": ["warn", "未验证 · 请求超时"],
+      "stunGoogle": ["warn", "未验证 · 请求超时"],
+      "stunCloudflare": ["warn", "未验证 · 无结果"],
+      "clash": ["warn", "Clash API HTTP 401"],
+      "ipv6": ["warn", "IPv6 检查未完整取得结果，未验证"],
+      "claude": ["warn", "连接记录请求超时"],
+      "webrtc": ["warn", "未验证：没有公网 ICE 候选；浏览器不支持"]
+    },
+    "windows": {
+      "tun": ["warn", "请求超时"],
+      "proxy": ["warn", "未取得结果"],
+      "http4": ["warn", "浏览器请求失败或跨域限制"],
+      "browserClaude": ["warn", "请求超时"],
+      "ipv6": ["warn", "结果不完整，IPv6 未验证"],
+      "claude": ["warn", "Claude Code 连接未验证：连接记录请求超时"],
+      "webrtc": ["warn", "没有公网候选，未验证"]
+    },
+    "counts": "0 项符合预期 / 11 项待核对"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "platform": "macos",
+  "evidence": {"macosPending": true},
+  "expected": {
+    "macos": {
+      "nativePending": ["warn", "检测中…"],
+      "browserPending": ["warn", "检测中…"],
+      "tun": null,
+      "proxy": null,
+      "stunGoogle": null,
+      "stunCloudflare": null,
+      "clash": null,
+      "ipv6": null,
+      "claude": null,
+      "http4": null,
+      "browserClaude": null,
+      "webrtc": null,
+      "http6": null
+    },
+    "headline": "正在检测…",
+    "counts": "0 项符合预期 / 2 项待核对"
+  }
+}
