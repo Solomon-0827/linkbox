@@ -45,7 +45,8 @@ async function checkPackage(zip,zipRoot,stagedFiles){
   const asar=await import('@electron/asar');
   for(const file of new Set([...requiredAppEntries,...stagedFiles])){
    let entry;
-   try{entry=asar.statFile(archive,file);}
+   // @electron/asar resolves nested entries with native separators on Windows.
+   try{entry=asar.statFile(archive,file.split('/').join(path.sep));}
    catch{throw Error('Missing app.asar entry: '+file);}
    if(entry.unpacked||!('size' in entry))throw Error('Not packed as an app.asar file: '+file);
    if(requiredAppEntries.includes(file)&&!entry.size)throw Error('Empty required app.asar entry: '+file);
