@@ -8,7 +8,8 @@ const {EventEmitter} = require('node:events');
 const http = require('node:http');
 const vm = require('node:vm');
 const YAML = require('yaml');
-const {Backend, ClashHTTPError, ENTRY, EXIT} = require('../backend.cjs');
+const {Backend} = require('../backend.cjs');
+const {Clash, ClashHTTPError, ENTRY, EXIT} = require('../clash.cjs');
 const sub = require('../subscriptions.cjs');
 
 const node = (name, server = 'relay.example.invalid') => ({
@@ -39,7 +40,9 @@ async function fixture(t) {
  await write('profiles/b.yaml', {proxies: ['same','other'].map(n => node(n))});
  const b = await new Backend(data).init();
  b.settings.configDir = root;
- b.endpoint = {};
+ b.clash = new Clash(()=>b.settings, script=>b.powershell(script), {
+  endpoint: {}, transport: (...args)=>b.request(...args), validate: file=>b.validateConfig(file),
+ });
  await fs.writeFile(path.join(data, 'subscriptions.json'), JSON.stringify({
   sources: items.map(({uid, url}) => ({name: uid, url})),
  }));
@@ -105,6 +108,210 @@ async function fixture(t) {
   refreshWith: value => {refreshed = value;}, saved: async () => JSON.parse(await fs.readFile(policy, 'utf8'))};
 }
 
+async function windowsRoots(t, root) {
+ const app = 'io.github.clash-verge-rev.clash-verge-rev';
+ const appData = path.join(path.dirname(root), 'AppData');
+ const localAppData = path.join(path.dirname(root), 'LocalAppData');
+ const primary = path.join(appData, app), secondary = path.join(localAppData, app);
+ for (const directory of [primary, secondary]) await fs.cp(root, directory, {recursive: true});
+ const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+ Object.defineProperty(process, 'platform', {...platform, value: 'win32'});
+ t.after(() => Object.defineProperty(process, 'platform', platform));
+ const environment = {APPDATA: appData, LOCALAPPDATA: localAppData};
+ for (const [key, value] of Object.entries(environment)) {
+  const original = process.env[key];
+  process.env[key] = value;
+  t.after(() => {
+   if (original === undefined) delete process.env[key];
+   else process.env[key] = original;
+  });
+ }
+ return {primary, secondary};
+}
+
+for (const sync of [false, true]) test(`${sync ? 'Sync' : 'Save'} reconciles the original profiles after a concurrent refresh falls back`, async t => {
+ const {b, root, apply, state, requests, policy, refreshWith} = await fixture(t);
+ const {primary, secondary} = await windowsRoots(t, root);
+ b.settings.configDir = '';
+ b.history = {latestResults: {fast: {chainDelay: 10, owner: 'a'}}};
+ const otherProfiles = path.join(secondary, 'profiles.yaml');
+ const unrelated = YAML.stringify({current: 'b', items: [{uid: 'b', selected: [{name: ENTRY, now: 'unrelated'}]}]});
+ await fs.writeFile(otherProfiles, unrelated);
+ const controller = b.request;
+ b.request = async (...args) => {
+  const result = await controller(...args);
+  if (args[2] === '/configs?force=false') {
+   state.live = ['fast'];
+   await fs.rename(path.join(primary, 'clash-verge.yaml'), path.join(primary, 'inactive.yaml'));
+   const refresh = await Backend.prototype.state.call(b);
+   assert.equal(refresh.settings.configDir, secondary);
+  }
+  return result;
+ };
+ const selected = {a: ['current', 'fast'], b: []};
+ if (sync) {
+  await fs.writeFile(policy, JSON.stringify({selected_nodes: selected}));
+  refreshWith({a: ['current', 'fast'], b: ['same']});
+  await b.updateSubscriptions();
+ } else {
+  await apply(selected);
+ }
+ assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.equal(state.entry, 'fast');
+ const profiles = YAML.parse(await fs.readFile(path.join(primary, 'profiles.yaml'), 'utf8'));
+ assert.deepEqual(profiles.items[0].selected, [{name: ENTRY, now: 'fast'}]);
+ assert.equal(await fs.readFile(otherProfiles, 'utf8'), unrelated);
+});
+
+for (const operation of ['Sync', 'Save', 'First run']) test(`${operation} cancels if AppData becomes preferred before writing`, async t => {
+ const {b, root, data, request, requests, policy, refreshWith} = await fixture(t);
+ const {primary, secondary} = await windowsRoots(t, root);
+ const config = path.join(primary, 'clash-verge.yaml');
+ const originalConfig = await fs.readFile(config);
+ await fs.unlink(config);
+ b.settings.configDir = '';
+ b.state = Backend.prototype.state;
+ assert.equal((await b.state()).settings.configDir, secondary);
+ const selected = {a: ['fast'], b: []};
+ if (operation === 'Sync') await fs.writeFile(policy, JSON.stringify({selected_nodes: selected}));
+ const selection = operation === 'Save' ? await request(selected) : undefined;
+ refreshWith({a: ['fast', 'current'], b: ['same']});
+ const before = await fixtureFiles(data);
+ const restorePrimary = () => fs.writeFile(config, originalConfig);
+ if (operation === 'Save') {
+  const validate = b.validateConfig;
+  b.validateConfig = async file => { await validate(file); await restorePrimary(); };
+ } else {
+  const download = b.textRequest;
+  b.textRequest = async url => { await restorePrimary(); return download(url); };
+ }
+ const update = operation === 'Save' ? sub.run(b, selection) :
+  operation === 'First run' ? sub.initialize(b) : b.updateSubscriptions();
+ await assert.rejects(update, {message: '配置或节点已被其他操作改变，已取消更新'});
+ assert.deepEqual(await fixtureFiles(data), {...before, [config]: originalConfig});
+ assert.deepEqual(requests, []);
+});
+
+for (const kind of ['chain', 'entrance']) test(`${kind} benchmark probes the server updated during network detection`, async t => {
+ const {b, config, write, policy, setProviders} = await fixture(t);
+ const previous = 'before.example.invalid', updated = 'after.example.invalid';
+ config['proxy-providers'] = {a: {payload: [node('current', previous), node('fast')]}};
+ await write('clash-verge.yaml', config);
+ await fs.writeFile(policy, JSON.stringify({selected_nodes: {a: ['current']}}));
+ b.state = Backend.prototype.state;
+ b.clash.corePath = async () => 'fixture';
+ setProviders({});
+ b.network = async () => {
+  if (config['proxy-providers'].a.payload[0].server === previous) {
+   config['proxy-providers'].a.payload[0].server = updated;
+   await write('clash-verge.yaml', config);
+  }
+  return {name: 'fixture'};
+ };
+ const probed = [];
+ b.testNode = async relay => {
+  probed.push(relay.server);
+  return {delay: 100, status: 'done'};
+ };
+ const result = await b.benchmark(kind);
+ assert.deepEqual(probed, [updated]);
+ assert.equal(result.latestResults.current.delay, 100);
+});
+
+test('scheduled auto-switch skips when the preferred directory has different routing for the same names', async t => {
+ const {b, root, config, write, policy, state, requests} = await fixture(t);
+ config['proxy-providers'] = {a: {payload: [node('current'), node('fast', 'tested.example.invalid')]}};
+ await write('clash-verge.yaml', config);
+ const {primary, secondary} = await windowsRoots(t, root);
+ const primaryConfig = path.join(primary, 'clash-verge.yaml');
+ await fs.unlink(primaryConfig);
+ b.settings = {...b.settings, configDir: '', autoRelay: true, concurrency: 1};
+ await fs.writeFile(policy, JSON.stringify({selected_nodes: {a: ['current', 'fast']}}));
+ b.state = Backend.prototype.state;
+ assert.equal((await b.state()).settings.configDir, secondary);
+ b.clash.corePath = async () => 'fixture';
+ b.network = async () => ({name: 'fixture'});
+ b.testNode = async relay => {
+  if (relay.name === 'fast') {
+   assert.equal(relay.server, 'tested.example.invalid');
+   config['proxy-providers'].a.payload[1].server = 'different.example.invalid';
+   await fs.writeFile(primaryConfig, YAML.stringify(config));
+  }
+  return {delay: relay.name === 'current' ? 200 : 50, status: 'done'};
+ };
+ const result = await b.benchmark('chain', () => true);
+ assert.equal(result.reason, '');
+ assert.equal(result.latestResults.fast.chainDelay, 50);
+ assert.equal(result.switchedTo, undefined);
+ assert.equal(state.entry, 'current');
+ assert.deepEqual(requests, []);
+});
+
+for (const benchmark of [false, true]) test(
+ `${benchmark ? 'Benchmark setup' : 'Refresh'} keeps its entry plan on the directory passed to it`, async t => {
+  const {b, root, config, state, write, setProviders} = await fixture(t);
+  config['proxy-groups'][0] = {name: ENTRY, type: 'select', use: ['a', 'b']};
+  config['proxy-providers'] = {a: {path: 'a.yaml'}, b: {path: 'b.yaml'}};
+  await write('clash-verge.yaml', config);
+  await write('a.yaml', {proxies: [node('current')]});
+  await write('b.yaml', {proxies: [{...node('fast', 'primary.example.invalid'), type: 'trojan'}]});
+  const {primary, secondary} = await windowsRoots(t, root);
+  await fs.writeFile(path.join(secondary, 'b.yaml'), YAML.stringify({proxies: [node('fast', 'secondary.example.invalid')]}));
+  b.settings.configDir = '';
+  state.live = ['current', 'fast'];
+  setProviders({});
+  b.state = Backend.prototype.state;
+  b.clash.corePath = async () => 'fixture';
+  let pendingFallback = !benchmark, fellBack = false;
+  b.network = async () => {
+   pendingFallback = !fellBack;
+   return {name: 'fixture'};
+  };
+  const configFile = path.join(primary, 'clash-verge.yaml');
+  const readFile = fs.readFile;
+  t.mock.method(fs, 'readFile', async (file, ...args) => {
+   if (pendingFallback && file === path.join(primary, 'a.yaml')) {
+    pendingFallback = false;
+    fellBack = true;
+    await fs.rename(configFile, configFile + '.inactive');
+    try {
+     assert.equal((await b.state()).settings.configDir, secondary);
+    } finally {
+     await fs.rename(configFile + '.inactive', configFile);
+    }
+   }
+   return readFile(file, ...args);
+  });
+  if (benchmark) {
+   const probes = new Map();
+   b.testNode = async relay => {
+    probes.set(relay.name, relay.server);
+    return {delay: 100, status: 'done'};
+   };
+   await b.benchmark('entrance');
+   assert.equal(probes.get('fast'), 'primary.example.invalid');
+  } else {
+   const snapshot = await b.state();
+   assert.equal(snapshot.nodes.find(relay => relay.name === 'fast').type, 'trojan');
+   assert.equal(snapshot.settings.configDir, secondary);
+  }
+  assert.ok(fellBack);
+});
+
+test('validation directory permission errors reach sync and Save before reload', async t => {
+ const {b, root, apply, refreshWith, requests} = await fixture(t);
+ refreshWith({a: ['fast'], b: ['same']});
+ const denied = Object.assign(Error("EACCES: permission denied, mkdtemp 'linkbox-validate-XXXXXX'"), {code: 'EACCES'});
+ const mkdtemp = fs.mkdtemp;
+ t.mock.method(fs, 'mkdtemp', async prefix => {
+  if (prefix === path.join(root, 'linkbox-validate-')) throw denied;
+  return mkdtemp(prefix);
+ });
+ await assert.rejects(b.updateSubscriptions(), {code: denied.code, message: denied.message});
+ await assert.rejects(apply({a: ['fast'], b: []}), {code: denied.code, message: denied.message});
+ assert.deepEqual(requests, []);
+});
+
 for (const flag of ['include-all-providers', 'include-all-proxies', 'include-all']) {
  test(`switches an unmanaged ENTRY using ${flag}`, async t => {
   const {b, config, state, write} = await fixture(t);
@@ -154,7 +361,7 @@ test('unmanaged ENTRY uses live relays with a native HTTP provider', async t => 
  await t.test('benchmarks available live relay credentials', async () => {
   const probes = [];
   b.network = async () => ({name:'fixture'});
-  b.corePath = async () => 'fixture';
+  b.clash.corePath = async () => 'fixture';
   b.testNode = async node => {probes.push(node.name);return {delay:100,status:'done'};};
   const {results} = await b.benchmark();
   assert.deepEqual(probes.sort(), ['current','fast']);
@@ -185,7 +392,7 @@ test('saved selection controls relays with a reused inline provider', async t =>
  });
  const probes = [];
  b.network = async () => ({name:'fixture'});
- b.corePath = async () => 'fixture';
+ b.clash.corePath = async () => 'fixture';
  b.testNode = async ({name}) => {
   probes.push(name);
   return {delay:name === 'fast' ? 10 : 100, status:'done'};
@@ -262,8 +469,11 @@ test('same-name owner move with connection refused rolls back', async t => {
   });
   return request;
  });
- const controller = b.request;
- b.request = (...args) => args[2] === '/configs?force=false' ? Backend.prototype.request.call(b,...args) : controller(...args);
+ const relayState = b.clash.relayState.bind(b.clash);
+ b.clash = new Clash(()=>b.settings, script=>b.powershell(script), {
+  endpoint: {}, validate: file=>b.validateConfig(file),
+ });
+ b.clash.relayState = relayState;
  for (code of ['ECONNREFUSED','ENOENT','ENOTFOUND','ETIMEDOUT']) {
   await assert.rejects(apply({a:[], b:['current','fast']}), /未发送重载请求.*文件已回退/);
   assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))), before);
@@ -277,7 +487,7 @@ test('same-name owner move with connection refused rolls back', async t => {
 test('saving another subscription keeps unreadable cache selection and provider', async t => {
  const {b, root, write, apply, saved, refreshWith} = await fixture(t);
  await apply({a:['current','fast'], b:['same','other']});
- const before = (await b.config())['proxy-providers'].b;
+ const before = (await b.clash.config()).config['proxy-providers'].b;
  await write('profiles/a.yaml', {proxies:['current','fast','same'].map(n => node(n))});
  await fs.writeFile(path.join(root, 'profiles/b.yaml'), 'proxies: [');
  const {sources:[, unreadable]} = await sub.catalog(b);
@@ -286,13 +496,13 @@ test('saving another subscription keeps unreadable cache selection and provider'
  assert.deepEqual((await saved()).selected_nodes, {a:['current','fast'], b:['same','other']});
  await sub.remove(b, {entry:'current', names:['fast']});
  assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['same','other']});
- assert.deepEqual((await b.config())['proxy-providers'].b, before);
+ assert.deepEqual((await b.clash.config()).config['proxy-providers'].b, before);
  assert.match(unreadable.warning, /保留原勾选/);
  refreshWith({a:['fast']});
  const original = await saved();
  await assert.rejects(b.updateSubscriptions(), /下载/);
  assert.deepEqual(await saved(), original);
- assert.deepEqual((await b.config())['proxy-providers'].b, before);
+ assert.deepEqual((await b.clash.config()).config['proxy-providers'].b, before);
 });
 
 test('catalog exposes both copies and selects exactly one owner', async t => {
@@ -566,7 +776,7 @@ for (const reference of ['selector', 'include-all-proxies', 'MATCH,current', 'DO
   };
   for (let save = 0; save < 2; save++) {
    await apply({a:['fast'], b:[]});
-   assert.deepEqual((await b.config()).proxies.find(n => n.name === 'current'), node('current'));
+   assert.deepEqual((await b.clash.config()).config.proxies.find(n => n.name === 'current'), node('current'));
    const script = await fs.readFile(path.join(root, 'profiles/Script.js'), 'utf8');
    const profile = {...structuredClone(config), proxies:config.proxies.slice(1)};
    const regenerated = JSON.parse(vm.runInNewContext(script + '\nJSON.stringify(main(profile))', {profile}));
@@ -674,7 +884,7 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
  test('other group retains a deselected provider through ' + Object.keys(reference)[0], async t => {
   const {b, root, write, apply, requests} = await fixture(t);
   await apply({a:['current'],b:['other']});
-  const config = await b.config(), previous = config['proxy-providers'].b;
+  const {config} = await b.clash.config(), previous = config['proxy-providers'].b;
   config['proxy-groups'].push({name:'secondary',type:'select',...reference,filter:'^other$'});
   await write('clash-verge.yaml', config);
   if (process.env.LINKBOX_TEST_CORE) b.validateConfig = file => {
@@ -684,7 +894,7 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
   const live = YAML.parse(requests.at(-1).body.payload);
   assert.deepEqual(live['proxy-groups'][0].use, ['a']);
   assert.equal(live['proxy-providers'].b.filter, '^other$');
-  assert.deepEqual((await b.config())['proxy-providers'].b, previous);
+  assert.deepEqual((await b.clash.config()).config['proxy-providers'].b, previous);
   const script = await fs.readFile(path.join(root,'profiles/Script.js'),'utf8');
   const context = require('node:vm').createContext({input:{'proxy-groups':config['proxy-groups']}});
   assert.deepEqual(JSON.parse(require('node:vm').runInContext(script + "\nJSON.stringify(main(input))", context))['proxy-providers'].b, previous);
@@ -716,6 +926,49 @@ test('validation failure and external state change cancel before any reload', as
  assert.deepEqual(await fs.readFile(file), original);
 });
 
+test('Sync does not rediscover the controller when a settings save finishes after the final guard', async t => {
+ const {b, root, data, config, requests, refreshWith} = await fixture(t);
+ const nextRoot = path.join(root, 'other-verge');
+ await fs.mkdir(nextRoot);
+ await fs.writeFile(path.join(nextRoot, 'clash-verge.yaml'), YAML.stringify({
+  ...config, 'external-controller': 'localhost:19091',
+ }));
+ refreshWith({a: ['current', 'fast', 'new'], b: ['other']});
+ const discover = [];
+ const request = b.request;
+ b.request = async (endpoint, method, route, body) => {
+  if (route === '/version') { discover.push(endpoint); return {}; }
+  return request(endpoint, method, route, body);
+ };
+ const rename = fs.rename;
+ const entered = Promise.withResolvers();
+ const resume = Promise.withResolvers();
+ let save;
+ t.mock.method(fs, 'rename', async (from, to) => {
+  if (to === path.join(data, 'settings.json')) {
+   entered.resolve();
+   await resume.promise;
+  }
+  if (to === path.join(root, 'clash-verge.yaml')) {
+   resume.resolve();
+   await save;
+  }
+  return rename(from, to);
+ });
+ save = b.saveSettings({configDir: nextRoot});
+ await entered.promise;
+ try {
+  await assert.rejects(sub.run(b), {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
+ } finally {
+  resume.resolve();
+  await save;
+ }
+ assert.equal(b.settings.configDir, nextRoot);
+ assert.deepEqual(discover, []);
+ assert.deepEqual(requests, []);
+ assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /name: new/);
+});
+
 test('successful reload reports an external change between selected entries', async t => {
  const {b, apply, state, requests, saved} = await fixture(t);
  const controller = b.request;
@@ -744,6 +997,28 @@ test('explicit reload rejection restores the files even when readback is unavail
  await assert.rejects(fs.access(path.join(root,'profiles/Script.js')));
  await assert.rejects(fs.access(policy));
  assert.equal(b.busy, false);
+});
+
+test('unsent reload rolls back Sync and reports no request', async t => {
+ const {b, root, data, requests, refreshWith} = await fixture(t);
+ const before = await fixtureFiles(data);
+ refreshWith({a: ['current', 'fast', 'new'], b: ['other']});
+ const controller = b.request;
+ for (const code of ['ENETUNREACH', 'ECONNREFUSED', 'ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH']) {
+  b.request = async (...args) => {
+   if (args[2] === '/configs?force=false') {
+    assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /name: new/);
+    throw Object.assign(Error('connection failed'), {code});
+   }
+   return controller(...args);
+  };
+  await assert.rejects(b.updateSubscriptions(),
+   {message: '无法连接 Clash 控制接口，未发送重载请求，文件已回退；请刷新状态后重试'}, code);
+  const files = Object.entries(await fixtureFiles(data))
+   .filter(([file]) => !file.startsWith(path.join(data, 'backups') + path.sep));
+  assert.deepEqual(Object.fromEntries(files), before, code);
+  assert.deepEqual(requests, []);
+ }
 });
 
 test('remove applies the same selection and refuses the current, stale or unknown entries', async t => {
@@ -784,6 +1059,36 @@ test('deleted subscriptions disappear from picker and a rotation retains the sta
   sub.sourceKey('https://b.invalid/client/'+'a'.repeat(24)));
 });
 
+test('discovery validates duplicate sources before skipping their profile path joins', async t => {
+ const {b, root, items, write} = await fixture(t);
+ const duplicate = {...items[0], uid: 'duplicate', file: 'duplicate.yaml'};
+ await write('profiles.yaml', {items: [items[0], duplicate]});
+ const joins = [];
+ const join = path.join;
+ t.mock.method(path, 'join', (...parts) => {
+  if (parts[0] === root && parts[1] === 'profiles') joins.push(parts[2]);
+  return join(...parts);
+ });
+ assert.deepEqual((await sub.catalog(b)).sources.map(s => s.name), ['A']);
+ assert.deepEqual(joins, ['a.yaml']);
+
+ await write('profiles.yaml', {items: [items[0], {...duplicate, file: '../outside.yaml'}]});
+ await assert.rejects(b.updateSubscriptions(), {message: 'Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点'});
+});
+
+test('redirected reload reports HTTP status and keeps the new files', async t => {
+ const {b, root, apply, saved} = await fixture(t);
+ const file = path.join(root, 'clash-verge.yaml'), original = await fs.readFile(file);
+ const controller = b.request;
+ b.request = async (...args) => {
+  if (args[2] === '/configs?force=false') throw new ClashHTTPError(302);
+  return controller(...args);
+ };
+ await assert.rejects(apply({a:['fast'], b:[]}), {message: 'Clash 控制接口返回 302。已写入新配置，Clash 未确认，请刷新状态核对'});
+ assert.notDeepEqual(await fs.readFile(file), original);
+ assert.deepEqual((await saved()).selected_nodes, {a:['fast']});
+});
+
 test('lost reload response keeps new files even with unchanged group membership', async t => {
  const {b, root, state, apply, refreshWith, requests, saved} = await fixture(t);
  await apply({a:['current','fast'],b:[]});
@@ -817,7 +1122,7 @@ test('lost Save response keeps the new owner and allows a fresh update', async t
  await assert.rejects(apply({a:[],b:['fast','other']}), /已写入新配置，Clash 未确认，请刷新状态核对/);
  assert.deepEqual(requests.map(r => r.route), ['/configs?force=false']);
  assert.deepEqual(await saved(), {selected_nodes:{b:['fast','other']},provider_labels:{a:'A',b:'B'}});
- assert.deepEqual((await b.config())['proxy-groups'][0].use, ['b']);
+ assert.deepEqual((await b.clash.config()).config['proxy-groups'][0].use, ['b']);
  assert.equal(state.entry, 'current');
  assert.equal(b.busy, false);
 
@@ -875,7 +1180,7 @@ for (const kind of ['chain', 'entrance']) test(`an interrupted ${kind} benchmark
  };
  b.network = async () => ({interface:'fixture'});
  b.loadNodes = async () => ({nodes:new Map([['current',node('current')]]),exit:node(EXIT)});
- b.corePath = async () => '/mock';
+ b.clash.corePath = async () => '/mock';
  b.testNode = async () => { probed = true; return {status:'done',delay:120}; };
  await assert.rejects(b.benchmark(kind), /controller read failed/);
  assert.equal(probed, true);
@@ -911,7 +1216,7 @@ test('missing relay cannot win reconciliation on an old benchmark delay', async 
   nodes:inputs.selection.a.map(name => ({name,providerId:'a'}))});
  b.loadNodes = async () => ({nodes:new Map([['fresh',node('fresh')]]),exit:node(EXIT)});
  b.network = async () => ({interface:'fixture'});
- b.corePath = async () => '/mock';
+ b.clash.corePath = async () => '/mock';
  b.testNode = async () => ({status:'done',delay:120,entranceDelay:50});
  const result = await b.benchmark();
  assert.equal(result.latestResults.stale.entranceDelay, null);

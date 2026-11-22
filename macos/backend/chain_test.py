@@ -16,13 +16,13 @@ import subprocess
 import tempfile
 import time
 import yaml
+import clash
+from clash import CONFIG_DIR
 import toolbox as t
 import runtime
 from settings import benchmark_value
 from reconcile import selection_owners
 
-CORE = '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo'
-CONFIG_DIR = runtime.CONFIG_DIR
 DNS_POLICY = {}
 TARGET = 'https://www.cloudflare.com/cdn-cgi/trace'
 
@@ -63,7 +63,7 @@ def load_nodes():
     from subscription_update import entry_plan
 
     global DNS_POLICY
-    conf = yaml.safe_load((CONFIG_DIR / 'clash-verge.yaml').read_text())
+    conf = clash.read_yaml(clash.config_file(CONFIG_DIR))
     DNS_POLICY = {k: v for k, v in conf.get('dns', {}).get('proxy-server-nameserver-policy', {}).items()
                   if not k.startswith(('geosite:', 'rule-set:'))}
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
@@ -78,7 +78,7 @@ def load_nodes():
             continue
         if provider.get('path'):
             try:
-                data = yaml.safe_load((CONFIG_DIR / provider['path']).read_text())
+                data = clash.read_yaml(clash.provider_file(CONFIG_DIR, provider['path']))
             except (OSError, ValueError, yaml.YAMLError):
                 continue
             proxies = data.get('proxies') if isinstance(data, dict) else None
@@ -170,7 +170,7 @@ def test_node(node, exit_node, network, cancelled, expected):
         with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
         config=isolated_config(node,exit_node,port,network['interface'])
         path=folder/'config.yaml';path.write_text(yaml.safe_dump(config,allow_unicode=True));path.chmod(0o600)
-        p=subprocess.Popen([CORE,'-d',str(folder),'-f',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        p=subprocess.Popen([clash.CORE,'-d',str(folder),'-f',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
             ready=False
             for _ in range(40):

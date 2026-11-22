@@ -5,6 +5,7 @@ from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import yaml
+import clash
 import chain_test as c
 
 class SafetyTests(unittest.TestCase):
@@ -61,7 +62,7 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             c.isolated_config({'dialer-proxy':'other'},{},12345,'en9')
     def test_read_only_live_state(self):
-        with patch.object(c.t,'api',side_effect=lambda method,path: self.assertEqual(method,'GET') or {'proxies':{}}) as api:
+        with patch.object(clash,'_request',side_effect=lambda method,path,**_: self.assertEqual(method,'GET') or {'proxies':{}}) as api:
             c.active_state()
             self.assertGreater(api.call_count,0)
     def test_unknown_interface_refused(self):

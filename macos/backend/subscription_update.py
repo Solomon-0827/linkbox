@@ -1,22 +1,13 @@
 """Validate and apply a subscription reconciliation plan."""
-import copy,datetime,fcntl,json,os,re,subprocess,tempfile,urllib.request,urllib.parse
-from pathlib import Path
+import copy,datetime,json,os,re,urllib.request
 import yaml
 import runtime
 from reconcile import reconcile, selection_owners
 import toolbox as t
-import chain_test as c
+import clash
 
 MARK='// BEGIN LINKBOX MANAGED PROVIDERS'
 NOTICE=re.compile('剩余流量|重置剩余|套餐到期|官网续费|务必加Q群')
-def atomic(path,data):
-    path.parent.mkdir(parents=True,exist_ok=True)
-    fd,tmp=tempfile.mkstemp(prefix='.linkbox-',dir=path.parent)
-    try:
-        with os.fdopen(fd,'wb') as f:f.write(data)
-        os.replace(tmp,path)
-    finally:
-        if os.path.exists(tmp):os.unlink(tmp)
 def dump(value):return yaml.safe_dump(value,allow_unicode=True,sort_keys=False).encode()
 def compact(value):
     if isinstance(value,dict):return {k:compact(v) for k,v in value.items() if v is not None}
@@ -40,21 +31,10 @@ def fetch(url):
 
 NO_SELECTION = '订阅里已没有你勾选的节点，请先在管理节点里勾选'
 INVALID_CONFIG = '无法读取 Clash Verge 配置，未修改'
-VALIDATION_FAILED = '配置校验失败，未改动当前代理'
 EXTERNAL_CHANGE = '配置或节点已被其他操作改变，已取消更新'
 POST_RELOAD_CHANGE = '更新后检测到外部链路或节点变化，请刷新并核对 Clash'
-RELOAD_UNCERTAIN = '已写入新配置，Clash 未确认，请刷新状态核对'
-RELOAD_NOT_SENT = '无法连接 Clash 控制接口，未发送重载请求'
 SWITCH_FAILED = '配置已更新，但无法切换中转入口，请刷新并核对 Clash'
-ENTRY_ROUTE = '/proxies/' + urllib.parse.quote(t.ENTRY, safe='')
 CHAIN_KEYS = ('mode', 'tun', 'exit', 'dialer')
-
-
-def read(path):
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        return None
 
 
 def name_filter(definition):
@@ -82,7 +62,7 @@ def entry_seed_owners(config, sources):
     if not use:
         return {}
     try:
-        response = t.api('GET', '/providers/proxies')
+        response = clash.providers()
     except Exception:
         return {}
     providers = config.get('proxy-providers') or {}
@@ -154,22 +134,6 @@ def script_text(original, managed):
             '};\n').encode()
 
 
-def update_selector(index, name):
-    profile = next((item for item in index.get('items', [])
-                    if index.get('current') and item.get('uid') == index['current']), None)
-    if profile is None:
-        return False
-    choices = profile.setdefault('selected', [])
-    choice = next((item for item in choices if item.get('name') == t.ENTRY), None)
-    if choice is None:
-        choices.append({'name': t.ENTRY, 'now': name})
-    elif choice.get('now') != name:
-        choice['now'] = name
-    else:
-        return False
-    return True
-
-
 def legacy_pin(original, config, saved_name):
     if not original or MARK.encode() not in original:
         return None
@@ -212,7 +176,7 @@ def select_after_reload(before, selected, desired):
             if after['entry'] == desired:
                 return desired
             try:
-                t.api('PUT', ENTRY_ROUTE, {'name': desired})
+                clash.switch_entry(desired)
             except Exception:
                 pass  # The switch may have applied before the response was lost.
         after = observe()
@@ -244,13 +208,13 @@ def benchmark_results():
 
 def managed_cache(root, owner, definition):
     source = definition.get('path')
-    return bool(source) and (root / source).resolve() == (root / 'providers/linkbox' / (owner + '.yaml')).resolve()
+    return bool(source) and clash.provider_file(root, source).resolve() == clash.managed_cache_file(root, owner).resolve()
 
 
 def provider_payload(definition, root, read_cache, *, filtered):
     payload = definition.get('payload')
     if source := definition.get('path'):
-        data = yaml.safe_load(read_cache(root / source) or b'')
+        data = yaml.safe_load(read_cache(clash.provider_file(root, source)) or b'')
         payload = data.get('proxies') if isinstance(data, dict) else None
     if not isinstance(payload, list):
         raise RuntimeError('代理缓存不完整，未修改')
@@ -275,7 +239,7 @@ def entry_plan(config, root):
         use = sorted(providers) if include_all or entry.get('include-all-providers') else entry.get('use') or []
         for owner in use:
             try:
-                payload = provider_payload(providers[owner], root, read, filtered=True)
+                payload = provider_payload(providers[owner], root, clash.read_file, filtered=True)
             except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError, re.error, yaml.YAMLError):
                 continue
             for node in payload:
@@ -295,7 +259,7 @@ def reload_payload(config, root, updates, baselines):
 
     def read_cache(path):
         if path not in updates and path not in baselines:
-            baselines[path] = read(path)
+            baselines[path] = clash.read_file(path)
         return updates.get(path, baselines.get(path))
 
     for owner, definition in live['proxy-providers'].items():
@@ -312,32 +276,10 @@ def reload_payload(config, root, updates, baselines):
     return dump(live), members
 
 
-def persist_entry(profiles, entry):
-    original = profiles.read_bytes()
-    index = yaml.safe_load(original)
-    if update_selector(index, entry):
-        if read(profiles) != original:
-            raise RuntimeError(EXTERNAL_CHANGE)
-        atomic(profiles, dump(index))
-
-
-def rollback(written, originals):
-    for path in reversed(written):
-        data = originals[path]
-        if data is None:
-            path.unlink(missing_ok=True)
-        else:
-            atomic(path, data)
-
-
 def run(metric='chain', *, request=None, removal=None, initialize=False):
     import subscription_picker as picker
     os.umask(0o077)
-    with open(t.BASE / 'latency.lock', 'a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError('已有测速或订阅更新正在运行') from None
+    with t.switch_lock():
         policy = runtime.read_json('node-policy.json')
         policy_file = runtime.BASE / 'node-policy.json'
         selection = policy.get('selected_nodes')
@@ -345,11 +287,11 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             return False
         before = t.relay_state()
         check_chain(before)
-        root = runtime.CONFIG_DIR
+        root = clash.CONFIG_DIR
         syncing = request is None and removal is None
         preview_file = runtime.BASE / picker.PREVIEW
-        config_file, script, profiles = root / 'clash-verge.yaml', root / 'profiles/Script.js', root / 'profiles.yaml'
-        baselines = {path: read(path) for path in (config_file, script, profiles, policy_file)}
+        config_file, script, profiles = clash.config_file(root), clash.script_file(root), clash.profiles_file(root)
+        baselines = {path: clash.read_file(path) for path in (config_file, script, profiles, policy_file)}
         sources, fingerprint, preview_profiles = picker.discover(for_update=syncing)
         if request is not None:
             selection = picker.validate_selection(sources, fingerprint, request, selection)
@@ -387,7 +329,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
             if t.relay_state() != before or picker.discover(for_update=True)[1] != fingerprint:
                 raise RuntimeError(EXTERNAL_CHANGE)
         if downloaded_profiles:
-            updates.update({root / 'profiles' / source['profile_file']: dump(downloaded_profiles[source['name']])
+            updates.update({clash.profile_file(root, source['profile_file']): dump(downloaded_profiles[source['name']])
                             for source, _ in sources if source['name'] in downloaded_profiles})
         try:
             config = yaml.safe_load(baselines[config_file] or b'')
@@ -406,7 +348,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         if not plan['candidates']:
             if syncing:
                 preview_data = {'revision': fingerprint, 'profiles': downloaded_profiles}
-                atomic(preview_file, dump(preview_data))
+                clash.write_file(preview_file, dump(preview_data))
             raise RuntimeError(NO_SELECTION)
 
         pin = legacy_pin(baselines[script], config, policy.get('pinned_entry'))
@@ -425,7 +367,7 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
                 continue
             if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}', owner):
                 raise RuntimeError('订阅标识需使用字母、数字或短横线')
-            cache = root / 'providers/linkbox' / (owner + '.yaml')
+            cache = clash.managed_cache_file(root, owner)
             updates[cache] = dump(doc)
             # Mihomo separates filter expressions at literal backticks.
             escaped = [re.sub(r'([.*+?^${}()|\[\]\\])', r'\\\1', name).replace('`', r'\x60') for name in keep]
@@ -453,55 +395,45 @@ def run(metric='chain', *, request=None, removal=None, initialize=False):
         selected_names = selection_owners(selected)
         planned_entry = before['entry'] if before['entry'] in selected_names else desired
         index = yaml.safe_load(baselines[profiles])
-        if update_selector(index, planned_entry):
+        if clash.update_selector(index, planned_entry):
             updates[profiles] = dump(index)
         saved = {'selected_nodes': plan['selection'], 'provider_labels': labels}
         updates[runtime.BASE / 'subscriptions.json'] = json.dumps({'sources': registry}, ensure_ascii=False, indent=2).encode()
         updates[policy_file] = json.dumps(saved, ensure_ascii=False, indent=2).encode()
-        originals = {path: baselines[path] if path in baselines else read(path) for path in updates}
+        originals = {path: baselines[path] if path in baselines else clash.read_file(path) for path in updates}
 
-        try:
-            with tempfile.TemporaryDirectory(prefix='linkbox-update-', dir=root) as folder:
-                file = Path(folder) / 'config.yaml'
-                file.write_bytes(payload)
-                subprocess.run([c.CORE, '-t', '-d', str(root), '-f', str(file)],
-                               capture_output=True, timeout=30, check=True)
-        except (OSError, subprocess.SubprocessError):
-            raise RuntimeError(VALIDATION_FAILED) from None
-        if picker.discover(for_update=syncing)[1] != fingerprint:
-            raise RuntimeError(EXTERNAL_CHANGE)
-        if t.relay_state() != before or any(read(p) != raw for p, raw in (originals | baselines).items()):
-            raise RuntimeError(EXTERNAL_CHANGE)
-
-        changes = {path: data for path, data in updates.items() if data != originals[path]}
-        # Keep obsolete policy data only in memory for rollback during this update.
-        backup_files = [path for path in changes if originals[path] is not None
-                        and (path != policy_file or policy.keys() <= saved.keys())]
-        if backup_files:
-            backup = runtime.BASE / 'backups' / ('update-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
-            backup.mkdir(parents=True)
-            for i, path in enumerate(backup_files):
-                (backup / (str(i) + '-' + path.name)).write_bytes(originals[path])
         written = []
-        try:
-            for path, data in changes.items():
-                atomic(path, data)
-                written.append(path)
-        except Exception:
-            rollback(written, originals)
-            raise
-        try:
-            t.api('PUT', '/configs?force=false', {'payload': payload.decode()})
-        except Exception as error:
-            unsent = t.request_not_sent(error)
-            if unsent or (isinstance(error, t.ClashHTTPError) and error.rejected):
-                rollback(written, originals)
-                message = RELOAD_NOT_SENT if unsent else str(error)
-                raise RuntimeError(message + '，文件已回退；请刷新状态后重试') from None
-            raise RuntimeError(RELOAD_UNCERTAIN) from None
+
+        def rollback():
+            clash.restore_files(written, originals)
+
+        def prepare():
+            if picker.discover(for_update=syncing)[1] != fingerprint:
+                raise RuntimeError(EXTERNAL_CHANGE)
+            if t.relay_state() != before or any(clash.read_file(p) != raw for p, raw in (originals | baselines).items()):
+                raise RuntimeError(EXTERNAL_CHANGE)
+
+            changes = {path: data for path, data in updates.items() if data != originals[path]}
+            # Keep obsolete policy data only in memory for rollback during this update.
+            backup_files = [path for path in changes if originals[path] is not None
+                            and (path != policy_file or policy.keys() <= saved.keys())]
+            if backup_files:
+                backup = runtime.BASE / 'backups' / ('update-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+                backup.mkdir(parents=True)
+                for i, path in enumerate(backup_files):
+                    (backup / (str(i) + '-' + path.name)).write_bytes(originals[path])
+            try:
+                for path, data in changes.items():
+                    clash.write_file(path, data)
+                    written.append(path)
+            except Exception:
+                rollback()
+                raise
+
+        clash.reload(root, payload, prepare, rollback)
         entry = select_after_reload(before, selected_names, desired)
         if entry != planned_entry:
-            persist_entry(profiles, entry)
+            clash.persist_selection(profiles, entry)
         if initialize:
             return True
         message = '已同步 Clash Verge 订阅。' if syncing else '已保存节点选择。'

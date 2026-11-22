@@ -2,7 +2,6 @@
 """Read-only network diagnostics. No proxy changes, signals, authenticated requests, or process restarts."""
 import concurrent.futures as cf
 import datetime as dt
-import http.client
 import ipaddress
 import json
 import os
@@ -18,28 +17,12 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import clash
 import runtime
 BASE = runtime.BASE/'proxy-self-check'
 ASSETS = Path(__file__).resolve().parent
 IP_COMPARISON = (ASSETS if getattr(sys, 'frozen', False) else ASSETS.parents[1] / 'windows') / 'ip-address.js'
 EXPECTED = runtime.expected_ip()
-SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
-
-def core(path):
-    class Connection(http.client.HTTPConnection):
-        def connect(self):
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(4)
-            self.sock.connect(SOCKET)
-    c = Connection('localhost', timeout=4)
-    try:
-        c.request('GET', path)
-        r = c.getresponse()
-        if r.status != 200:
-            raise RuntimeError('Clash API HTTP ' + str(r.status))
-        return json.loads(r.read())
-    finally:
-        c.close()
 
 def safe(fn):
     try:
@@ -91,8 +74,8 @@ def run(command):
     return subprocess.run(command, capture_output=True, text=True, timeout=8).stdout
 
 def local_state():
-    conf, proxies = core('/configs'), core('/proxies')['proxies']
-    selected = {n: {k: proxies.get(n, {}).get(k) for k in ('now', 'dialer-proxy', 'type')} for n in ('GLOBAL', '中转入口', '美国静态家宽')}
+    conf, proxies = clash.state(timeout=4, expected_status=200)
+    selected = {n: {k: proxies.get(n, {}).get(k) for k in ('now', 'dialer-proxy', 'type')} for n in ('GLOBAL', clash.ENTRY, clash.EXIT)}
     return {'mode': conf.get('mode'), 'tun': conf.get('tun', {}).get('enable'), 'ipv6': conf.get('ipv6'), 'groups': selected}
 
 def claude_connections():
@@ -104,7 +87,7 @@ def claude_connections():
     if not pids:
         return {'process_count': 0, 'matched': [], 'other_sockets': [], 'note': '未发现 Claude Code 进程，未验证'}
     lines = run(['/usr/sbin/lsof', '-nP', '-a', '-p', ','.join(pids), '-i'])
-    connections = core('/connections').get('connections', [])
+    connections = clash.connections(timeout=4, expected_status=200).get('connections', [])
     byport = {}
     for x in connections:
         m = x.get('metadata', {})

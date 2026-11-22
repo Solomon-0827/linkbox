@@ -6,10 +6,16 @@ import time
 import unittest
 from unittest.mock import patch
 import yaml
+import clash
 import chain_test as c
 import gui_backend as g
 
 class ParallelTests(unittest.TestCase):
+    def setUp(self):
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(g.t, 'BASE', base))
+        self.enterContext(patch.object(g.runtime, 'BASE', base))
+
     def exercise(self, mode, concurrency=5):
         names=[str(i) for i in range(8)]
         state={'mode':'global','exit':c.t.EXIT,'dialer':c.t.ENTRY}
@@ -60,8 +66,8 @@ class ParallelTests(unittest.TestCase):
             (cache / 'a.yaml').write_text('proxies: [{name: healthy, server: example.invalid}]')
             (cache / 'b.yaml').write_text('proxies: [')
             with (patch.object(c.t, 'BASE', base), patch.object(c.runtime, 'BASE', base),
-                  patch.object(c.runtime, 'CONFIG_DIR', base),
-                  patch.object(c, 'CONFIG_DIR', base), patch.object(c.t, 'relay_state', return_value=state),
+                  patch.object(c, 'CONFIG_DIR', base),
+                  patch.object(c.t, 'relay_state', return_value=state),
                   patch.object(c, 'physical_network', return_value={'interface': 'en0'}),
                   patch.object(c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe):
                 for selection in ({'a': ['healthy']}, {'a': ['healthy'], 'b': ['broken']}):
@@ -96,7 +102,7 @@ class ParallelTests(unittest.TestCase):
         network={'interface':'en0'}
         guard={'network':network,'before':state,'routing_fingerprint':c.routing_fingerprint(original,exit_node,'203.0.113.10',c.DNS_POLICY,'a','b')}
         for fresh,physical in [(original,{'interface':'en1'}),({**original,'b':{'server':'new.invalid'}},network)]:
-            with patch.object(g,'snapshot',return_value=state),patch.object(g.t,'switch_owners',return_value={'a': 'a', 'b': 'a'}),patch.object(c,'load_nodes',return_value=(fresh,exit_node,'203.0.113.10')),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(g.t,'api') as api:
+            with patch.object(g,'snapshot',return_value=state),patch.object(g.t,'switch_owners',return_value={'a': 'a', 'b': 'a'}),patch.object(c,'load_nodes',return_value=(fresh,exit_node,'203.0.113.10')),patch.object(c,'physical_network',return_value=physical),patch.object(c,'active_state',return_value=(state,state['nodes'])),patch.object(clash,'_request') as api:
                 with self.assertRaisesRegex(RuntimeError,'未自动切换'):
                     g.change('b','a',guard)
                 api.assert_not_called()
@@ -126,7 +132,7 @@ class ParallelTests(unittest.TestCase):
                         active['live'] = ['current', 'external']
                     writes = []
 
-                    def api(method, route, payload=None):
+                    def api(method, route, payload=None, **_):
                         self.assertEqual(method, 'PUT')
                         writes.append(payload['name'])
                         active.update(entry=payload['name'], live=['current', 'external'])
@@ -135,10 +141,10 @@ class ParallelTests(unittest.TestCase):
                           patch.object(c, 'load_nodes', return_value=(nodes, exit_node, '203.0.113.10')),
                           patch.object(c, 'physical_network', return_value=network),
                           patch.object(c, 'active_state', return_value=(state, state['nodes'])),
-                          patch.object(g.runtime, 'CONFIG_DIR', base),
+                          patch.object(clash, 'CONFIG_DIR', base),
                           patch.object(g.runtime, 'read_json', return_value=selection),
-                          patch.object(g.t, 'api', side_effect=api),
-                          patch.object(g.t, 'persist_selection') as persist):
+                          patch.object(clash, '_request', side_effect=api),
+                          patch.object(clash, 'persist_selection') as persist):
                         with self.assertRaisesRegex(RuntimeError, '待核对' if changed_after_put else '节点状态已变化'):
                             g.change('same', 'current', mode)
                         persist.assert_not_called()
@@ -147,13 +153,13 @@ class ParallelTests(unittest.TestCase):
     def test_entrance_parallel(self):
         active=0;peak=0;lock=threading.Lock();gate=threading.Barrier(5)
         state={'nodes':list('abcdefghij')}
-        def api(*args):
+        def api(*args, **_):
             nonlocal active,peak
             with lock:active+=1;peak=max(peak,active)
             try:gate.wait(timeout=3);time.sleep(.02);return {'delay':42}
             finally:
                 with lock:active-=1
-        with tempfile.TemporaryDirectory() as tmp,patch.object(g.t,'BASE',Path(tmp)),patch.object(g,'snapshot',return_value=state),patch.object(g.t,'state',return_value=({},{})),patch.object(g.t,'node_inventory',return_value={}),patch.object(g.t,'api',side_effect=api):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(g.t,'BASE',Path(tmp)),patch.object(g,'snapshot',return_value=state),patch.object(g.t,'state',return_value=({},{})),patch.object(g.t,'node_inventory',return_value={}),patch.object(clash,'_request',side_effect=api):
             g.latency();g.latency() # the lock must be released for another run
             self.assertEqual(peak,5);self.assertEqual(active,0)
             self.assertEqual(len(json.loads((Path(tmp)/'latency-results.json').read_text())['results']),10)

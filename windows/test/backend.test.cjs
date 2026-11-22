@@ -1,6 +1,17 @@
-const test=require('node:test'),assert=require('node:assert/strict'),os=require('node:os'),path=require('node:path'),fs=require('node:fs/promises'),http=require('node:http');
+const test=require('node:test'),assert=require('node:assert/strict'),os=require('node:os'),path=require('node:path'),fs=require('node:fs/promises');
 const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED}=require('../backend.cjs');
+const {Clash, ENTRY, EXIT}=require('../clash.cjs');
 const ipComparison=require('../../fixtures/ip-comparison.json');
+function fakeBackend(folder, Constructor=Backend) {
+ const b=new Constructor(folder);
+ b.clash=new Clash(()=>b.settings,script=>b.powershell(script),{
+  endpoint:{}, transport:(_endpoint,...args)=>b.controller(...args),
+ });
+ return b;
+}
+function mockConfig(b, config = {proxies:[]}) {
+ b.clash.config = async () => ({root:b.dataDir, config});
+}
 test('Claude proxy exit checks compare parsed addresses',()=>{
  const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1'}];
  const connections=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽']}];
@@ -32,7 +43,7 @@ test('Windows chain benchmark compares parsed exit addresses',async t=>{
   },
  });
  vm.runInContext(await fs.readFile(require.resolve('../backend.cjs'),'utf8'),context);
- const b=new context.module.exports.Backend(folder);
+ const b=fakeBackend(folder, context.module.exports.Backend);
  b.freePort=async()=>12345;
  b.powershell=async()=>String(child.pid);
  for(const {name,expected,probe,matches} of ipComparison){
@@ -46,11 +57,11 @@ test('Windows chain benchmark compares parsed exit addresses',async t=>{
   await fs.writeFile(path.join(folder,'node-policy.json'),JSON.stringify({selected_nodes:{fixture:['relay']}}));
   await b.init();
   b.settings={expectedIP:EXPECTED};
-  b.config=async()=>({proxies:[{name:'美国静态家宽',server:EXPECTED,'dialer-proxy':'中转入口'}],
+  mockConfig(b, {proxies:[{name:'美国静态家宽',server:EXPECTED,'dialer-proxy':'中转入口'}],
    'proxy-providers':{fixture:{payload:[{name:'relay'}]}}});
-  b.relayState=async()=>({mode:'global',entry:'relay',exit:'美国静态家宽',dialer:'中转入口',live:['relay']});
-  b.api=async()=>({});
-  b.corePath=async()=>'mock.exe';
+  b.clash.relayState=async()=>({mode:'global',entry:'relay',exit:'美国静态家宽',dialer:'中转入口',live:['relay']});
+  b.controller=async()=>({});
+  b.clash.corePath=async()=>'mock.exe';
   const started=Promise.withResolvers(),ready=Promise.withResolvers();
   b.network=async()=>{started.resolve();return ready.promise;};
   b.textRequest=async()=>`ip=${EXPECTED}`;
@@ -76,10 +87,10 @@ test('saved Windows exit addresses load verbatim and survive a settings save', a
  const file=path.join(folder,'settings.json');
  for(const expectedIP of [ipComparison[1].expected,'example.invalid']){
   await fs.writeFile(file,JSON.stringify({expectedIP}));
-  const b=await new Backend(folder).init();
-  b.config=async()=>({proxies:[{name:'美国静态家宽',server:'203.0.113.10','dialer-proxy':'中转入口'}]});
-  b.relayState=async()=>({live:[]});
-  b.api=async()=>({});
+  const b=await fakeBackend(folder).init();
+  mockConfig(b, {proxies:[{name:'美国静态家宽',server:'203.0.113.10','dialer-proxy':'中转入口'}]});
+  b.clash.relayState=async()=>({live:[]});
+  b.controller=async()=>({});
   assert.equal((await b.state()).expectedIP,expectedIP);
   await b.saveSettings({hourly:false});
   assert.equal(JSON.parse(await fs.readFile(file,'utf8')).expectedIP,expectedIP);
@@ -91,9 +102,9 @@ test('a stale saved connection path fails at the configured path',async t=>{
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  const missing=path.join(folder,'missing');
  await fs.writeFile(path.join(folder,'settings.json'),JSON.stringify({configDir:missing,corePath:missing}));
- const b=await new Backend(folder).init();
- await assert.rejects(b.config(),/未找到 Clash Verge 配置/);
- await assert.rejects(b.corePath(),{code:'ENOENT',path:missing});
+ const b=await fakeBackend(folder).init();
+ await assert.rejects(b.clash.config(),/未找到 Clash Verge 配置/);
+ await assert.rejects(b.clash.corePath(),{code:'ENOENT',path:missing});
 });
 
 test('an unrelated settings save preserves saved connection paths',async t=>{
@@ -101,7 +112,7 @@ test('an unrelated settings save preserves saved connection paths',async t=>{
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  const file=path.join(folder,'settings.json');
  await fs.writeFile(file,JSON.stringify({configDir:{invalid:true},corePath:42}));
- const b=await new Backend(folder).init();
+ const b=await fakeBackend(folder).init();
  const defaultConfig=process.platform==='win32'?folder:path.join(folder,'Library/Application Support');
  if(process.platform==='win32'){
   const appData=process.env.APPDATA;
@@ -111,11 +122,11 @@ test('an unrelated settings save preserves saved connection paths',async t=>{
  const root=path.join(defaultConfig,'io.github.clash-verge-rev.clash-verge-rev');
  await fs.mkdir(root,{recursive:true});
  await fs.writeFile(path.join(root,'config.yaml'),'proxies: []');
- assert.deepEqual(await b.config(),{proxies:[]});
+ assert.deepEqual(await b.clash.config(),{root,file:path.join(root,'config.yaml'),config:{proxies:[]}});
  const autoCore=path.join(folder,'mock-core.exe');
  await fs.writeFile(autoCore,'test');
  b.powershell=async()=>JSON.stringify(autoCore);
- assert.equal(await b.corePath(),process.platform==='darwin'?'/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo':autoCore);
+ assert.equal(await b.clash.corePath(),process.platform==='darwin'?'/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo':autoCore);
  await b.saveSettings({hourly:false});
  const saved=JSON.parse(await fs.readFile(file,'utf8'));
  assert.deepEqual(saved.configDir,{invalid:true});
@@ -124,52 +135,66 @@ test('an unrelated settings save preserves saved connection paths',async t=>{
 test('isolated configuration never enables live control, TUN or mutates inputs',()=>{const a={name:'入口',type:'ss',server:'example.invalid',port:1},b={name:'美国静态家宽',server:EXPECTED,'dialer-proxy':'中转入口'};const before=JSON.stringify([a,b]);for(const kind of ['chain','entrance']){const c=isolatedConfig(a,b,12345,'Wi-Fi',kind);assert.equal(c.tun.enable,false);assert.equal(c['allow-lan'],false);assert.equal(c['external-controller'],'');assert.equal(c['interface-name'],'Wi-Fi');assert.equal(c.proxies[0]['interface-name'],'Wi-Fi');assert.equal(c.profile['store-selected'],false);assert.equal(c.proxies.length,kind==='chain'?2:1);}assert.equal(JSON.stringify([a,b]),before);assert.throws(()=>isolatedConfig({...a,'dialer-proxy':'other'},b,1,'Wi-Fi'));});
 test('IPv6 incomplete probes must never pass',()=>{assert.equal(ipv6Assessment([],[{connected:false},{connected:false}]).status,'ok');assert.equal(ipv6Assessment([],[{},{}]).status,'warn');assert.equal(ipv6Assessment([],[{connected:true},{connected:false}]).status,'warn');assert.equal(ipv6Assessment(['2001:db8::1'],[{connected:false},{connected:false}]).status,'warn');});
 test('Claude connections require exact endpoint evidence and verified proxy exit',()=>{const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1',OwningProcess:123}],cons=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽','GLOBAL']}];assert.equal(assessClaude(rows,cons,EXPECTED).status,'ok');assert.equal(assessClaude(rows,cons,'203.0.113.11').status,'warn');assert.equal(assessClaude([],[],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[...cons,...cons],EXPECTED).status,'warn');assert.equal(assessClaude(rows,[{...cons[0],chains:['DIRECT']}],EXPECTED).status,'bad');});
-test('live API rejects reloads, connection closes, route patches and deletions',async()=>{const b=new Backend('/tmp');for(const [method,url]of [['PUT','/configs'],['PATCH','/configs'],['DELETE','/connections'],['PUT','/proxies/GLOBAL'],['POST','/restart']])await assert.rejects(b.api(method,url));});
-test('switch validates stale state before writes and writes only entrance',async()=>{const b=new Backend('/tmp'),state={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a',providerId:'a'},{name:'b',providerId:'a'}],live:['a','b'],switchable:['a','b'],entryOwners:{a:'a',b:'a'}};let wrote=[];b.state=async()=>state;b.api=async(m,u,p)=>{wrote.push([m,u,p]);state.entry=p.name};await assert.rejects(b.switchNode('b','stale'));assert.equal(wrote.length,0);await b.switchNode('b','a');assert.deepEqual(wrote,[['PUT','/proxies/'+encodeURIComponent('中转入口'),{name:'b'}]]);});
-test('local HTTP API treats a rejection status as explicit with or without a body', async () => {
- const server = http.createServer((req, res) => {
-  assert.equal(req.headers.authorization, 'Bearer local-test');
-  if (req.url === '/version') return res.end('{"version":"test"}');
-  res.statusCode = 400;
-  res.end(req.url === '/rejected' ? '{"message":"rejected"}' : undefined);
- });
- await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
- try {
-  const b = new Backend('/tmp'), endpoint = {hostname:'127.0.0.1',port:server.address().port,secret:'local-test'};
-  assert.equal((await b.request(endpoint,'GET','/version')).version, 'test');
-  await assert.rejects(b.request(endpoint,'PUT','/rejected'), {rejected:true});
-  await assert.rejects(b.request(endpoint,'PUT','/empty'), {rejected:true});
- } finally {
-  server.close();
- }
+test('switch validates stale state before writes and writes only entrance',async()=>{
+ const b=fakeBackend('/tmp');
+ const state={mode:'global',tun:true,entry:'a',exit:EXIT,dialer:ENTRY,live:['a','b'],
+  switchable:['a','b'],entryOwners:{a:'a',b:'a'}};
+ const wrote=[];
+ b.state=async()=>state;
+ b.controller=async(method,route,body)=>{wrote.push([method,route,body]);state.entry=body.name;};
+ await assert.rejects(b.switchNode('b','stale'));
+ assert.deepEqual(wrote,[]);
+ await b.switchNode('b','a');
+ assert.deepEqual(wrote,[['PUT','/proxies/'+encodeURIComponent(ENTRY),{name:'b'}]]);
 });
 test('failed benchmark start preserves display history and invalidates ranking', async t => {
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-history-'));
  t.after(() => fs.rm(folder, {recursive:true, force:true}));
- const b = await new Backend(folder).init();
+ const b = await fakeBackend(folder).init();
  const results = {relay:{owner:'a', chainDelay:10}}, finishedAt = '2026-11-20T00:00:00Z';
+ mockConfig(b);
  b.state = async () => {throw Error('controller read failed');};
  for (const kind of ['chain', 'entrance']) {
   b.history = {results, finishedAt, latestResults:results};
   await assert.rejects(b.benchmark(kind), /controller read failed/);
-  const reopened = await new Backend(folder).init();
+  const reopened = await fakeBackend(folder).init();
   assert.deepEqual(reopened.history, {results, finishedAt, latestResults:{}});
  }
 });
-test('parallel benchmark is bounded and leaves live API read-only',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-pool-'));try{const b=await new Backend(dir).init();const s={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi',addresses:['192.0.2.2']});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.corePath=async()=>'mock.exe';b.api=async()=>{throw Error('unexpected mutation')};let active=0,peak=0;b.testNode=async()=>{peak=Math.max(peak,++active);await new Promise(r=>setTimeout(r,10));active--;return {delay:100,status:'done',kind:'chain'}};const result=await b.benchmark();assert.equal(Object.keys(result.results).length,8);assert.equal(peak,5);assert.equal(active,0);assert.equal(s.entry,'a');assert.equal(b.busy,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
-test('network changes discard results and do not switch nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-change-'));try{const b=await new Backend(dir).init();let changed=false;const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a'}]};b.state=async()=>s;b.network=async()=>({name:changed?'Ethernet':'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map([['a',{}]]),exit:{}});b.corePath=async()=>'mock';b.testNode=async()=>{changed=true;return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.match(r.reason,/变化/);assert.equal(s.entry,'a')}finally{await fs.rm(dir,{recursive:true,force:true})}});
-test('a cancelled benchmark never runs remaining nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-cancel-'));try{const b=await new Backend(dir).init();const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.corePath=async()=>'mock';let calls=0;b.testNode=async()=>{calls++;b.cancel();return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.ok(calls<=5);assert.equal(b.busy,false);assert.equal(b.progress.running,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
-test('network report records changes during checks without issuing mutations',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-'));try{const b=new Backend(dir);let calls=0;b.state=async()=>({mode:'global',tun:true,entry:++calls===1?'WiFi relay':'Ethernet relay',exit:'美国静态家宽',dialer:'中转入口',mixedPort:7897});b.trace=async()=>({ip:EXPECTED});b.ipv6Probe=async()=>({connected:false});b.api=async method=>{assert.equal(method,'GET');return {connections:[]}};const r=await b.networkCheck();assert.equal(r.stable,false);assert.equal(r.proxy.ip,EXPECTED);assert.equal(r.claude.status,'warn');assert.deepEqual(await fs.readdir(dir),[])}finally{await fs.rm(dir,{recursive:true,force:true})}});
+test('parallel benchmark is bounded and leaves live API read-only',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-pool-'));try{const b=await fakeBackend(dir).init();mockConfig(b);const s={mode:'global',tun:true,entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi',addresses:['192.0.2.2']});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.clash.corePath=async()=>'mock.exe';b.controller=async()=>{throw Error('unexpected mutation')};let active=0,peak=0;b.testNode=async()=>{peak=Math.max(peak,++active);await new Promise(r=>setTimeout(r,10));active--;return {delay:100,status:'done',kind:'chain'}};const result=await b.benchmark();assert.equal(Object.keys(result.results).length,8);assert.equal(peak,5);assert.equal(active,0);assert.equal(s.entry,'a');assert.equal(b.busy,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
+test('network changes discard results and do not switch nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-change-'));try{const b=await fakeBackend(dir).init();mockConfig(b);let changed=false;const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:[{name:'a'}]};b.state=async()=>s;b.network=async()=>({name:changed?'Ethernet':'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map([['a',{}]]),exit:{}});b.clash.corePath=async()=>'mock';b.testNode=async()=>{changed=true;return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.match(r.reason,/变化/);assert.equal(s.entry,'a')}finally{await fs.rm(dir,{recursive:true,force:true})}});
+test('a cancelled benchmark never runs remaining nodes',async()=>{const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-cancel-'));try{const b=await fakeBackend(dir).init();mockConfig(b);const s={mode:'global',entry:'a',exit:'美国静态家宽',dialer:'中转入口',nodes:Array.from({length:8},(_,i)=>({name:String(i)}))};b.state=async()=>s;b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(s.nodes.map(n=>[n.name,n])),exit:{}});b.clash.corePath=async()=>'mock';let calls=0;b.testNode=async()=>{calls++;b.cancel();return {delay:123}};const r=await b.benchmark();assert.equal(Object.keys(r.results).length,0);assert.ok(calls<=5);assert.equal(b.busy,false);assert.equal(b.progress.running,false)}finally{await fs.rm(dir,{recursive:true,force:true})}});
+test('network report uses the diagnostic deadline and records changes without mutations',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-'));
+ t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const b=fakeBackend(dir);
+ let calls=0;
+ b.state=async timeout=>{
+  assert.equal(timeout,6000);
+  return {mode:'global',tun:true,entry:++calls===1?'WiFi relay':'Ethernet relay',exit:EXIT,dialer:ENTRY,mixedPort:7897};
+ };
+ b.trace=async()=>({ip:EXPECTED});
+ b.ipv6Probe=async()=>({connected:false});
+ b.controller=async (method,route,body,timeout)=>{
+  assert.deepEqual([method,route,body,timeout],['GET','/connections',undefined,6000]);
+  return {connections:[]};
+ };
+ const report=await b.networkCheck();
+ assert.equal(report.stable,false);
+ assert.equal(report.proxy.ip,EXPECTED);
+ assert.equal(report.claude.status,'warn');
+ assert.deepEqual(await fs.readdir(dir),[]);
+});
 test('network report uses the expected IP from before its probes',async t=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-check-exit-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  t.mock.method(os,'networkInterfaces',()=>({}));
- const b=await new Backend(folder).init(),nextIP='203.0.113.11';
+ const b=await fakeBackend(folder).init(),nextIP='203.0.113.11';
  b.settings={expectedIP:EXPECTED};
- b.config=async()=>({proxies:[]});
- b.relayState=async()=>({mode:'global',entry:'relay',live:['relay'],mixedPort:7897});
+ mockConfig(b, {proxies:[]});
+ b.clash.relayState=async()=>({mode:'global',entry:'relay',live:['relay'],mixedPort:7897});
  b.ipv6Probe=async()=>({connected:false});
- b.api=async method=>{assert.equal(method,'GET');return {connections:[]};};
+ b.controller=async method=>{assert.equal(method,'GET');return {connections:[]};};
  b.powershell=async()=>JSON.stringify({connections:[]});
  const started=Promise.withResolvers(),probe=Promise.withResolvers();
  b.trace=async()=>{started.resolve();return probe.promise;};
@@ -193,19 +218,26 @@ test('isolated probes retain provider DNS and never enable TUN',()=>{const polic
 
 test('dynamic benchmark limits concurrency and only an opted-in scheduled run changes the relay',async t=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-'));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
- const b=await new Backend(folder).init(),names=['current','entrance','chain','failed'];let entry='current',active=0,peak=0,writes=[];
+ const b=await fakeBackend(folder).init(),names=['current','entrance','chain','failed'];let entry='current',active=0,peak=0,writes=[];
+ const profiles=path.join(folder,'profiles.yaml');
+ await fs.writeFile(path.join(folder,'clash-verge.yaml'),'proxies: []');
+ const originalProfiles='current: active\nitems: [{uid: active}]';
+ await fs.writeFile(profiles,originalProfiles);
+ b.settings.configDir=folder;
  b.state=async()=>({mode:'global',tun:true,entry,exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names,entryOwners:Object.fromEntries(names.map(name=>[name,'a']))});
- b.network=async()=>({interface:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(names.map(name=>[name,{name}])),exit:{}});b.corePath=async()=>'/mock';
- b.api=async(method,route,body)=>{writes.push([method,route,body.name]);entry=body.name};
+ b.network=async()=>({interface:'Wi-Fi'});b.loadNodes=async()=>({nodes:new Map(names.map(name=>[name,{name}])),exit:{}});b.clash.corePath=async()=>'/mock';
+ b.controller=async(method,route,body)=>{writes.push([method,route,body.name]);entry=body.name};
  b.testNode=async node=>{active++;peak=Math.max(peak,active);await new Promise(resolve=>setTimeout(resolve,8));active--;
   const [entranceDelay,delay]={current:[200,400],entrance:[80,260],chain:[90,190],failed:[5,null]}[node.name];return {delay,entranceDelay,status:delay?'done':'failed',kind:'chain'};};
  await Promise.all([b.saveSettings({interval:15,concurrency:2}),b.saveSettings({autoRelay:true,metric:'entrance'})]);
- const restarted=await new Backend(folder).init();assert.deepEqual(restarted.settings,{interval:15,concurrency:2,autoRelay:true,metric:'entrance'});
+ const restarted=await fakeBackend(folder).init();assert.deepEqual(restarted.settings,{configDir:folder,interval:15,concurrency:2,autoRelay:true,metric:'entrance'});
  await b.benchmark();assert.equal(peak,2);assert.equal(writes.length,0);
  await b.benchmark('chain',()=>false);assert.equal(writes.length,0);
  const run=await b.benchmark('chain',()=>true);assert.equal(run.switchedTo,'entrance');assert.deepEqual(writes,[['PUT','/proxies/'+encodeURIComponent('中转入口'),'entrance']]);
  await b.saveSettings({metric:'chain'});const next=await b.benchmark('chain',()=>true);assert.equal(next.switchedTo,'chain');
  entry='current';const scheduled=b.benchmark('chain',()=>true);await b.saveSettings({autoRelay:false});
+ await assert.rejects(fs.access(path.join(folder,'backups')), {code:'ENOENT'});
+ assert.equal(await fs.readFile(profiles,'utf8'),originalProfiles);
  assert.equal((await scheduled).switchedTo,undefined);assert.equal(writes.length,2);
  await b.saveSettings({autoRelay:true});const testNode=b.testNode;b.testNode=async(...args)=>{b.cancel();return testNode(...args)};
  assert.equal((await b.benchmark('chain',()=>true)).switchedTo,undefined);assert.equal(writes.length,2);
@@ -213,10 +245,11 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
 
 test('automatic relay checks settings commits and fresh subscription definitions before writing',async t=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'linkbox-auto-race-'));t.after(()=>fs.rm(folder,{recursive:true,force:true}));
- const b=await new Backend(folder).init(),names=['current','candidate'];let endpoint='tested.invalid',loaded=0,writes=0;
+ const b=await fakeBackend(folder).init(),names=['current','candidate'];let endpoint='tested.invalid',loaded=0,writes=0;
  b.state=async()=>({mode:'global',tun:true,entry:'current',exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names,entryOwners:Object.fromEntries(names.map(name=>[name,'a']))});
- b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>{loaded++;return {nodes:new Map(names.map(name=>[name,{name,server:endpoint}])),exit:{}}};b.corePath=async()=>'/mock';
- b.api=async()=>{writes++;};const result=node=>({delay:node.name==='current'?200:50,entranceDelay:50,kind:'chain'});
+ mockConfig(b);
+ b.network=async()=>({name:'Wi-Fi'});b.loadNodes=async()=>{loaded++;return {nodes:new Map(names.map(name=>[name,{name,server:endpoint}])),exit:{}}};b.clash.corePath=async()=>'/mock';
+ b.controller=async()=>{writes++;};const result=node=>({delay:node.name==='current'?200:50,entranceDelay:50,kind:'chain'});
  await b.saveSettings({autoRelay:true});
  b.testNode=async node=>{endpoint='replacement.invalid';return result(node);};
  assert.equal((await b.benchmark('chain',()=>true)).switchedTo,undefined);assert.equal(loaded,2);assert.equal(writes,0);
@@ -233,17 +266,18 @@ test('automatic relay checks settings commits and fresh subscription definitions
 test('benchmark waits for a deferred worker after another post-probe read rejects', async t => {
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-worker-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
- const b = await new Backend(folder).init(), names = ['current', 'deferred', 'queued'];
+ const b = await fakeBackend(folder).init(), names = ['current', 'deferred', 'queued'];
  b.settings.concurrency = 2;
  const state = {mode:'global',tun:true,entry:'current',exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name}))};
  let reads = 0;
+ mockConfig(b);
  b.state = async () => {
   if(++reads === 1) return state;
   throw Error('post-probe state unavailable');
  };
  b.network = async () => ({name:'Wi-Fi'});
  b.loadNodes = async () => ({nodes:new Map(names.map(name=>[name,{name}])),exit:{}});
- b.corePath = async () => '/mock';
+ b.clash.corePath = async () => '/mock';
  const deferred = Promise.withResolvers(), aborted = Promise.withResolvers(), started = Promise.withResolvers();
  const calls = [];
  b.testNode = async (node, _exit, _network, _core, _kind, signal) => {
@@ -278,8 +312,7 @@ test('benchmark waits for a deferred worker after another post-probe read reject
 test('benchmark loads duplicate credentials only from the selected owner and includes the current baseline', async t => {
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-owner-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
- const b = await new Backend(folder).init(), ENTRY = '中转入口', EXIT = '美国静态家宽';
- b.root = folder;
+ const b = await fakeBackend(folder).init(), ENTRY = '中转入口', EXIT = '美国静态家宽';
  const node = server => ({name:'same',server});
  const providers = {};
  await fs.mkdir(path.join(folder,'providers/linkbox'), {recursive:true});
@@ -291,8 +324,8 @@ test('benchmark loads duplicate credentials only from the selected owner and inc
  const config = {proxies:[node('local.example.invalid'),{name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY}],
   'proxy-providers':providers,
   'proxy-groups':[{name:ENTRY,use:['a','b']}]};
- b.config = async () => config;
- b.api = async (method,route) => {
+ mockConfig(b, config);
+ b.controller = async (method,route) => {
   assert.equal(method,'GET');
   if(route==='/configs')return {mode:'global'};
   if(route==='/proxies')return {proxies:{
@@ -315,7 +348,7 @@ test('benchmark handles a malformed provider cache per relay', async t => {
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-malformed-cache-'));
  t.after(()=>fs.rm(folder,{recursive:true,force:true}));
  const {ENTRY, EXIT} = require('../backend.cjs');
- const b = await new Backend(folder).init();
+ const b = await fakeBackend(folder).init();
  b.settings.configDir = folder;
  await fs.mkdir(path.join(folder,'providers/linkbox'), {recursive:true});
  await fs.writeFile(path.join(folder,'clash-verge.yaml'),JSON.stringify({
@@ -325,10 +358,10 @@ test('benchmark handles a malformed provider cache per relay', async t => {
  }));
  await fs.writeFile(path.join(folder,'providers/linkbox/a.yaml'),'proxies: [{name: healthy, server: example.invalid}]');
  await fs.writeFile(path.join(folder,'providers/linkbox/b.yaml'),'proxies: [');
- b.relayState = async () => ({mode:'global',exit:EXIT,dialer:ENTRY,entry:'healthy',live:['healthy']});
- b.api = async () => ({});
+ b.clash.relayState = async () => ({mode:'global',exit:EXIT,dialer:ENTRY,entry:'healthy',live:['healthy']});
+ b.controller = async () => ({});
  b.network = async () => ({name:'fixture'});
- b.corePath = async () => 'fixture';
+ b.clash.corePath = async () => 'fixture';
  const probes = [];
  b.testNode = async node => {probes.push(node.name);return {delay:100,status:'done'};};
  for (const selection of [{a:['healthy']},{a:['healthy'],b:['broken']}]) {
@@ -348,20 +381,20 @@ for (const automatic of [false, true]) for (const changedAfterPut of [false, tru
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-switch-owner-'));
   t.after(() => fs.rm(folder, {recursive:true, force:true}));
   const {ENTRY, EXIT} = require('../backend.cjs');
-  const b = await new Backend(folder).init();
+  const b = await fakeBackend(folder).init();
   b.settings.autoRelay = true;
   await fs.writeFile(path.join(folder, 'node-policy.json'), JSON.stringify({selected_nodes:{a:['current','same']}}));
   const current = {name:'current',server:'current.invalid'}, same = {name:'same',server:'a.invalid'};
   const exit = {name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY};
-  b.config = async () => ({proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
+  mockConfig(b, {proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
    'proxy-groups':[{name:ENTRY,use:['a']}]});
   b.network = async () => ({interface:'Wi-Fi'});
-  b.corePath = async () => '/mock';
+  b.clash.corePath = async () => '/mock';
   b.testNode = async node => ({delay: node.name === 'current' ? 400 : 100});
   let entry = 'current';
   let live = changedAfterPut ? ['current','same'] : ['current','external'];
   const writes = [];
-  b.api = async (method, route, body) => {
+  b.controller = async (method, route, body) => {
    if(method === 'PUT'){
     writes.push(body.name);entry = body.name;live = ['current','external'];return;
    }
@@ -384,19 +417,19 @@ for (const automatic of [false, true]) for (const wrongGroup of [false, true]) t
  const folder = await fs.mkdtemp(path.join(os.tmpdir(), 'linkbox-switch-group-'));
  t.after(() => fs.rm(folder, {recursive:true, force:true}));
  const {ENTRY, EXIT} = require('../backend.cjs');
- const b = await new Backend(folder).init();
+ const b = await fakeBackend(folder).init();
  b.settings.autoRelay = true;
  await fs.writeFile(path.join(folder, 'node-policy.json'), JSON.stringify({selected_nodes:{a:['current','same']}}));
  const current = {name:'current',server:'current.invalid'}, same = {name:'same',server:'a.invalid'};
  const exit = {name:EXIT,server:'203.0.113.10','dialer-proxy':ENTRY};
  const config = {proxies:[exit], 'proxy-providers':{a:{payload:[current,same]}},
   'proxy-groups':[{name:ENTRY,use:['a']},{name:'secondary',use:[wrongGroup?'a':'b']}]};
- b.config = async () => config;
+ mockConfig(b, config);
  b.network = async () => ({interface:'fixture'});
- b.corePath = async () => '/mock';
+ b.clash.corePath = async () => '/mock';
  b.testNode = async node => ({delay:node.name === 'current' ? 400 : 100});
  let entry = 'current', live = ['same','current','unrelated'];
- b.api = async (method, route, body) => {
+ b.controller = async (method, route, body) => {
   if (method === 'PUT') {entry = body.name;live = ['current','same','different'];return;}
   if (route === '/configs') return {mode:'global'};
   if (route === '/proxies') return {proxies:{

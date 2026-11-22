@@ -3,11 +3,11 @@ import json
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import subprocess
 import sys
-import urllib.parse
 import urllib.request
 import datetime
 import fcntl
 import os
+import clash
 import toolbox as t
 import runtime
 from settings import SettingsError, benchmark_settings
@@ -63,15 +63,12 @@ def latency():
         before=snapshot(False);_,p=t.state();results={}
         owners = t.relay_owners(runtime.read_json('node-policy.json').get('selected_nodes'), before.get('live', []))
         inventory = t.node_inventory(p, owners)
-        query=urllib.parse.urlencode({'url':'https://www.gstatic.com/generate_204','timeout':3000,'expected':'204'})
         def measure(name):
             _,provider=inventory.get(name,({},None))
             provider=owners.get(name, provider)
-            q=urllib.parse.quote
-            route=('/providers/proxies/'+q(provider,safe='')+'/'+q(name,safe='')+'/healthcheck') if provider else '/proxies/'+q(name,safe='')+'/delay'
             row={'owner':owners.get(name),'time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'source':'入口 HTTPS 204，单次 / 3 秒超时','error':''}
             try:
-                d=t.api('GET',route+'?'+query).get('delay')
+                d=clash.entry_delay(name, provider)
                 if not isinstance(d,(int,float)) or d<=0:raise RuntimeError('未返回有效延迟')
                 row.update(delay=d,status='实测可达')
             except Exception as e:row.update(delay=None,status='未响应',error=str(e))
@@ -125,7 +122,7 @@ def change(target,previous,guard=None):
         if target not in fresh_owners or fresh_owners[target] != owner:
             raise RuntimeError('节点归属已变化，请先更新订阅')
     if target==previous:return {'message':'已经是该节点，没有修改。','state':s}
-    t.api('PUT','/proxies/'+urllib.parse.quote(t.ENTRY,safe=''),{'name':target})
+    clash.switch_entry(target)
     after=snapshot()
     if after['entry']!=target or after['exit']!=t.EXIT or after['mode']!='global' or after['dialer']!=t.ENTRY:
         raise RuntimeError('操作后状态与预期不符，请刷新并检查 Clash；没有继续更改。')

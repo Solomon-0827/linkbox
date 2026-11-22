@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import yaml
 
@@ -66,6 +68,29 @@ class PickerTests(test_update.SubscriptionFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '完整读取'):
             picker.synchronize()
         self.api.assert_not_called()
+
+    def test_discovery_builds_profile_path_after_resolving_source_identity(self):
+        index = yaml.safe_load(self.index.read_bytes())
+        index['items'] = index['items'][:1]
+        self.index.write_bytes(update.dump(index))
+        (self.base / 'subscriptions.json').unlink()
+        events = []
+        source_key = picker.source_key
+        join = Path.__truediv__
+
+        def track_key(url):
+            events.append('source identity')
+            return source_key(url)
+
+        def track_join(path, part):
+            if path == self.root and part == 'profiles':
+                events.append('profile path')
+            return join(path, part)
+
+        with patch.object(picker, 'source_key', track_key), patch.object(Path, '__truediv__', track_join):
+            sources, _, _ = picker.discover()
+        self.assertEqual([source['display_name'] for source, _ in sources], ['A'])
+        self.assertEqual(events, ['source identity', 'profile path', 'source identity'])
 
     def test_unsupported_source_does_not_hide_usable_subscriptions(self):
         doc = yaml.safe_load(self.index.read_text())
