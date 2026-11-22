@@ -47,8 +47,8 @@ def _request(method, path, payload=None, *, timeout=6, expected_status=None):
 
     conn = Connection('localhost')
     try:
-        conn.request(method, path, json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None,
-                     {'Content-Type': 'application/json'})
+        body = json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None
+        conn.request(method, path, body, {'Content-Type': 'application/json'} if body is not None else {})
         response = conn.getresponse()
         if not 200 <= response.status < 300 or expected_status not in (None, response.status):
             raise ClashHTTPError(response.status, expected_status=expected_status)
@@ -145,14 +145,16 @@ def read_config(*, text=True):
     return yaml.safe_load(path.read_text() if text else path.read_bytes())
 
 
-def write_file(path, data, *, expected=None, conflict=None):
+def write_file(path, data, *, expected=None, conflict=None, require_existing=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix='.linkbox-', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as output:
             output.write(data)
-        if conflict is not None and read_file(path) != expected:
-            raise RuntimeError(conflict)
+        if conflict is not None:
+            current = path.read_bytes() if require_existing else read_file(path)
+            if current != expected:
+                raise RuntimeError(conflict)
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -199,6 +201,6 @@ def persist_selection(name, *, backup_dir=None):
         backup = backup_dir / ('profiles-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.yaml')
         with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as file:
             file.write(original)
-    write_file(path, output, expected=original,
+    write_file(path, output, expected=original, require_existing=backup_dir is not None,
                conflict='Clash 同时更新了订阅文件，跳过持久化，避免覆盖' if backup_dir is not None
                else '配置或节点已被其他操作改变，已取消更新')

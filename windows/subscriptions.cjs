@@ -28,9 +28,9 @@ function clean(document) {
  }
  return {...document, proxies};
 }
-async function discover(b, forUpdate = false) {
- await b.clash.config(); // Resolve the local Verge configuration directory.
- const profiles = parseProfile(await readFile(b.clash.profilesFile()));
+async function discover(b, forUpdate = false, root) {
+ root ??= (await b.clash.config()).root;
+ const profiles = parseProfile(await readFile(b.clash.profilesFile(root)));
  if (!Array.isArray(profiles?.items) || profiles.items.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
   throw Error('无法完整读取 Clash Verge 订阅，未删除节点');
  }
@@ -47,7 +47,7 @@ async function discover(b, forUpdate = false) {
    if (typeof url !== 'string' || !url.startsWith('https://')) {
     throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
    }
-   profile = b.clash.profileFile(file);
+   profile = b.clash.profileFile(root, file);
   } catch (error) {
    if (forUpdate) throw error;
    continue;
@@ -66,7 +66,7 @@ async function discover(b, forUpdate = false) {
   throw Error('订阅标识冲突，请先整理 Clash Verge 订阅');
  }
  const revisions = sources.map(({source, raw}) => [source, digest(raw)]);
- const revision = hash([b.clash.root, revisions, (await policy(b)).selected_nodes]);
+ const revision = hash([root, revisions, (await policy(b)).selected_nodes]);
  if (forUpdate) return {sources: sources.map(({source}) => ({source})), fingerprint: revision};
  const rawPreview = await readFile(path.join(b.dataDir, PREVIEW));
  const preview = parseProfile(rawPreview);
@@ -155,8 +155,9 @@ function mergeSelectionDraft(catalog, changes){
 }
 
 async function catalog(b, changes=[]) {
- const {sources, fingerprint} = await discover(b);
- const state = await b.state();
+ const verge = await b.clash.config();
+ const {sources, fingerprint} = await discover(b, false, verge.root);
+ const state = await b.state(undefined, verge);
  const owners = selectionOwners(reconcile({sources: inventoryFor(sources),
   selection: (await policy(b)).selected_nodes, live: state.live, current: state.entry}).selection);
  const current = state.entry;
@@ -306,20 +307,20 @@ function benchmarkResults(b) {
   }]));
 }
 
-function managedCache(clash, owner, definition) {
- return definition.path && clash.providerFile(definition.path) === clash.managedCacheFile(owner);
+function managedCache(clash, root, owner, definition) {
+ return definition.path && clash.providerFile(root, definition.path) === clash.managedCacheFile(root, owner);
 }
 
-async function providerPayload(definition, clash, readCache, filtered) {
+async function providerPayload(definition, clash, root, readCache, filtered) {
  let {payload} = definition;
- if (definition.path) payload = parseProfile(await readCache(clash.providerFile(definition.path)))?.proxies;
+ if (definition.path) payload = parseProfile(await readCache(clash.providerFile(root, definition.path)))?.proxies;
  if (!Array.isArray(payload)) throw Error('代理缓存不完整，未修改');
  if (!filtered) return payload;
  const accepts = nameFilter(definition);
  return payload.filter(node => accepts(node.name));
 }
 
-async function entryPlan(config, clash) {
+async function entryPlan(config, clash, root) {
  const entry = config['proxy-groups']?.find(group => group.name === ENTRY);
  if (!entry) throw Error('缺少中转入口组');
  const staticNodes = new Map((config.proxies || []).map(node => [node.name, node]));
@@ -335,7 +336,7 @@ async function entryPlan(config, clash) {
  const use = includeAll || entry['include-all-providers'] ? Object.keys(providers).sort() : entry.use || [];
  for (const owner of use) {
   let payload;
-  try { payload = await providerPayload(providers[owner], clash, readFile, true); }
+  try { payload = await providerPayload(providers[owner], clash, root, readFile, true); }
   catch { continue; }
   for (const node of payload) {
    if (accepts(node.name) && !members.has(node.name)) members.set(node.name, {owner, node});
@@ -344,7 +345,7 @@ async function entryPlan(config, clash) {
  return members;
 }
 
-async function reloadPayload(config, clash, updates, baselines) {
+async function reloadPayload(config, clash, root, updates, baselines) {
  // The service cannot read LinkBox's user-owned provider cache files.
  const live = structuredClone(config);
  const entry = live['proxy-groups'].find(group => group.name === ENTRY);
@@ -354,9 +355,9 @@ async function reloadPayload(config, clash, updates, baselines) {
   return updates.get(file) ?? baselines.get(file);
  };
  for (const [owner, definition] of Object.entries(live['proxy-providers'])) {
-  const managed = managedCache(clash, owner, definition);
+  const managed = managedCache(clash, root, owner, definition);
   if (!managed && !use.has(owner)) continue;
-  const payload = await providerPayload(definition, clash, readCache, use.has(owner));
+  const payload = await providerPayload(definition, clash, root, readCache, use.has(owner));
   if (use.has(owner)) {
    for (const node of payload) members.add(node.name);
   }
@@ -377,16 +378,17 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   const policyFile = path.join(b.dataDir, 'node-policy.json');
   let selection = saved.selected_nodes;
   if (initialize && selection != null) return false;
-  const before = await b.state();
+  const verge = await b.clash.config();
+  const {root, file: configFile} = verge;
+  const readState = async () => b.state(undefined, await b.clash.config(root));
+  const before = await b.state(undefined, verge);
   b.assertChain(before);
-  await b.clash.config();
   const syncing = request === null && removal === null;
   const previewFile = path.join(b.dataDir, PREVIEW);
-  const configFile = b.clash.configFile, script = b.clash.scriptFile();
-  const profiles = b.clash.profilesFile();
+  const script = b.clash.scriptFile(root), profiles = b.clash.profilesFile(root);
   const baselines = new Map();
   for (const file of [configFile, script, profiles, policyFile]) baselines.set(file, await readFile(file));
-  const discovered = await discover(b, syncing);
+  const discovered = await discover(b, syncing, root);
   let {sources} = discovered;
   if (request !== null) {
    selection = validateSelection(discovered, request, selection);
@@ -422,13 +424,13 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    if (refreshed.length !== sources.length) throw Error('订阅下载或解析失败，未改动当前配置');
    sources = refreshed;
    downloadedProfiles = Object.fromEntries(downloads);
-   if (sig(await b.state()) !== sig(before) ||
-       (await discover(b, true)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
+   if (sig(await readState()) !== sig(before) ||
+       (await discover(b, true, root)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
   }
   if (downloadedProfiles) {
    for (const {source} of sources) {
     if (Object.hasOwn(downloadedProfiles, source.name)) {
-     updates.set(b.clash.profileFile(source.profile_file), YAML.stringify(downloadedProfiles[source.name]));
+     updates.set(b.clash.profileFile(root, source.profile_file), YAML.stringify(downloadedProfiles[source.name]));
     }
    }
   }
@@ -464,7 +466,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    }
    if (!keep?.length) continue;
    if (!/^[A-Za-z0-9_-]{1,60}$/.test(owner)) throw Error('订阅标识需使用字母、数字或短横线');
-   const file = b.clash.managedCacheFile(owner);
+   const file = b.clash.managedCacheFile(root, owner);
    updates.set(file, YAML.stringify(document));
    definitions.set(owner, {
     type: 'http', url: source.url, path: file, interval: 86400,
@@ -476,13 +478,13 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
   }
   const use = [...definitions.keys()].filter(owner => Object.hasOwn(plan.selection, owner) && plan.selection[owner].length);
   const retired = Object.fromEntries(Object.entries(existing).filter(([name, definition]) =>
-   !definitions.has(name) && managedCache(b.clash, name, definition)));
+   !definitions.has(name) && managedCache(b.clash, root, name, definition)));
   const managed = {providers: Object.fromEntries(definitions), retired, dns, use};
   if (pin) managed.pin = pin;
   const updated = transform(config, managed);
   updates.set(configFile, YAML.stringify(updated));
   updates.set(script, scriptText(baselines.get(script), managed));
-  const {payload, members} = await reloadPayload(updated, b.clash, updates, baselines);
+  const {payload, members} = await reloadPayload(updated, b.clash, root, updates, baselines);
   // A saved relay can be absent from the live group while its subscription cache is unreadable.
   const selected = Object.fromEntries(Object.entries(plan.selection).map(([owner, names]) =>
    [owner, names.filter(name => members.has(name))]));
@@ -506,9 +508,9 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
 
   const written = [];
   const rollback = () => restoreFiles(written, originals);
-  await b.clash.reload(payload, async () => {
-   if ((await discover(b, syncing)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
-   if (sig(await b.state()) !== sig(before)) {
+  await b.clash.reload(root, payload, async () => {
+   if ((await discover(b, syncing, root)).fingerprint !== discovered.fingerprint) throw Error(EXTERNAL_CHANGE);
+   if (sig(await readState()) !== sig(before)) {
     throw Error(EXTERNAL_CHANGE);
    }
    for (const [file, raw] of new Map([...originals, ...baselines])) {
@@ -537,7 +539,7 @@ async function run(b, request = null, {removal = null, initialize = false} = {})
    }
   }, rollback);
   const entry = await selectAfterReload(b, before, selectedNames, desired);
-  if (entry !== plannedEntry) await b.clash.persistSelection(entry);
+  if (entry !== plannedEntry) await b.clash.persistSelection(profiles, entry);
   if (initialize) return true;
   return {message: syncing ? '已同步 Clash Verge 订阅。' : '已保存节点选择。'};
  })();

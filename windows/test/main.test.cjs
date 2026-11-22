@@ -194,7 +194,8 @@ test('Windows quit waits for the subscription update to settle', async t => {
   on(event,fn){if(event==='before-quit')beforeQuit=fn;},whenReady:()=>new Promise(()=>{})};
  const paused = new Promise(resolve=>{settle=resolve;});
  const entered = new Promise(resolve=>{enter=resolve;});
- const fake = {dataDir,async state(){enter();await paused;throw Error('fixture stop');},async shutdown(){shutdowns++;}};
+ const fake = {dataDir,clash:{async config(){return {root:dataDir};}},
+  async state(){enter();await paused;throw Error('fixture stop');},async shutdown(){shutdowns++;}};
  const electron = {app,nativeTheme:{},ipcMain:{handle(){}}};
  const context = vm.createContext({require:name=>name==='electron'?electron:
   require(name.startsWith('./')?'../'+name.slice(2):name),process:{argv:[],platform:'win32'},__dirname,

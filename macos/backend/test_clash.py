@@ -60,6 +60,23 @@ class ClashAdapterTests(unittest.TestCase):
                     self.assertEqual(network_check.safe(diagnostic), {'error': 'Clash API HTTP 204'})
             receive.return_value.read.assert_not_called()
 
+    def test_controller_sends_json_header_only_for_requests_with_a_body(self):
+        connection = http.client.HTTPConnection
+        with (patch.object(connection, 'request') as send,
+              patch.object(connection, 'getresponse') as receive,
+              patch.object(network_check, 'run', side_effect=['123 claude', ''])):
+            receive.return_value.status = 200
+            receive.return_value.read.side_effect = [b'{}', b'{"proxies": {}}', b'{}', b'']
+            network_check.local_state()
+            network_check.claude_connections()
+            clash.switch_entry('fast')
+
+        for request, route in zip(send.call_args_list[:3], ['/configs', '/proxies', '/connections']):
+            self.assertEqual(request.args[:2], ('GET', route))
+            self.assertNotIn('Content-Type', request.args[3])
+        self.assertEqual(send.call_args.args[:2], ('PUT', '/proxies/' + quote(clash.ENTRY, safe='')))
+        self.assertIn('Content-Type', send.call_args.args[3])
+
     def test_reload_validates_the_exact_payload_before_guard_and_write(self):
         payload = b'proxies: []'
         events = []
@@ -93,13 +110,14 @@ class ClashAdapterTests(unittest.TestCase):
             profiles = root / 'profiles.yaml'
             profiles.write_bytes(original)
 
-            def read_with_change(path):
-                if path == profiles:
-                    profiles.write_bytes(concurrent)
-                return path.read_bytes()
+            mkstemp = tempfile.mkstemp
+
+            def edit_profiles_before_guard(*args, **kwargs):
+                profiles.write_bytes(concurrent)
+                return mkstemp(*args, **kwargs)
 
             with (patch.object(clash, 'CONFIG_DIR', root),
-                  patch.object(clash, 'read_file', side_effect=read_with_change)):
+                  patch.object(clash.tempfile, 'mkstemp', side_effect=edit_profiles_before_guard)):
                 with self.assertRaisesRegex(RuntimeError, '同时更新'):
                     clash.persist_selection('new', backup_dir=root / 'backups')
             self.assertEqual(profiles.read_bytes(), concurrent)

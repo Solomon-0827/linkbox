@@ -108,6 +108,126 @@ async function fixture(t) {
   refreshWith: value => {refreshed = value;}, saved: async () => JSON.parse(await fs.readFile(policy, 'utf8'))};
 }
 
+async function windowsRoots(t, root) {
+ const app = 'io.github.clash-verge-rev.clash-verge-rev';
+ const appData = path.join(path.dirname(root), 'AppData');
+ const localAppData = path.join(path.dirname(root), 'LocalAppData');
+ const primary = path.join(appData, app), secondary = path.join(localAppData, app);
+ for (const directory of [primary, secondary]) await fs.cp(root, directory, {recursive: true});
+ const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+ Object.defineProperty(process, 'platform', {...platform, value: 'win32'});
+ t.after(() => Object.defineProperty(process, 'platform', platform));
+ const environment = {APPDATA: appData, LOCALAPPDATA: localAppData};
+ for (const [key, value] of Object.entries(environment)) {
+  const original = process.env[key];
+  process.env[key] = value;
+  t.after(() => {
+   if (original === undefined) delete process.env[key];
+   else process.env[key] = original;
+  });
+ }
+ return {primary, secondary};
+}
+
+for (const sync of [false, true]) test(`${sync ? 'Sync' : 'Save'} reconciles the original profiles after a concurrent refresh falls back`, async t => {
+ const {b, root, apply, state, requests, policy, refreshWith} = await fixture(t);
+ const {primary, secondary} = await windowsRoots(t, root);
+ b.settings.configDir = '';
+ b.history = {latestResults: {fast: {chainDelay: 10, owner: 'a'}}};
+ const otherProfiles = path.join(secondary, 'profiles.yaml');
+ const unrelated = YAML.stringify({current: 'b', items: [{uid: 'b', selected: [{name: ENTRY, now: 'unrelated'}]}]});
+ await fs.writeFile(otherProfiles, unrelated);
+ const controller = b.request;
+ b.request = async (...args) => {
+  const result = await controller(...args);
+  if (args[2] === '/configs?force=false') {
+   state.live = ['fast'];
+   await fs.rename(path.join(primary, 'clash-verge.yaml'), path.join(primary, 'inactive.yaml'));
+   const refresh = await Backend.prototype.state.call(b);
+   assert.equal(refresh.settings.configDir, secondary);
+  }
+  return result;
+ };
+ const selected = {a: ['current', 'fast'], b: []};
+ if (sync) {
+  await fs.writeFile(policy, JSON.stringify({selected_nodes: selected}));
+  refreshWith({a: ['current', 'fast'], b: ['same']});
+  await b.updateSubscriptions();
+ } else {
+  await apply(selected);
+ }
+ assert.deepEqual(requests.map(r => r.route), ['/configs?force=false', ENTRY_ROUTE]);
+ assert.equal(state.entry, 'fast');
+ const profiles = YAML.parse(await fs.readFile(path.join(primary, 'profiles.yaml'), 'utf8'));
+ assert.deepEqual(profiles.items[0].selected, [{name: ENTRY, now: 'fast'}]);
+ assert.equal(await fs.readFile(otherProfiles, 'utf8'), unrelated);
+});
+
+for (const benchmark of [false, true]) test(
+ `${benchmark ? 'Benchmark setup' : 'Refresh'} keeps reading caches from the resolved Verge directory`, async t => {
+  const {b, root, config, state, write, setProviders} = await fixture(t);
+  config['proxy-groups'][0] = {name: ENTRY, type: 'select', use: ['a', 'b']};
+  config['proxy-providers'] = {a: {path: 'a.yaml'}, b: {path: 'b.yaml'}};
+  await write('clash-verge.yaml', config);
+  await write('a.yaml', {proxies: [node('current')]});
+  await write('b.yaml', {proxies: [{...node('fast', 'primary.example.invalid'), type: 'trojan'}]});
+  const {primary, secondary} = await windowsRoots(t, root);
+  await fs.writeFile(path.join(secondary, 'b.yaml'), YAML.stringify({proxies: [node('fast', 'secondary.example.invalid')]}));
+  b.settings.configDir = '';
+  state.live = ['current', 'fast'];
+  setProviders({});
+  b.state = Backend.prototype.state;
+  b.clash.corePath = async () => 'fixture';
+  let pendingFallback = !benchmark, fellBack = false;
+  b.network = async () => {
+   pendingFallback = !fellBack;
+   return {name: 'fixture'};
+  };
+  const configFile = path.join(primary, 'clash-verge.yaml');
+  const readFile = fs.readFile;
+  t.mock.method(fs, 'readFile', async (file, ...args) => {
+   if (pendingFallback && file === path.join(primary, 'a.yaml')) {
+    pendingFallback = false;
+    fellBack = true;
+    await fs.rename(configFile, configFile + '.inactive');
+    try {
+     assert.equal((await b.state()).settings.configDir, secondary);
+    } finally {
+     await fs.rename(configFile + '.inactive', configFile);
+    }
+   }
+   return readFile(file, ...args);
+  });
+  if (benchmark) {
+   const probes = new Map();
+   b.testNode = async relay => {
+    probes.set(relay.name, relay.server);
+    return {delay: 100, status: 'done'};
+   };
+   await b.benchmark('entrance');
+   assert.equal(probes.get('fast'), 'primary.example.invalid');
+  } else {
+   const snapshot = await b.state();
+   assert.equal(snapshot.nodes.find(relay => relay.name === 'fast').type, 'trojan');
+   assert.equal(snapshot.settings.configDir, primary);
+  }
+  assert.ok(fellBack);
+});
+
+test('validation directory permission errors reach sync and Save before reload', async t => {
+ const {b, root, apply, refreshWith, requests} = await fixture(t);
+ refreshWith({a: ['fast'], b: ['same']});
+ const denied = Object.assign(Error("EACCES: permission denied, mkdtemp 'linkbox-validate-XXXXXX'"), {code: 'EACCES'});
+ const mkdtemp = fs.mkdtemp;
+ t.mock.method(fs, 'mkdtemp', async prefix => {
+  if (prefix === path.join(root, 'linkbox-validate-')) throw denied;
+  return mkdtemp(prefix);
+ });
+ await assert.rejects(b.updateSubscriptions(), {code: denied.code, message: denied.message});
+ await assert.rejects(apply({a: ['fast'], b: []}), {code: denied.code, message: denied.message});
+ assert.deepEqual(requests, []);
+});
+
 for (const flag of ['include-all-providers', 'include-all-proxies', 'include-all']) {
  test(`switches an unmanaged ENTRY using ${flag}`, async t => {
   const {b, config, state, write} = await fixture(t);
@@ -283,7 +403,7 @@ test('same-name owner move with connection refused rolls back', async t => {
 test('saving another subscription keeps unreadable cache selection and provider', async t => {
  const {b, root, write, apply, saved, refreshWith} = await fixture(t);
  await apply({a:['current','fast'], b:['same','other']});
- const before = (await b.clash.config())['proxy-providers'].b;
+ const before = (await b.clash.config()).config['proxy-providers'].b;
  await write('profiles/a.yaml', {proxies:['current','fast','same'].map(n => node(n))});
  await fs.writeFile(path.join(root, 'profiles/b.yaml'), 'proxies: [');
  const {sources:[, unreadable]} = await sub.catalog(b);
@@ -292,13 +412,13 @@ test('saving another subscription keeps unreadable cache selection and provider'
  assert.deepEqual((await saved()).selected_nodes, {a:['current','fast'], b:['same','other']});
  await sub.remove(b, {entry:'current', names:['fast']});
  assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['same','other']});
- assert.deepEqual((await b.clash.config())['proxy-providers'].b, before);
+ assert.deepEqual((await b.clash.config()).config['proxy-providers'].b, before);
  assert.match(unreadable.warning, /保留原勾选/);
  refreshWith({a:['fast']});
  const original = await saved();
  await assert.rejects(b.updateSubscriptions(), /下载/);
  assert.deepEqual(await saved(), original);
- assert.deepEqual((await b.clash.config())['proxy-providers'].b, before);
+ assert.deepEqual((await b.clash.config()).config['proxy-providers'].b, before);
 });
 
 test('catalog exposes both copies and selects exactly one owner', async t => {
@@ -572,7 +692,7 @@ for (const reference of ['selector', 'include-all-proxies', 'MATCH,current', 'DO
   };
   for (let save = 0; save < 2; save++) {
    await apply({a:['fast'], b:[]});
-   assert.deepEqual((await b.clash.config()).proxies.find(n => n.name === 'current'), node('current'));
+   assert.deepEqual((await b.clash.config()).config.proxies.find(n => n.name === 'current'), node('current'));
    const script = await fs.readFile(path.join(root, 'profiles/Script.js'), 'utf8');
    const profile = {...structuredClone(config), proxies:config.proxies.slice(1)};
    const regenerated = JSON.parse(vm.runInNewContext(script + '\nJSON.stringify(main(profile))', {profile}));
@@ -680,7 +800,7 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
  test('other group retains a deselected provider through ' + Object.keys(reference)[0], async t => {
   const {b, root, write, apply, requests} = await fixture(t);
   await apply({a:['current'],b:['other']});
-  const config = await b.clash.config(), previous = config['proxy-providers'].b;
+  const {config} = await b.clash.config(), previous = config['proxy-providers'].b;
   config['proxy-groups'].push({name:'secondary',type:'select',...reference,filter:'^other$'});
   await write('clash-verge.yaml', config);
   if (process.env.LINKBOX_TEST_CORE) b.validateConfig = file => {
@@ -690,7 +810,7 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
   const live = YAML.parse(requests.at(-1).body.payload);
   assert.deepEqual(live['proxy-groups'][0].use, ['a']);
   assert.equal(live['proxy-providers'].b.filter, '^other$');
-  assert.deepEqual((await b.clash.config())['proxy-providers'].b, previous);
+  assert.deepEqual((await b.clash.config()).config['proxy-providers'].b, previous);
   const script = await fs.readFile(path.join(root,'profiles/Script.js'),'utf8');
   const context = require('node:vm').createContext({input:{'proxy-groups':config['proxy-groups']}});
   assert.deepEqual(JSON.parse(require('node:vm').runInContext(script + "\nJSON.stringify(main(input))", context))['proxy-providers'].b, previous);
@@ -836,7 +956,7 @@ test('lost Save response keeps the new owner and allows a fresh update', async t
  await assert.rejects(apply({a:[],b:['fast','other']}), /已写入新配置，Clash 未确认，请刷新状态核对/);
  assert.deepEqual(requests.map(r => r.route), ['/configs?force=false']);
  assert.deepEqual(await saved(), {selected_nodes:{b:['fast','other']},provider_labels:{a:'A',b:'B'}});
- assert.deepEqual((await b.clash.config())['proxy-groups'][0].use, ['b']);
+ assert.deepEqual((await b.clash.config()).config['proxy-groups'][0].use, ['b']);
  assert.equal(state.entry, 'current');
  assert.equal(b.busy, false);
 

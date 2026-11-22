@@ -16,13 +16,12 @@ async function fixture(t, options = {}) {
  const b = await new Backend(path.join(root, 'data')).init();
  b.settings.configDir = root;
  b.clash = new Clash(() => b.settings, () => '', {endpoint: {}, ...options});
- await b.clash.config();
  return {root, b, adapter: b.clash};
 }
 
 test('controller surface sends only named reads, entry switch and validated reload', async t => {
  const events = [];
- const {adapter} = await fixture(t, {
+ const {adapter, root} = await fixture(t, {
   validate: async file => { events.push(['validate', await fs.readFile(file, 'utf8')]); },
   transport: async (_endpoint, method, route, body) => { events.push([method, route, body]); return {}; },
  });
@@ -33,7 +32,7 @@ test('controller surface sends only named reads, entry switch and validated relo
  await adapter.connections();
  await adapter.switchEntry('a/b?c');
  const payload = 'proxies: []';
- await adapter.reload(payload, () => events.push(['prepare']), () => assert.fail('rollback'));
+ await adapter.reload(root, payload, () => events.push(['prepare']), () => assert.fail('rollback'));
  assert.deepEqual(events, [
   ['GET', '/configs', undefined], ['GET', '/proxies', undefined],
   ['GET', '/providers/proxies', undefined], ['GET', '/connections', undefined],
@@ -44,7 +43,7 @@ test('controller surface sends only named reads, entry switch and validated relo
 
 test('HTTP errors ignore response content and classify explicit reload rejection', async t => {
  let status = 401, body = 'password: fixture-only';
- const {adapter} = await fixture(t, {endpoint: {secret: 'local-test'}, validate: () => {}});
+ const {adapter, root} = await fixture(t, {endpoint: {secret: 'local-test'}, validate: () => {}});
  const requests = [];
  t.mock.method(http, 'request', (options, respond) => {
   requests.push(options);
@@ -69,14 +68,14 @@ test('HTTP errors ignore response content and classify explicit reload rejection
  status = 400;
  for (body of ['password: fixture-only', '']) {
   let rolledBack = false;
-  await assert.rejects(adapter.reload('proxies: []', () => {}, () => { rolledBack = true; }),
+  await assert.rejects(adapter.reload(root, 'proxies: []', () => {}, () => { rolledBack = true; }),
    {message: 'Clash 控制接口返回 400，文件已回退；请刷新状态后重试'});
   assert.ok(rolledBack);
  }
 });
 
 test('a connected controller failure preserves the transport error and leaves the reload unconfirmed', async t => {
- const {adapter} = await fixture(t, {validate: () => {}});
+ const {adapter, root} = await fixture(t, {validate: () => {}});
  t.mock.method(http, 'request', () => {
   const req = new EventEmitter();
   req.write = () => {};
@@ -88,7 +87,7 @@ test('a connected controller failure preserves the transport error and leaves th
   return req;
  });
  await assert.rejects(adapter.relayState(), {message: 'read ECONNRESET'});
- await assert.rejects(adapter.reload('proxies: []', () => {}, () => assert.fail('rollback')),
+ await assert.rejects(adapter.reload(root, 'proxies: []', () => {}, () => assert.fail('rollback')),
   {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
 });
 
@@ -132,9 +131,9 @@ test('verified manual switch cannot overwrite a late Verge edit', async t => {
  assert.equal(await fs.readFile(file, 'utf8'), vergeContents);
 });
 
-test('diagnostic reads use four seconds and reload gives the controller thirty seconds', async t => {
+test('reads honor a caller-supplied timeout and reload gives the controller thirty seconds', async t => {
  const deadlines = [];
- const {adapter} = await fixture(t, {validate: () => {}});
+ const {adapter, root} = await fixture(t, {validate: () => {}});
  const schedule = setTimeout;
  t.mock.method(globalThis, 'setTimeout', (callback, timeout) => {
   deadlines.push(timeout);
@@ -151,9 +150,51 @@ test('diagnostic reads use four seconds and reload gives the controller thirty s
   return req;
  });
  await assert.rejects(adapter.connections(4000), {message: 'Clash 控制接口超时'});
- await assert.rejects(adapter.reload('proxies: []', () => {}, () => assert.fail('rollback')),
+ await assert.rejects(adapter.reload(root, 'proxies: []', () => {}, () => assert.fail('rollback')),
   {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
  assert.deepEqual(deadlines, [4000, 30000]);
+});
+
+test('Windows Network Check can verify a controller response after five seconds', async t => {
+ const {b} = await fixture(t);
+ const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+ Object.defineProperty(process, 'platform', {...platform, value: 'win32'});
+ t.after(() => Object.defineProperty(process, 'platform', platform));
+ t.mock.method(os, 'networkInterfaces', () => ({}));
+ b.trace = async () => ({ip: '203.0.113.10'});
+ b.settings.expectedIP = '203.0.113.10';
+ b.ipv6Probe = async () => ({connected: false});
+ b.powershell = async () => JSON.stringify({connections: [{LocalPort: 5000, LocalAddress: '127.0.0.1'}]});
+ const replies = {
+  '/configs': {mode: 'global'},
+  '/proxies': {proxies: {[ENTRY]: {now: 'relay', all: ['relay']}, GLOBAL: {now: EXIT}}},
+  '/providers/proxies': {},
+  '/connections': {connections: [{metadata: {sourcePort: '5000', sourceIP: '127.0.0.1'}, chains: [EXIT]}]},
+ };
+ const deadlines = [];
+ t.mock.method(globalThis, 'setTimeout', (abandon, ms) => {
+  deadlines.push(ms);
+  if (ms < 5000) queueMicrotask(abandon);
+ });
+ t.mock.method(http, 'request', ({path: route}, respond) => {
+  const req = new EventEmitter();
+  req.on('newListener', event => {
+   if (event === 'error') req.emit('socket', {connecting: false});
+  });
+  req.destroy = error => req.emit('error', error);
+  req.end = () => queueMicrotask(() => {
+   const response = Object.assign(new EventEmitter(), {statusCode: 200});
+   respond(response);
+   response.emit('data', Buffer.from(JSON.stringify(replies[route])));
+   response.emit('end');
+   req.emit('close');
+  });
+  return req;
+ });
+ const report = await b.networkCheck();
+ assert.equal(report.stable, true);
+ assert.equal(report.claude.status, 'ok');
+ assert.deepEqual(deadlines, Array(7).fill(6000));
 });
 
 test('a rejection after seven seconds still rolls back a Windows reload', async t => {
@@ -176,7 +217,7 @@ test('a rejection after seven seconds still rolls back a Windows reload', async 
   });
   return req;
  });
- const reload = adapter.reload(payload, () => fs.writeFile(file, payload), () => fs.writeFile(file, original));
+ const reload = adapter.reload(root, payload, () => fs.writeFile(file, payload), () => fs.writeFile(file, original));
  await assert.rejects(reload, /400.*文件已回退/);
  assert.equal(await fs.readFile(file, 'utf8'), original);
 });

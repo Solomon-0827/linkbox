@@ -618,6 +618,24 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 self.apply({'a': ['current'], 'b': []})
                 self.assertIn('b', self.reload['proxy-providers'])
 
+    def test_verified_switch_reports_missing_profiles_file_during_persistence(self):
+        state = {**self.active, 'live': ['current', 'fast']}
+        replace_guard = tempfile.mkstemp
+
+        def remove_profiles_before_guard(*args, **kwargs):
+            self.index.unlink()
+            return replace_guard(*args, **kwargs)
+
+        with (patch.object(gui, 'snapshot', side_effect=lambda: {**state, 'entry': self.active['entry']}),
+              patch.object(clash.tempfile, 'mkstemp', side_effect=remove_profiles_before_guard)):
+            result = gui.change('fast', 'current')
+
+        missing = FileNotFoundError(2, 'No such file or directory', str(self.index))
+        self.assertEqual(result['message'], '实时切换成功，但保存选择失败：' + str(missing))
+        self.assertEqual(result['state']['entry'], 'fast')
+        self.assertEqual(self.requests, [ENTRY_ROUTE])
+        self.assertFalse(self.index.exists())
+
     def test_manual_and_auto_switch_ignore_duplicate_loaded_by_other_group(self):
         self.policy.write_text(json.dumps({'selected_nodes': {'a': ['current', 'same']}}))
         config = yaml.safe_load(self.config.read_bytes())

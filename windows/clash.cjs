@@ -130,20 +130,18 @@ class Clash {
  async connections(timeout) { return this.#call('GET', '/connections', undefined, timeout); }
  async switchEntry(name) { await this.#call('PUT', ENTRY_ROUTE, {name}); }
 
- async reload(payload, prepare, rollback) {
+ async reload(root, payload, prepare, rollback) {
+  const temp = await fs.mkdtemp(path.join(root, 'linkbox-validate-'));
   try {
-   const temp = await fs.mkdtemp(path.join(this.root, 'linkbox-validate-'));
-   try {
-    const file = path.join(temp, 'config.yaml');
-    await fs.writeFile(file, payload, {mode: 0o600});
-    if (this.#validate) await this.#validate(file);
-    else await exec(await this.corePath(), ['-t', '-d', this.root, '-f', file],
-     {windowsHide: true, timeout: 30000, maxBuffer: 2e6});
-   } finally {
-    await fs.rm(temp, {recursive: true, force: true});
-   }
+   const file = path.join(temp, 'config.yaml');
+   await fs.writeFile(file, payload, {mode: 0o600});
+   if (this.#validate) await this.#validate(file);
+   else await exec(await this.corePath(), ['-t', '-d', root, '-f', file],
+    {windowsHide: true, timeout: 30000, maxBuffer: 2e6});
   } catch {
    throw Error('配置校验失败，未改动当前代理');
+  } finally {
+   await fs.rm(temp, {recursive: true, force: true});
   }
 
   // Recheck the snapshots and install the files only after validation succeeds.
@@ -162,20 +160,19 @@ class Clash {
   }
  }
 
- profilesFile() { return path.join(this.root, 'profiles.yaml'); }
- scriptFile() { return this.profileFile('Script.js'); }
- profileFile(filename) {
+ profilesFile(root) { return path.join(root, 'profiles.yaml'); }
+ scriptFile(root) { return this.profileFile(root, 'Script.js'); }
+ profileFile(root, filename) {
   if (typeof filename !== 'string' || !filename || filename === '.' || filename === '..' ||
       path.basename(filename) !== filename || filename.includes('/') || filename.includes('\\')) {
    throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
   }
-  return path.join(this.root, 'profiles', filename);
+  return path.join(root, 'profiles', filename);
  }
- managedCacheFile(owner) { return path.join(this.root, 'providers', 'linkbox', owner + '.yaml'); }
- providerFile(filename) { return path.resolve(this.root, filename); }
+ managedCacheFile(root, owner) { return path.join(root, 'providers', 'linkbox', owner + '.yaml'); }
+ providerFile(root, filename) { return path.resolve(root, filename); }
 
- async persistSelection(name) {
-  const file = this.profilesFile();
+ async persistSelection(file, name) {
   const original = await readFile(file);
   const index = YAML.parse(original.toString());
   if (updateSelector(index, name)) {
@@ -190,8 +187,8 @@ class Clash {
   return typeof value === 'string' ? value : '';
  }
 
- async config() {
-  const configured = this.connectionPath('configDir');
+ async config(pinnedRoot) {
+  const configured = pinnedRoot ?? this.connectionPath('configDir');
   const directory = 'io.github.clash-verge-rev.clash-verge-rev';
   const roots = configured ? [configured] : process.platform === 'win32'
    ? [process.env.APPDATA, process.env.LOCALAPPDATA].map(base => path.join(base || '', directory))
@@ -201,11 +198,7 @@ class Clash {
     const file = path.join(root, name);
     try {
      const config = YAML.parse((await readFile(file))?.toString() || '');
-     if (Array.isArray(config?.proxies)) {
-      this.root = root;
-      this.configFile = file;
-      return config;
-     }
+     if (Array.isArray(config?.proxies)) return {root, file, config};
     } catch {}
    }
   }
@@ -214,7 +207,7 @@ class Clash {
 
  async #discover() {
   let config;
-  try { config = await this.config(); }
+  try { ({config} = await this.config()); }
   catch (error) { throw new ClashRequestNotSent(error.message); }
   const endpoints = [];
   // Clash Verge service uses an owner-scoped endpoint, overriding the sidecar path in YAML.
