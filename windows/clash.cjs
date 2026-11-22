@@ -151,10 +151,10 @@ class Clash {
   // Recheck the snapshots and install the files only after validation succeeds.
   await prepare();
   // A settings save can invalidate the controller while the files are being installed.
-  // Rediscovering the same controller is harmless; only a settings reset invalidates it.
+  // Only a settings reset invalidates it; a rediscovery since then is the current controller.
   if (!endpoint || this.#generation !== generation) throw Error(RELOAD_UNCERTAIN);
   try {
-   await this.#transport(endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
+   await this.#transport(this.#endpoint || endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
   } catch (error) {
    const unsent = error instanceof ClashRequestNotSent ||
     ['ECONNREFUSED', 'ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH'].includes(error?.code);

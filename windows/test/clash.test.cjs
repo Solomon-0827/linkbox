@@ -261,3 +261,30 @@ test('a concurrent rediscovery of the same controller does not cancel the reload
  await adapter.reload(root, 'proxies: []', () => {}, () => assert.fail('rollback'));
  assert.deepEqual(requests.at(-1), ['PUT', '/configs?force=false', {payload: 'proxies: []'}]);
 });
+
+test('a reload uses the controller rediscovered after the original one stopped answering', async t => {
+ const puts = [];
+ let releaseSecond, validate;
+ const secondVersion = new Promise(resolve => { releaseSecond = resolve; });
+ let versions = 0;
+ const {adapter, root} = await fixture(t, {
+  endpoint: undefined,
+  resolveConfig: async () => ({config: {'external-controller': '127.0.0.1:9097'}}),
+  validate: () => validate(),
+  transport: async (endpoint, method, route) => {
+   if (route === '/version') {
+    versions += 1;
+    if (versions === 2) await secondVersion;
+    endpoint.found = versions;
+    return {};
+   }
+   if (method === 'PUT') puts.push(endpoint.found);
+   return {};
+  },
+ });
+ const first = adapter.providers(), second = adapter.connections();
+ await first;
+ validate = async () => { releaseSecond(); await second; };
+ await adapter.reload(root, 'proxies: []', () => {}, () => assert.fail('rollback'));
+ assert.deepEqual(puts, [2]);
+});
