@@ -15,6 +15,7 @@ APP = OUT / '链路盒子.app'
 RESOURCES = [ROOT / 'assets/ProxyToolbox.icns', ROOT / 'windows/coffee-extract.js']
 CHECK_PAGE = ROOT / 'macos/backend/check.html'
 IP_COMPARISON = ROOT / 'windows/ip-address.js'
+BACKEND_MODULES = ('clash', 'subscription_update', 'subscription_picker')
 REQUIRED_FILES = (
     'MacOS/ProxyToolbox',
     'Resources/backend/linkbox-backend',
@@ -74,9 +75,15 @@ def main():
         '--workpath', str(BUILD / 'work'), '--specpath', str(BUILD),
         '--add-data', str(CHECK_PAGE) + ':.', '--add-data', str(IP_COMPARISON) + ':.',
         '--collect-data', 'certifi',
-        '--hidden-import', 'subscription_update', '--hidden-import', 'subscription_picker',
+        *(f'--hidden-import={name}' for name in BACKEND_MODULES),
         str(ROOT / 'macos/backend/gui_backend.py'),
     ], check=True)
+    from PyInstaller.archive.readers import CArchiveReader
+    executable = BUILD / 'backend/linkbox-backend/linkbox-backend'
+    archive = CArchiveReader(str(executable)).open_embedded_archive('PYZ.pyz')
+    for name in BACKEND_MODULES:
+        if name not in archive.toc:
+            raise SystemExit(f'Missing required backend module: {name}')
     if APP.exists():
         shutil.rmtree(APP)
     contents = APP / 'Contents'

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import yaml
 
+import clash
 import chain_test
 import gui_backend
 import runtime
@@ -25,7 +26,7 @@ class PolicyTests(unittest.TestCase):
         def relay(address):
             return {'name': 'same', 'server': address}
 
-        with tempfile.TemporaryDirectory() as tmp, patch.object(chain_test, 'CONFIG_DIR', Path(tmp)):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(clash, 'CONFIG_DIR', Path(tmp)):
             (Path(tmp) / 'a.yaml').write_text(yaml.safe_dump({'proxies': [relay('a.example.invalid')]}))
             config = {'proxies': [relay('local.example.invalid'),
                                    {'name': t.EXIT, 'server': '203.0.113.10', 'dialer-proxy': t.ENTRY}],
@@ -38,11 +39,11 @@ class PolicyTests(unittest.TestCase):
 
     def test_provider_labels_are_not_assumed_from_node_name(self):
         providers = {'providers': {owner: {'proxies': [{'name': 'node'}]} for owner in ['A', 'B']}}
-        with patch.object(t, 'api', return_value=providers):
+        with patch.object(clash, '_request', return_value=providers):
             self.assertEqual(t.node_inventory({'node': {}}, {'node': 'B'})['node'][1], 'B')
 
     def test_expected_exit_comes_from_local_config(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(runtime, 'CONFIG_DIR', Path(tmp)), patch.object(runtime, 'read_json', return_value={}):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(clash, 'CONFIG_DIR', Path(tmp)), patch.object(runtime, 'read_json', return_value={}):
             (Path(tmp) / 'clash-verge.yaml').write_text('proxies:\n - name: 美国静态家宽\n   server: 192.0.2.55\n')
             self.assertEqual(runtime.expected_ip(), '192.0.2.55')
 

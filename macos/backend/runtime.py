@@ -3,12 +3,11 @@ from ipaddress import ip_address
 import json
 import os
 from pathlib import Path
-import yaml
+import clash
 import settings
 
 BASE = Path(os.environ.get('LINKBOX_DATA_DIR', Path.home()/'Library/Application Support/ProxyToolbox'))
 BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
-CONFIG_DIR = Path(os.environ.get('LINKBOX_CONFIG_DIR', Path.home()/'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev'))
 CONCURRENCY = settings.benchmark_value('concurrency', None)
 
 def read_json(name):
@@ -21,8 +20,8 @@ def expected_ip(config=None):
     value=read_json('settings.json').get('expected_ip','')
     if not value:
         try:
-            if config is None:config=yaml.safe_load((CONFIG_DIR/'clash-verge.yaml').read_text())
-            value=next(n.get('server','') for n in config.get('proxies',[]) if n.get('name')=='美国静态家宽')
+            if config is None:config=clash.read_config()
+            value=next(n.get('server','') for n in config.get('proxies',[]) if n.get('name')==clash.EXIT)
         except (OSError,ValueError,StopIteration,AttributeError):return ''
     try:return str(ip_address(value))
     except (ValueError, TypeError):return ''

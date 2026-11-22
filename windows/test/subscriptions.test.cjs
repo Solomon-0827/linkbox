@@ -8,7 +8,8 @@ const {EventEmitter} = require('node:events');
 const http = require('node:http');
 const vm = require('node:vm');
 const YAML = require('yaml');
-const {Backend, ClashHTTPError, ENTRY, EXIT} = require('../backend.cjs');
+const {Backend} = require('../backend.cjs');
+const {Clash, ClashHTTPError, ENTRY, EXIT} = require('../clash.cjs');
 const sub = require('../subscriptions.cjs');
 
 const node = (name, server = 'relay.example.invalid') => ({
@@ -39,7 +40,9 @@ async function fixture(t) {
  await write('profiles/b.yaml', {proxies: ['same','other'].map(n => node(n))});
  const b = await new Backend(data).init();
  b.settings.configDir = root;
- b.endpoint = {};
+ b.clash = new Clash(()=>b.settings, script=>b.powershell(script), {
+  endpoint: {}, transport: (...args)=>b.request(...args), validate: file=>b.validateConfig(file),
+ });
  await fs.writeFile(path.join(data, 'subscriptions.json'), JSON.stringify({
   sources: items.map(({uid, url}) => ({name: uid, url})),
  }));
@@ -154,7 +157,7 @@ test('unmanaged ENTRY uses live relays with a native HTTP provider', async t => 
  await t.test('benchmarks available live relay credentials', async () => {
   const probes = [];
   b.network = async () => ({name:'fixture'});
-  b.corePath = async () => 'fixture';
+  b.clash.corePath = async () => 'fixture';
   b.testNode = async node => {probes.push(node.name);return {delay:100,status:'done'};};
   const {results} = await b.benchmark();
   assert.deepEqual(probes.sort(), ['current','fast']);
@@ -185,7 +188,7 @@ test('saved selection controls relays with a reused inline provider', async t =>
  });
  const probes = [];
  b.network = async () => ({name:'fixture'});
- b.corePath = async () => 'fixture';
+ b.clash.corePath = async () => 'fixture';
  b.testNode = async ({name}) => {
   probes.push(name);
   return {delay:name === 'fast' ? 10 : 100, status:'done'};
@@ -262,8 +265,11 @@ test('same-name owner move with connection refused rolls back', async t => {
   });
   return request;
  });
- const controller = b.request;
- b.request = (...args) => args[2] === '/configs?force=false' ? Backend.prototype.request.call(b,...args) : controller(...args);
+ const relayState = b.clash.relayState.bind(b.clash);
+ b.clash = new Clash(()=>b.settings, script=>b.powershell(script), {
+  endpoint: {}, validate: file=>b.validateConfig(file),
+ });
+ b.clash.relayState = relayState;
  for (code of ['ECONNREFUSED','ENOENT','ENOTFOUND','ETIMEDOUT']) {
   await assert.rejects(apply({a:[], b:['current','fast']}), /未发送重载请求.*文件已回退/);
   assert.deepEqual(await Promise.all(files.map(file=>fs.readFile(file))), before);
@@ -277,7 +283,7 @@ test('same-name owner move with connection refused rolls back', async t => {
 test('saving another subscription keeps unreadable cache selection and provider', async t => {
  const {b, root, write, apply, saved, refreshWith} = await fixture(t);
  await apply({a:['current','fast'], b:['same','other']});
- const before = (await b.config())['proxy-providers'].b;
+ const before = (await b.clash.config())['proxy-providers'].b;
  await write('profiles/a.yaml', {proxies:['current','fast','same'].map(n => node(n))});
  await fs.writeFile(path.join(root, 'profiles/b.yaml'), 'proxies: [');
  const {sources:[, unreadable]} = await sub.catalog(b);
@@ -286,13 +292,13 @@ test('saving another subscription keeps unreadable cache selection and provider'
  assert.deepEqual((await saved()).selected_nodes, {a:['current','fast'], b:['same','other']});
  await sub.remove(b, {entry:'current', names:['fast']});
  assert.deepEqual((await saved()).selected_nodes, {a:['current'], b:['same','other']});
- assert.deepEqual((await b.config())['proxy-providers'].b, before);
+ assert.deepEqual((await b.clash.config())['proxy-providers'].b, before);
  assert.match(unreadable.warning, /保留原勾选/);
  refreshWith({a:['fast']});
  const original = await saved();
  await assert.rejects(b.updateSubscriptions(), /下载/);
  assert.deepEqual(await saved(), original);
- assert.deepEqual((await b.config())['proxy-providers'].b, before);
+ assert.deepEqual((await b.clash.config())['proxy-providers'].b, before);
 });
 
 test('catalog exposes both copies and selects exactly one owner', async t => {
@@ -566,7 +572,7 @@ for (const reference of ['selector', 'include-all-proxies', 'MATCH,current', 'DO
   };
   for (let save = 0; save < 2; save++) {
    await apply({a:['fast'], b:[]});
-   assert.deepEqual((await b.config()).proxies.find(n => n.name === 'current'), node('current'));
+   assert.deepEqual((await b.clash.config()).proxies.find(n => n.name === 'current'), node('current'));
    const script = await fs.readFile(path.join(root, 'profiles/Script.js'), 'utf8');
    const profile = {...structuredClone(config), proxies:config.proxies.slice(1)};
    const regenerated = JSON.parse(vm.runInNewContext(script + '\nJSON.stringify(main(profile))', {profile}));
@@ -674,7 +680,7 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
  test('other group retains a deselected provider through ' + Object.keys(reference)[0], async t => {
   const {b, root, write, apply, requests} = await fixture(t);
   await apply({a:['current'],b:['other']});
-  const config = await b.config(), previous = config['proxy-providers'].b;
+  const config = await b.clash.config(), previous = config['proxy-providers'].b;
   config['proxy-groups'].push({name:'secondary',type:'select',...reference,filter:'^other$'});
   await write('clash-verge.yaml', config);
   if (process.env.LINKBOX_TEST_CORE) b.validateConfig = file => {
@@ -684,7 +690,7 @@ for (const reference of [{use:['b']}, {'include-all':true}, {'include-all-provid
   const live = YAML.parse(requests.at(-1).body.payload);
   assert.deepEqual(live['proxy-groups'][0].use, ['a']);
   assert.equal(live['proxy-providers'].b.filter, '^other$');
-  assert.deepEqual((await b.config())['proxy-providers'].b, previous);
+  assert.deepEqual((await b.clash.config())['proxy-providers'].b, previous);
   const script = await fs.readFile(path.join(root,'profiles/Script.js'),'utf8');
   const context = require('node:vm').createContext({input:{'proxy-groups':config['proxy-groups']}});
   assert.deepEqual(JSON.parse(require('node:vm').runInContext(script + "\nJSON.stringify(main(input))", context))['proxy-providers'].b, previous);
@@ -817,7 +823,7 @@ test('lost Save response keeps the new owner and allows a fresh update', async t
  await assert.rejects(apply({a:[],b:['fast','other']}), /已写入新配置，Clash 未确认，请刷新状态核对/);
  assert.deepEqual(requests.map(r => r.route), ['/configs?force=false']);
  assert.deepEqual(await saved(), {selected_nodes:{b:['fast','other']},provider_labels:{a:'A',b:'B'}});
- assert.deepEqual((await b.config())['proxy-groups'][0].use, ['b']);
+ assert.deepEqual((await b.clash.config())['proxy-groups'][0].use, ['b']);
  assert.equal(state.entry, 'current');
  assert.equal(b.busy, false);
 
@@ -875,7 +881,7 @@ for (const kind of ['chain', 'entrance']) test(`an interrupted ${kind} benchmark
  };
  b.network = async () => ({interface:'fixture'});
  b.loadNodes = async () => ({nodes:new Map([['current',node('current')]]),exit:node(EXIT)});
- b.corePath = async () => '/mock';
+ b.clash.corePath = async () => '/mock';
  b.testNode = async () => { probed = true; return {status:'done',delay:120}; };
  await assert.rejects(b.benchmark(kind), /controller read failed/);
  assert.equal(probed, true);
@@ -911,7 +917,7 @@ test('missing relay cannot win reconciliation on an old benchmark delay', async 
   nodes:inputs.selection.a.map(name => ({name,providerId:'a'}))});
  b.loadNodes = async () => ({nodes:new Map([['fresh',node('fresh')]]),exit:node(EXIT)});
  b.network = async () => ({interface:'fixture'});
- b.corePath = async () => '/mock';
+ b.clash.corePath = async () => '/mock';
  b.testNode = async () => ({status:'done',delay:120,entranceDelay:50});
  const result = await b.benchmark();
  assert.equal(result.latestResults.stale.entranceDelay, null);

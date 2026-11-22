@@ -13,6 +13,8 @@ from urllib.parse import quote
 
 import yaml
 
+import clash
+import chain_test as chain
 import gui_backend as gui
 import runtime
 import subscription_picker as picker
@@ -57,9 +59,9 @@ class SubscriptionFixture:
         stack = ExitStack()
         self.addCleanup(stack.close)
         for obj, key, value in [(runtime, 'BASE', self.base), (t, 'BASE', self.base),
-                                (runtime, 'CONFIG_DIR', self.root)]:
+                                (clash, 'CONFIG_DIR', self.root)]:
             stack.enter_context(patch.object(obj, key, value))
-        self.validate = stack.enter_context(patch.object(update.subprocess, 'run'))
+        self.validate = stack.enter_context(patch.object(clash.subprocess, 'run'))
         self.requests = []
         self.reload = None
         self.providers = {
@@ -68,8 +70,8 @@ class SubscriptionFixture:
         }
         self.at_reload = []
         self.keep_stale_entry = False
-        self.real_api = t.api
-        self.api = stack.enter_context(patch.object(t, 'api', side_effect=self.controller))
+        self.real_api = clash._request
+        self.api = stack.enter_context(patch.object(clash, '_request', side_effect=self.controller))
         stack.enter_context(patch.object(t, 'relay_state', side_effect=lambda **_: self.active.copy()))
         self.downloaded = {}
         self.fetch = stack.enter_context(patch.object(update, 'fetch', wraps=update.fetch, side_effect=self.download))
@@ -149,7 +151,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 if flag != 'include-all-proxies':
                     self.active['live'].append('provider-fast')
                 target = self.active['live'][-1]
-                with patch.object(t, 'persist_selection'):
+                with patch.object(clash, 'persist_selection'):
                     self.assertEqual(gui.change(target, 'current')['state']['entry'], target)
 
     def test_unmanaged_switch_with_unsupported_group_filter_uses_live_names(self):
@@ -162,7 +164,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             run_process([core, '-t', '-d', str(self.root), '-f', str(self.config)],
                         capture_output=True, timeout=10, check=True)
         self.active.update(entry='入口甲', live=['入口甲', '入口乙'])
-        with patch.object(t, 'persist_selection'):
+        with patch.object(clash, 'persist_selection'):
             with self.assertRaisesRegex(RuntimeError, '节点状态已变化'):
                 gui.change(t.EXIT, '入口甲')
             self.assertEqual(gui.change('入口乙', '入口甲')['state']['entry'], '入口乙')
@@ -179,13 +181,12 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with self.subTest(operation='list'):
             self.assertEqual([row['name'] for row in gui.snapshot()['node_rows']], names)
         with (self.subTest(operation='benchmark'),
-              patch.object(update.c, 'CONFIG_DIR', self.root),
-              patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
-              patch.object(update.c, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe):
-            _, report, _ = update.c.run(1)
+              patch.object(chain, 'physical_network', return_value={'interface': 'fixture'}),
+              patch.object(chain, 'test_node', return_value=([{'ms': 100, 'ip': '203.0.113.10'}] * 3, [], {})) as probe):
+            _, report, _ = chain.run(1)
             self.assertEqual([call.args[0]['name'] for call in probe.call_args_list], ['current', 'fast'])
             self.assertEqual(set(report['results']), set(names))
-        with self.subTest(operation='switch'), patch.object(t, 'persist_selection'):
+        with self.subTest(operation='switch'), patch.object(clash, 'persist_selection'):
             self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
             self.assertEqual(gui.change('native-relay', 'fast')['state']['entry'], 'native-relay')
 
@@ -208,17 +209,16 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             delay = 10 if relay['name'] == 'fast' else 100
             return ([{'ms': delay, 'ip': '203.0.113.10'}] * 3, [], {})
 
-        with (patch.object(update.c, 'CONFIG_DIR', self.root),
-              patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
-              patch.object(update.c, 'test_node', side_effect=probe) as measure):
-            _, report, (nodes, *_) = update.c.run(1)
+        with (patch.object(chain, 'physical_network', return_value={'interface': 'fixture'}),
+              patch.object(chain, 'test_node', side_effect=probe) as measure):
+            _, report, (nodes, *_) = chain.run(1)
         with self.subTest(operation='benchmark'):
             self.assertEqual(set(nodes), {'current'})
             self.assertEqual([call.args[0]['name'] for call in measure.call_args_list], ['current'])
             self.assertEqual(set(report['results']), {'current'})
             self.assertEqual(report['results']['current']['owner'], 'a')
         with self.subTest(operation='auto-switch'):
-            self.assertIsNone(update.c.auto_candidate(report, 'chain'))
+            self.assertIsNone(chain.auto_candidate(report, 'chain'))
         with self.subTest(operation='manual switch'):
             with self.assertRaisesRegex(RuntimeError, '节点状态已变化'):
                 gui.change('fast', 'current')
@@ -425,7 +425,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
 
         def unavailable(method, route, body=None, **kwargs):
             if (method, route) == ('GET', '/providers/proxies'):
-                raise t.ClashHTTPError(404)
+                raise clash.ClashHTTPError(404)
             return self.controller(method, route, body, **kwargs)
 
         self.api.side_effect = unavailable
@@ -631,13 +631,13 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         nodes = {'current': node('current'), 'same': node('same')}
         exit_node = config['proxies'][-1]
         network = {'interface': 'fixture'}
-        guard = {'network': network, 'before': state, 'routing_fingerprint': update.c.routing_fingerprint(
-            nodes, exit_node, '203.0.113.10', update.c.DNS_POLICY, 'current', 'same')}
+        guard = {'network': network, 'before': state, 'routing_fingerprint': chain.routing_fingerprint(
+            nodes, exit_node, '203.0.113.10', chain.DNS_POLICY, 'current', 'same')}
         with (patch.object(gui, 'snapshot', side_effect=lambda: {**state, 'entry': self.active['entry']}),
-              patch.object(update.c, 'load_nodes', return_value=(nodes, exit_node, '203.0.113.10')),
-              patch.object(update.c, 'physical_network', return_value=network),
-              patch.object(update.c, 'active_state', return_value=(state, state['nodes'])),
-              patch.object(t, 'persist_selection')):
+              patch.object(chain, 'load_nodes', return_value=(nodes, exit_node, '203.0.113.10')),
+              patch.object(chain, 'physical_network', return_value=network),
+              patch.object(chain, 'active_state', return_value=(state, state['nodes'])),
+              patch.object(clash, 'persist_selection')):
             for mode in (None, guard):
                 self.active.update(entry='current', live=state['live'])
                 self.assertEqual(gui.change('same', 'current', mode)['state']['entry'], 'same')
@@ -650,7 +650,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.config.write_bytes(update.dump(config))
         self.apply({'a': ['current', 'fast'], 'b': []})
         with (patch.object(gui, 'snapshot', side_effect=lambda: {**self.active, 'nodes': self.active['live']}),
-              patch.object(t, 'persist_selection')):
+              patch.object(clash, 'persist_selection')):
             self.assertEqual(gui.change('fast', 'current')['state']['entry'], 'fast')
         self.assertEqual(self.requests, ['/configs?force=false', ENTRY_ROUTE])
 
@@ -680,8 +680,8 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.apply({'a': ['current', 'fast'], 'b': []})
         before = {k: v for k, v in self.files().items() if not k.startswith('backups/')}
         active = self.active.copy()
-        with (patch.object(t, 'api', self.real_api),
-              patch.object(t.socket, 'socket') as socket_factory):
+        with (patch.object(clash, '_request', self.real_api),
+              patch.object(clash.socket, 'socket') as socket_factory):
             connect = socket_factory.return_value.connect
             for error in (ConnectionRefusedError(errno.ECONNREFUSED, 'refused'),
                           FileNotFoundError(errno.ENOENT, 'socket missing'), TimeoutError('connect timed out')):
@@ -707,12 +707,12 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         nodes = {name: node(name) for name in state['nodes']}
         network = {'interface': 'fixture'}
         guard = {'network': network, 'before': self.active.copy(), 'routing_fingerprint':
-                 update.c.routing_fingerprint(nodes, {}, '203.0.113.10', update.c.DNS_POLICY, 'current', 'same')}
+                 chain.routing_fingerprint(nodes, {}, '203.0.113.10', chain.DNS_POLICY, 'current', 'same')}
         self.requests.clear()
         with (patch.object(gui, 'snapshot', side_effect=lambda: {**state, 'entry': self.active['entry']}),
-              patch.object(update.c, 'load_nodes', return_value=(nodes, {}, '203.0.113.10')),
-              patch.object(update.c, 'physical_network', return_value=network),
-              patch.object(t, 'persist_selection')):
+              patch.object(chain, 'load_nodes', return_value=(nodes, {}, '203.0.113.10')),
+              patch.object(chain, 'physical_network', return_value=network),
+              patch.object(clash, 'persist_selection')):
             for mode in (None, guard):
                 with self.subTest(automatic=mode is not None):
                     self.active['entry'] = 'current'
@@ -722,11 +722,11 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
     def test_failed_benchmark_start_preserves_display_history_and_invalidates_ranking(self):
         history = {'results': {'fast': {'owner': 'a', 'delay': 10, 'chain_delay': 20}},
                    'finished_at': '2026-11-20T00:00:00+00:00'}
-        for start in (update.c.run, gui.latency):
+        for start in (chain.run, gui.latency):
             with self.subTest(benchmark=start.__module__):
                 for name in ('chain-results.json', 'latency-results.json'):
                     (self.base / name).write_text(json.dumps(history))
-                with (patch.object(update.c, 'active_state', side_effect=RuntimeError('controller read failed')),
+                with (patch.object(chain, 'active_state', side_effect=RuntimeError('controller read failed')),
                       patch.object(gui, 'snapshot', side_effect=RuntimeError('controller read failed'))):
                     with self.assertRaisesRegex(RuntimeError, 'controller read failed'):
                         start()
@@ -743,7 +743,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         with (patch.object(gui, 'snapshot', return_value={**self.active, 'nodes': ['current']}),
               patch.object(t, 'state', return_value=({}, {})),
               patch.object(t, 'node_inventory', return_value={}),
-              patch.object(t, 'api', return_value={'delay': 5})):
+              patch.object(clash, '_request', return_value={'delay': 5})):
             gui.latency()
             row, = gui.node_rows({}, {'current': 'a'})
         self.assertEqual((row['delay'], row['chain_delay']), (5, 20))
@@ -761,12 +761,12 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         def probe(*_):
             probed.append(True)
             return [], [], {}
-        with (patch.object(update.c, 'active_state', side_effect=read_chain),
-              patch.object(update.c, 'load_nodes', return_value=({'current': node('current')}, {}, '203.0.113.10')),
-              patch.object(update.c, 'physical_network', return_value={'interface': 'fixture'}),
-              patch.object(update.c, 'test_node', side_effect=probe)):
+        with (patch.object(chain, 'active_state', side_effect=read_chain),
+              patch.object(chain, 'load_nodes', return_value=({'current': node('current')}, {}, '203.0.113.10')),
+              patch.object(chain, 'physical_network', return_value={'interface': 'fixture'}),
+              patch.object(chain, 'test_node', side_effect=probe)):
             with self.assertRaisesRegex(RuntimeError, 'controller read failed'):
-                update.c.run(1)
+                chain.run(1)
         self.assertTrue(probed)
         self.downloaded = {'a': ['fast', 'quick'], 'b': ['other']}
         picker.synchronize()
@@ -786,7 +786,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             return {'delay': 100}
         with (patch.object(gui, 'snapshot', side_effect=snapshot),
               patch.object(t, 'state', return_value=({}, {})),
-              patch.object(t, 'node_inventory', return_value={}), patch.object(t, 'api', side_effect=probe)):
+              patch.object(t, 'node_inventory', return_value={}), patch.object(clash, '_request', side_effect=probe)):
             with self.assertRaisesRegex(RuntimeError, 'controller read failed'):
                 gui.latency()
         self.assertTrue(probed)
@@ -796,7 +796,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
 
     def test_validation_and_external_changes_leave_files_untouched(self):
         before = self.files()
-        self.validate.side_effect = update.subprocess.CalledProcessError(1, 'mihomo')
+        self.validate.side_effect = clash.subprocess.CalledProcessError(1, 'mihomo')
         with self.assertRaisesRegex(RuntimeError, '校验失败'):
             self.apply({'a': ['fast'], 'b': []})
         self.validate.side_effect = lambda *args, **kwargs: self.active.update(entry='external')
@@ -821,7 +821,7 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         def reject_reload(method, route, body=None, **_):
             self.requests.append(route)
             if method == 'PUT':
-                raise t.ClashHTTPError(400)
+                raise clash.ClashHTTPError(400)
             raise OSError('offline')
         self.api.side_effect = reject_reload
         with self.assertRaisesRegex(RuntimeError, '400.*文件已回退'):
@@ -830,10 +830,10 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual({k: v for k, v in self.files().items() if not k.startswith('backups/')}, before)
 
     def test_transport_rejects_an_http_error_without_reading_the_body(self):
-        with (patch('toolbox.http.client.HTTPConnection.request'),
-              patch('toolbox.http.client.HTTPConnection.getresponse') as response):
+        with (patch('clash.http.client.HTTPConnection.request'),
+              patch('clash.http.client.HTTPConnection.getresponse') as response):
             response.return_value.status = 400
-            with self.assertRaises(t.ClashHTTPError) as rejected:
+            with self.assertRaises(clash.ClashHTTPError) as rejected:
                 self.real_api('PUT', '/configs?force=false')
             self.assertTrue(rejected.exception.rejected)
             response.return_value.read.assert_not_called()

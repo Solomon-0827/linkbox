@@ -2,9 +2,9 @@
 import hashlib
 import json
 import re
-from pathlib import Path
 from urllib.parse import urlsplit
 import yaml
+import clash
 import runtime
 import toolbox as t
 import subscription_update as update
@@ -38,8 +38,7 @@ def source_key(url):
 
 
 def discover(for_update=False):
-    root = runtime.CONFIG_DIR
-    profiles = document(update.read(root / 'profiles.yaml'))
+    profiles = document(clash.read_file(clash.profiles_file()))
     items = profiles.get('items')
     if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
         raise RuntimeError('无法完整读取 Clash Verge 订阅，未删除节点')
@@ -55,15 +54,15 @@ def discover(for_update=False):
             if for_update:
                 raise RuntimeError('Clash Verge 订阅需要 HTTPS 地址及本地文件，未更新节点')
             continue
-        # Only read local profile files under the known directory.
-        filename = item.get('file', '')
-        if not isinstance(filename, str) or Path(filename).name != filename or filename in {'.', '..'} or '\\' in filename:
+        filename = item['file']
+        try:
+            profile = clash.profile_file(filename)
+        except ValueError as error:
             if for_update:
-                raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
+                raise RuntimeError(str(error)) from None
             continue
         old = by_url.get(source_key(item['url']), {})
         identifier = old.get('name') or 'verge_' + hashlib.sha256(str(item.get('uid', filename)).encode()).hexdigest()[:12]
-        profile = root / 'profiles' / filename
         source = {'name': identifier, 'display_name': item.get('name') or identifier,
                   'url': item['url'], 'profile_file': filename}
         key = source_key(item['url'])
@@ -71,7 +70,7 @@ def discover(for_update=False):
             continue
         seen.add(key)
         try:
-            raw = update.read(profile)
+            raw = clash.read_file(profile)
         except OSError:
             raw = None
         sources.append((source, raw))
@@ -79,10 +78,10 @@ def discover(for_update=False):
         raise RuntimeError('订阅标识冲突，请先整理 Clash Verge 订阅')
     revisions = [[source, digest(raw)] for source, raw in sources]
     selection = runtime.read_json('node-policy.json').get('selected_nodes')
-    revision = fingerprint([str(root), revisions, selection])
+    revision = fingerprint([str(clash.CONFIG_DIR), revisions, selection])
     if for_update:
         return [(source, None) for source, _ in sources], revision, None
-    raw_preview = update.read(runtime.BASE / PREVIEW)
+    raw_preview = clash.read_file(runtime.BASE / PREVIEW)
     preview = document(raw_preview)
     preview_profiles = preview.get('profiles') if preview.get('revision') == revision else None
     preview_id = digest(raw_preview) if preview_profiles else None

@@ -5,6 +5,7 @@ from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import yaml
+import clash
 import chain_test as c
 
 class SafetyTests(unittest.TestCase):
@@ -34,7 +35,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(config['proxies'][0]['interface-name'],'en9')
         self.assertEqual(config['rules'],['DOMAIN,www.gstatic.com,TEST_ENTRY','MATCH,TEST_US_EXIT'])
     def test_expected_ip_override_with_hostname_and_different_server_ip(self):
-        with TemporaryDirectory() as tmp, patch.object(c, 'CONFIG_DIR', Path(tmp)), \
+        with TemporaryDirectory() as tmp, patch.object(clash, 'CONFIG_DIR', Path(tmp)), \
                 patch.object(c.runtime, 'read_json', return_value={'expected_ip': '203.0.113.10'}):
             path = Path(tmp) / 'clash-verge.yaml'
             for server in ['exit.example.invalid', '203.0.113.11']:
@@ -61,7 +62,7 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             c.isolated_config({'dialer-proxy':'other'},{},12345,'en9')
     def test_read_only_live_state(self):
-        with patch.object(c.t,'api',side_effect=lambda method,path: self.assertEqual(method,'GET') or {'proxies':{}}) as api:
+        with patch.object(clash,'_request',side_effect=lambda method,path,**_: self.assertEqual(method,'GET') or {'proxies':{}}) as api:
             c.active_state()
             self.assertGreater(api.call_count,0)
     def test_unknown_interface_refused(self):

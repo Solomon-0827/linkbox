@@ -1,65 +1,15 @@
 #!/usr/bin/env python3
 from contextlib import contextmanager
-import datetime
-import errno
 import fcntl
-import http.client
-import json
 import os
-from pathlib import Path
-import socket
 import subprocess
 import sys
-import tempfile
-import urllib.parse
 
-from runtime import BASE, CONFIG_DIR
+import clash
+from clash import ENTRY, EXIT, state
+from runtime import BASE
 from reconcile import selection_owners
 
-SOCKET = f'/var/run/clash-verge-service/users/{os.getuid()}/verge-mihomo.sock'
-PROFILES = CONFIG_DIR / 'profiles.yaml'
-EXIT = '美国静态家宽'
-ENTRY = '中转入口'
-
-class ClashHTTPError(RuntimeError):
-    def __init__(self, status):
-        super().__init__(f'Clash API 返回 {status}')
-        self.rejected = 400 <= status < 600
-
-
-class ClashRequestNotSent(OSError):
-    pass
-
-
-def request_not_sent(error):
-    return isinstance(error, (ClashRequestNotSent, socket.gaierror)) or getattr(error, 'errno', None) in (
-        errno.ECONNREFUSED, errno.ENOENT, errno.ENETUNREACH, errno.EHOSTUNREACH)
-
-
-def api(method, path, payload=None, *, timeout=6):
-    class Connection(http.client.HTTPConnection):
-        def connect(self):
-            try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.settimeout(timeout)
-                self.sock.connect(SOCKET)
-            except OSError as error:
-                raise ClashRequestNotSent('无法连接 Clash 控制接口') from error
-    conn = Connection('localhost')
-    try:
-        conn.request(method, path, json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None, {'Content-Type': 'application/json'})
-        response = conn.getresponse()
-        if response.status >= 300:
-            raise ClashHTTPError(response.status)
-        body = response.read()
-        return json.loads(body) if body else None
-    finally:
-        conn.close()
-
-def state(**request_options):
-    conf = api('GET', '/configs', **request_options)
-    p = api('GET', '/proxies', **request_options)['proxies']
-    return conf, p
 
 def relay_state(**request_options):
     config, proxies = state(**request_options)
@@ -83,18 +33,15 @@ def relay_owners(selection, live):
     if selection is not None:
         return selection_owners(selection)
 
-    import yaml
-    import runtime
     from subscription_update import entry_plan
 
-    root = runtime.CONFIG_DIR
     try:
-        config = yaml.safe_load((root / 'clash-verge.yaml').read_bytes())
-    except (OSError, ValueError, yaml.YAMLError):
+        config = clash.read_config()
+    except (OSError, ValueError):
         config = None
     if not isinstance(config, dict):
         config = {}
-    plan = entry_plan(config, root) or {}
+    plan = entry_plan(config) or {}
     return {name: plan.get(name, (None, None))[0] for name in live}
 
 
@@ -118,7 +65,7 @@ def node_inventory(proxies, owners):
     result = {name: (value, value.get('provider-name')) for name, value in proxies.items()
               if name not in owners or owners[name] is None}
     try:
-        providers = provider_nodes(api('GET', '/providers/proxies'))
+        providers = provider_nodes(clash.providers())
     except RuntimeError:
         providers = {}
     for provider, data in providers.items():
@@ -136,38 +83,6 @@ def show():
     print('中转入口：' + str(p.get(ENTRY, {}).get('now')))
     print('美国出口的上游：' + str(p.get(EXIT, {}).get('dialer-proxy')))
     return c, p
-
-def persist_selection(name):
-    # Preserve unrelated fields. Abort if another writer changes the file during preparation.
-    import yaml
-    original = PROFILES.read_bytes()
-    doc = yaml.safe_load(original)
-    profile = next((x for x in doc.get('items', []) if x.get('uid') == doc.get('current')), None)
-    if profile is None:
-        raise RuntimeError('找不到当前订阅，未修改持久化设置')
-    selected = profile.setdefault('selected', [])
-    for group, choice in [(ENTRY, name), ('GLOBAL', EXIT)]:
-        record = next((x for x in selected if x.get('name') == group), None)
-        if record is None:
-            selected.append({'name': group, 'now': choice})
-        else:
-            record['now'] = choice
-    output = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False).encode()
-    backups = BASE / 'backups'
-    backups.mkdir(exist_ok=True, mode=0o700)
-    backup = backups / ('profiles-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.yaml')
-    backup.write_bytes(original)
-    backup.chmod(0o600)
-    fd, temporary = tempfile.mkstemp(prefix='.toolbox-', dir=PROFILES.parent)
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(output)
-        if PROFILES.read_bytes() != original:
-            raise RuntimeError('Clash 同时更新了订阅文件，跳过持久化，避免覆盖')
-        os.replace(temporary, PROFILES)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 def switch():
     c, p = show()
@@ -211,7 +126,7 @@ def switch_entry(current, target):
     owners = switch_owners(fresh_p[ENTRY].get('all', []))
     if target not in owners:
         raise RuntimeError('选择期间代理状态发生变化，取消切换，请重新选择')
-    api('PUT', '/proxies/' + urllib.parse.quote(ENTRY, safe=''), {'name': target})
+    clash.switch_entry(target)
     after_c, after_p = state()
     after_owners = switch_owners(after_p[ENTRY].get('all', []))
     if (after_p[ENTRY].get('now') != target or after_p['GLOBAL'].get('now') != EXIT
@@ -220,7 +135,7 @@ def switch_entry(current, target):
         raise RuntimeError('切换后的状态与预期不符，请查看 Clash；本工具不会继续改动')
     print('\n已确认当前入口：' + target + '；全局出口：' + EXIT)
     try:
-        persist_selection(target)
+        clash.persist_selection(target, backup_dir=BASE / 'backups')
         print('已保存当前订阅的选择，下次加载时可恢复；原文件已备份。')
     except Exception as e:
         print('注意：实时切换成功，但持久化保存失败：' + str(e))

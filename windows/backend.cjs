@@ -1,10 +1,11 @@
 'use strict';
-const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),http=require('node:http'),https=require('node:https'),net=require('node:net');
+const fs=require('node:fs/promises'),path=require('node:path'),os=require('node:os'),https=require('node:https'),net=require('node:net');
 const {execFile,spawn}=require('node:child_process'),{promisify,isDeepStrictEqual}=require('node:util'),exec=promisify(execFile),YAML=require('yaml'),{HttpsProxyAgent}=require('https-proxy-agent');
 const {benchmarkSettings,expectedIP,settingChanges}=require('./preferences.cjs');
 const {sameIP}=require('./ip-address.js');
 const {selectionOwners}=require('./reconcile.cjs');
-const ENTRY='中转入口',EXIT='美国静态家宽',EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
+const {Clash, ENTRY, EXIT, parseYAML, readFile}=require('./clash.cjs');
+const EXPECTED='203.0.113.10',TRACE='https://www.cloudflare.com/cdn-cgi/trace';
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function jsonRead(p,fallback={}){try{return JSON.parse(await fs.readFile(p,'utf8'));}catch{return fallback;}}
 async function writeJSON(p,v){await fs.mkdir(path.dirname(p),{recursive:true});const tmp=p+'.tmp';await fs.writeFile(tmp,JSON.stringify(v,null,2),{mode:0o600});await fs.rename(tmp,p);}
@@ -43,19 +44,8 @@ function assessClaude(rows,connections,expectedProxyIP,expectedIP=EXPECTED){
  const good=matched.filter(x=>x.chains.includes(EXIT)).length,bad=matched.some(x=>x.chains.length&&!x.chains.includes(EXIT));
  return {status:bad?'bad':good>0&&good===rows.length&&sameIP(expectedProxyIP,expectedIP)?'ok':'warn',detail:rows.length?`${good}/${rows.length} 条 Claude Code 连接匹配美国静态家宽；${other.length} 条未匹配`:'当前无可核验的 Claude Code 连接，未验证',matched,other};
 }
-class ClashHTTPError extends Error {
- constructor(status){
-  super('Clash 控制接口返回 '+status);
-  this.rejected = status >= 400 && status < 600;
- }
-}
-class ClashRequestNotSent extends Error {}
-function requestNotSent(error){
- return error instanceof ClashRequestNotSent ||
-  ['ECONNREFUSED','ENOENT','ENOTFOUND','EAI_AGAIN','ENETUNREACH','EHOSTUNREACH'].includes(error?.code);
-}
 class Backend{
- constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.nodePolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
+ constructor(dataDir,notify=()=>{}){this.dataDir=dataDir;this.notify=notify;this.settings={};this.clash=new Clash(()=>this.settings,script=>this.powershell(script));this.autoRevision=0;this.pendingSettings=0;this.settingsWrite=Promise.resolve();this.nodePolicy={};this.children=new Set();this.busy=false;this.cancelled=false;this.progress={running:false,results:{}};this.guard=new Set();}
  async init(){
   await fs.mkdir(this.dataDir,{recursive:true});
   const saved=await jsonRead(path.join(this.dataDir,'settings.json'));
@@ -71,64 +61,19 @@ class Backend{
  const write=this.settingsWrite.then(async()=>{
   if(this.busy&&connectionChange)throw Error('请等待当前操作完成后再修改连接设置');
   const next={...this.settings,...changes};
-  await writeJSON(path.join(this.dataDir,'settings.json'),next);this.settings=next;if(connectionChange)this.endpoint=null;
+  await writeJSON(path.join(this.dataDir,'settings.json'),next);this.settings=next;if(connectionChange)this.clash.resetConnection();
  });
  this.settingsWrite=write.catch(()=>{});try{await write;}finally{this.pendingSettings--;this.autoRevision++;}
  }
  async powershell(script){const encoded=Buffer.from("[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$ErrorActionPreference='Stop';"+script,'utf16le').toString('base64');const {stdout}=await exec('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',encoded],{windowsHide:true,timeout:12000,maxBuffer:2e6});return stdout.trim();}
- connectionPath(key){const value=this.settings[key];return typeof value==='string'?value:'';}
- async config(){
- const configured=this.connectionPath('configDir');
- const roots=configured?[configured]:process.platform==='win32'?[path.join(process.env.APPDATA||'','io.github.clash-verge-rev.clash-verge-rev'),path.join(process.env.LOCALAPPDATA||'','io.github.clash-verge-rev.clash-verge-rev')]:[path.join(os.homedir(),'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev')];
- for(const root of roots)for(const name of ['clash-verge.yaml','config.yaml'])try{const c=YAML.parse(await fs.readFile(path.join(root,name),'utf8'));if(c&&Array.isArray(c.proxies)){this.root=root;this.configFile=path.join(root,name);return c;}}catch{}
- throw Error('未找到 Clash Verge 配置。请先启用链式配置，或在设置中选择配置目录。');}
- async discover(){const c=await this.config();const endpoints=[];
- // Clash Verge service uses an owner-scoped endpoint, overriding the sidecar path in YAML.
- if(process.platform==='darwin')endpoints.push({socketPath:`/var/run/clash-verge-service/users/${process.getuid()}/verge-mihomo.sock`});
- if(process.platform==='win32')try{const sid=await this.powershell('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value');if(/^S-1-[0-9-]+$/.test(sid)){const key=require('node:crypto').createHash('sha256').update(sid).digest('hex');for(const prefix of ['verge-mihomo-production-','verge-mihomo-sidecar-release-'])endpoints.push({socketPath:'\\\\.\\pipe\\'+prefix+key});}}catch{}
-
- if(process.platform==='win32'&&typeof c['external-controller-pipe']==='string'&&c['external-controller-pipe'].startsWith('\\\\.\\pipe\\'))endpoints.push({socketPath:c['external-controller-pipe']});
- if(process.platform==='darwin'&&c['external-controller-unix'])endpoints.push({socketPath:c['external-controller-unix']});
- if(c['external-controller']){const u=new URL('http://'+c['external-controller']);if(['127.0.0.1','localhost','0.0.0.0','[::1]','[::]'].includes(u.hostname))endpoints.push({hostname:'127.0.0.1',port:Number(u.port),secret:c.secret});}
- for(const e of endpoints)try{await this.request(e,'GET','/version');this.endpoint=e;return;}catch{}
- throw Error('无法连接 Clash Verge 本机控制接口。请确认 Clash Verge 正在运行；无需开启局域网控制。');}
- request(endpoint,method,route,body,timeout=6000){return new Promise((resolve,reject)=>{
-  const {secret,...opts}=endpoint;const payload=body===undefined?null:JSON.stringify(body);
-  const req=http.request({...opts,method,path:route,headers:{...(secret?{Authorization:'Bearer '+secret}:{}),...(payload?{'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)}:{})}},r=>{
-   if(r.statusCode>=300){
-    r.on('error',reject);
-    r.resume();
-    reject(new ClashHTTPError(r.statusCode));
-    return;
-   }
-   let chunks=[],size=0;r.on('data',x=>{size+=x.length;if(size>12e6){req.destroy(Error('响应过大'));return;}chunks.push(x)});r.on('error',reject);r.on('end',()=>{const body=Buffer.concat(chunks).toString();try{resolve(body?JSON.parse(body):{});}catch{reject(Error('Clash 返回无效数据'));}})});
-  let connected=false;
-  req.on('socket',socket=>{
-   if(socket.connecting)socket.once('connect',()=>{connected=true;});
-   else connected=true;
-  });
-  const timer=setTimeout(()=>req.destroy(Error('Clash 控制接口超时')),timeout);
-  req.on('close',()=>clearTimeout(timer));
-  req.on('error',error=>reject(connected?error:new ClashRequestNotSent('无法连接 Clash 控制接口',{cause:error})));
-  if(payload)req.write(payload);req.end();});}
- async api(method,route,body,timeout){
-  if(method!=='GET'&&!(method==='PUT'&&(route==='/proxies/'+encodeURIComponent(ENTRY)||/^\/providers\/proxies\/[^/?]+$/.test(route))))throw Error('不允许该控制操作');
-  if(!this.endpoint)await this.discover();return this.request(this.endpoint,method,route,body,timeout);}
- async relayState(timeout){
-  const read=route=>this.api('GET',route,undefined,timeout);
-  const [c,p]=await Promise.all([read('/configs'),read('/proxies')]);
-  const all=p.proxies||{},g=all[ENTRY]||{};
-  return {mode:c.mode,tun:!!c.tun?.enable,ipv6:c.ipv6,mixedPort:c['mixed-port']||7897,
-   entry:g.now,exit:all.GLOBAL?.now,dialer:all[EXIT]?.['dialer-proxy'],live:g.all||[]};
- }
  async state(timeout){
   const override=this.settings.expectedIP;
   this.nodePolicy=await jsonRead(path.join(this.dataDir,'node-policy.json'),{});
-  const cfg=await this.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
+  const cfg=await this.clash.config(), configured=cfg.proxies?.find(n=>n.name===EXIT)?.server;
   const {entryPlan}=require('./subscriptions.cjs');
   const [relay,providers,plan]=await Promise.all([
-   this.relayState(timeout),this.api('GET','/providers/proxies',undefined,timeout).catch(()=>({})),
-   entryPlan(cfg,this.root).catch(()=>null),
+   this.clash.relayState(timeout),this.clash.providers(timeout).catch(()=>({})),
+   entryPlan(cfg,this.clash).catch(()=>null),
   ]);
   const owners=this.nodePolicy.selected_nodes==null
    ? new Map(relay.live.map(name=>[name,plan?.get(name)?.owner??null]))
@@ -147,7 +92,7 @@ class Backend{
   });
   return {...relay,expectedIP:expectedIP(override,configured),nodes,
    entryOwners,switchable:Object.keys(entryOwners),lastTest:this.history.finishedAt,
-   settings:{...benchmarkSettings(this.settings),configDir:this.root,corePath:this.connectionPath('corePath')},
+   settings:{...benchmarkSettings(this.settings),configDir:this.clash.root,corePath:this.clash.connectionPath('corePath')},
    progress:this.progress};
  }
  assertChain(s){if(s.mode!=='global'||s.exit!==EXIT||s.dialer!==ENTRY)throw Error('请先在 Clash Verge 选择全局 → 美国静态家宽，并启用链式配置。');}
@@ -159,14 +104,20 @@ class Backend{
    this.assertChain(before);
    if(before.entry!==previous||!before.switchable.includes(name))throw Error('节点状态已变化，请刷新状态');
    const owner=before.entryOwners[name];
-   if(name!==previous)await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name});
+   if(name!==previous)await this.clash.switchEntry(name);
    const after=await this.state();
    if(after.entry!==name||after.exit!==EXIT||after.mode!=='global'||after.dialer!==ENTRY||
     !after.switchable.includes(name)||after.entryOwners[name]!==owner){
     throw Error('切换后的状态待核对，请刷新 Clash 状态');
    }
-   return after;
+   const switchWarning = name === previous ? undefined : await this.persistSwitch(name);
+   return switchWarning ? {...after, switchWarning} : after;
   }finally{this.busy=false;}
+ }
+
+ async persistSwitch(name) {
+  try { await this.clash.persistSelection(name, path.join(this.dataDir, 'backups')); }
+  catch (error) { return '实时切换成功，但保存选择失败：' + safeError(error); }
  }
 
  async textRequest(url,port=null,{timeout=12000,max=2e6,signal,accept=[200]}={}){
@@ -175,13 +126,13 @@ class Backend{
  async trace(port,signal){const text=await this.textRequest(TRACE,port,{signal,timeout:8000});const values=Object.fromEntries(text.split('\n').filter(x=>x.includes('=')).map(x=>{const i=x.indexOf('=');return [x.slice(0,i),x.slice(i+1)]}));if(!net.isIP(values.ip))throw Error('未取得有效出口');return {ip:values.ip,country:values.loc};}
  async ipInfo(){const s=await this.state();const v=JSON.parse(await this.textRequest('https://ipwho.is/',s.mixedPort));if(v.success!==true)throw Error('IP 属性查询失败');return {ip:v.ip,country:v.country,region:v.region,city:v.city,asn:v.connection?.asn,isp:v.connection?.isp,updatedAt:new Date().toISOString()};}
  async loadNodes({expectedIP:override}=this.settings){
-  const config=await this.config();
+  const config=await this.clash.config();
   const selection=(await jsonRead(path.join(this.dataDir,'node-policy.json'))).selected_nodes;
   const {entryPlan}=require('./subscriptions.cjs');
   const owners=selectionOwners(selection);
   const nodes=new Map();
   if(selection==null){
-   const plan=await entryPlan(config,this.root).catch(()=>new Map());
+   const plan=await entryPlan(config,this.clash).catch(()=>new Map());
    for(const [name,{node}] of plan)if(node)nodes.set(name,node);
   }
   const providers=config['proxy-providers']||{};
@@ -189,7 +140,7 @@ class Backend{
    const provider=Object.hasOwn(providers,owner)?providers[owner]??{}:{};
    let list=provider.payload;
    if(provider.path){
-    try{list=YAML.parse(await fs.readFile(path.resolve(this.root,provider.path),'utf8'))?.proxies;}
+    try{list=parseYAML((await readFile(this.clash.providerFile(provider.path)))?.toString() || '')?.proxies;}
     catch{continue;}
    }
    if(!Array.isArray(list))continue;
@@ -204,10 +155,6 @@ class Backend{
   if(exit['dialer-proxy']!==ENTRY)throw Error('固定出口的链式上游已变化，未开始测试');
   return {nodes,exit,config,expectedIP:expected,dnsPolicy};
  }
- async corePath(){const configured=this.connectionPath('corePath');if(configured){await fs.access(configured);return configured;}if(process.platform==='darwin')return '/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo';
- try{const raw=await this.powershell("@(Get-CimInstance Win32_Process | Where-Object {$_.Name -match '^(verge-mihomo|mihomo|clash-meta)(-alpha)?\\.exe$'} | Select-Object -ExpandProperty ExecutablePath) | ConvertTo-Json -Compress");const found=JSON.parse(raw||'[]');for(const p of [found].flat())if(p){await fs.access(p);return p;}}catch{}
- for(const base of [process.env.ProgramFiles,process.env.LOCALAPPDATA&&path.join(process.env.LOCALAPPDATA,'Programs')].filter(Boolean))for(const suffix of ['Clash Verge/verge-mihomo.exe','Clash Verge/resources/verge-mihomo.exe']){const p=path.join(base,suffix);try{await fs.access(p);return p;}catch{}}
- throw Error('未找到 Mihomo 内核，请在设置中选择 Clash Verge 自带的 verge-mihomo.exe');}
  async network(){if(process.platform!=='win32')throw Error('完整链路测速需在 Windows 实机运行');
  const raw=await this.powershell("$a=@(Get-NetAdapter -Physical | Where-Object Status -eq 'Up');$r=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Where-Object {$a.ifIndex -contains $_.ifIndex} | ForEach-Object {$i=Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.ifIndex;[pscustomobject]@{name=$_.InterfaceAlias;index=$_.ifIndex;gateway=$_.NextHop;metric=($_.RouteMetric+$i.InterfaceMetric)}} | Sort-Object metric);if(!$r.Count){throw 'No physical IPv4 route'};$n=$r[0];$ip=@(Get-NetIPAddress -InterfaceIndex $n.index -AddressFamily IPv4 | Where-Object AddressState -eq 'Preferred' | Select-Object -ExpandProperty IPAddress);[pscustomobject]@{name=$n.name;index=$n.index;gateway=$n.gateway;addresses=$ip} | ConvertTo-Json -Compress");return JSON.parse(raw);}
  async freePort(){const s=net.createServer();await new Promise((resolve,reject)=>{s.once('error',reject);s.listen(0,'127.0.0.1',resolve)});const port=s.address().port;await new Promise(r=>s.close(r));return port;}
@@ -229,7 +176,7 @@ class Backend{
  this.history={...this.history,latestResults:{}};
  await writeJSON(historyFile,this.history);
  const before=await this.state();this.assertChain(before);
- const network=await this.network(),probe=await this.loadNodes(settings),{nodes,exit}=probe,core=await this.corePath();
+ const network=await this.network(),probe=await this.loadNodes(settings),{nodes,exit}=probe,core=await this.clash.corePath();
  this.progress={running:true,kind,total:before.nodes.length,completed:0,results:{},active:[]};const emit=()=>this.notify('progress',this.progress);emit();
  let next=0;
  const unchanged=async()=>signature(await this.state())===signature(before)&&
@@ -305,12 +252,13 @@ class Backend{
     const owner=before.nodes.find(row=>row.name===target)?.providerId;
     if(!current.switchable.includes(target)||current.entryOwners[target]!==owner)throw Error('节点归属已变化，请先更新订阅');
     if(!authorized())return this.history;
-    await this.api('PUT','/proxies/'+encodeURIComponent(ENTRY),{name:target});
+    await this.clash.switchEntry(target);
     const after=await this.state();
     if(after.entry!==target||after.mode!==before.mode||after.tun!==before.tun||
      after.exit!==before.exit||after.dialer!==before.dialer||
      !after.switchable.includes(target)||after.entryOwners[target]!==owner)throw Error('自动切换后的状态待核对，请刷新 Clash 状态');
-    return {...this.history,switchedTo:target};
+    const switchWarning = await this.persistSwitch(target);
+    return {...this.history,switchedTo:target,...(switchWarning ? {switchWarning} : {})};
    }
   }
  }
@@ -319,15 +267,15 @@ class Backend{
  cancel(){this.abort?.abort();}
  async updateSubscriptions(){return require('./subscriptions.cjs').run(this);}
  async ipv6Probe(host){return new Promise(resolve=>{const s=net.connect({host,port:443,family:6});const finish=v=>{s.destroy();resolve(v)};s.setTimeout(4000);s.once('connect',()=>finish({connected:true,local:s.localAddress}));s.once('error',e=>finish({connected:false,reason:e.code}));s.once('timeout',()=>finish({connected:false,reason:'timeout'}));});}
- async networkCheck(){const interfacesBefore=JSON.stringify(os.networkInterfaces());const safe=async fn=>{try{return await fn()}catch(e){return {error:safeError(e)}}};const s=await this.state(),expected=s.expectedIP;
+ async networkCheck(){const interfacesBefore=JSON.stringify(os.networkInterfaces());const safe=async fn=>{try{return await fn()}catch(e){return {error:safeError(e)}}};const timeout=4000,s=await this.state(timeout),expected=s.expectedIP;
  const [proxy,tun,v6a,v6b,claudeRaw,connectionSnapshot]=await Promise.all([safe(()=>this.trace(s.mixedPort)),safe(()=>this.trace()),this.ipv6Probe('2606:4700:4700::1111'),this.ipv6Probe('2001:4860:4860::8888'),safe(async()=>{
  if(process.platform!=='win32')throw Error('Claude Code 进程核验需要 Windows');
  const raw=await this.powershell("$p=@(Get-Process -Name claude -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id);$c=@(Get-NetTCPConnection -State Established | Where-Object {$p -contains $_.OwningProcess} | Select-Object OwningProcess,LocalAddress,LocalPort,RemoteAddress,RemotePort);[pscustomobject]@{processCount=$p.Count;connections=$c} | ConvertTo-Json -Depth 5 -Compress");return JSON.parse(raw);
- }),safe(()=>this.api('GET','/connections'))]);
+ }),safe(()=>this.clash.connections(timeout))]);
  const addresses=Object.values(os.networkInterfaces()).flat().filter(x=>x&&x.family==='IPv6'&&!x.internal&&!/^(fe[89ab]|f[cd]|::)/i.test(x.address)).map(x=>x.address);
  const claude=claudeRaw.error||connectionSnapshot.error?{status:'warn',detail:'Claude Code 连接未验证：'+(claudeRaw.error||connectionSnapshot.error)}:assessClaude(claudeRaw.connections||[],connectionSnapshot.connections||[],proxy.ip,expected);
- let stable=false;try{stable=signature(await this.state())===signature(s)&&JSON.stringify(os.networkInterfaces())===interfacesBefore;}catch{}
+ let stable=false;try{stable=signature(await this.state(timeout))===signature(s)&&JSON.stringify(os.networkInterfaces())===interfacesBefore;}catch{}
  const result={time:new Date().toISOString(),expected,stable,state:{mode:s.mode,tun:s.tun,ipv6:s.ipv6,entry:s.entry,exit:s.exit},proxy,tun,ipv6:{...ipv6Assessment(addresses,[v6a,v6b]),addresses,probes:[v6a,v6b]},claude};return result;}
  async shutdown(){this.cancel();for(const t of this.guard)clearInterval(t);await Promise.all([...this.children].map(c=>this.stopChild(c)));}
 }
-module.exports={Backend,ClashHTTPError,requestNotSent,autoCandidate,isolatedConfig,signature,providerNodes,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
+module.exports={Backend,autoCandidate,isolatedConfig,signature,providerNodes,ipv6Assessment,assessClaude,EXPECTED,ENTRY,EXIT,writeJSON,safeError};
