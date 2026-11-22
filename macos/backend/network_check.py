@@ -28,7 +28,7 @@ def safe(fn):
     try:
         return fn()
     except Exception as e:
-        return {'error': str(e)}
+        return {'error': runtime.safe_error(e)}
 
 def http_exit(proxy=None):
     handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy} if proxy else {})
@@ -66,7 +66,7 @@ def ipv6_probe(ip):
         s.connect((ip, 443))
         return {'target': ip, 'connected': True, 'local': s.getsockname()[0]}
     except OSError as e:
-        return {'target': ip, 'connected': False, 'reason': str(e)}
+        return {'target': ip, 'connected': False, 'reason': runtime.safe_error(e)}
     finally:
         s.close()
 
@@ -74,7 +74,7 @@ def run(command):
     return subprocess.run(command, capture_output=True, text=True, timeout=8).stdout
 
 def local_state():
-    conf, proxies = clash.state(timeout=4)
+    conf, proxies = clash.state(timeout=4, expected_status=200)
     selected = {n: {k: proxies.get(n, {}).get(k) for k in ('now', 'dialer-proxy', 'type')} for n in ('GLOBAL', clash.ENTRY, clash.EXIT)}
     return {'mode': conf.get('mode'), 'tun': conf.get('tun', {}).get('enable'), 'ipv6': conf.get('ipv6'), 'groups': selected}
 
@@ -87,7 +87,7 @@ def claude_connections():
     if not pids:
         return {'process_count': 0, 'matched': [], 'other_sockets': [], 'note': '未发现 Claude Code 进程，未验证'}
     lines = run(['/usr/sbin/lsof', '-nP', '-a', '-p', ','.join(pids), '-i'])
-    connections = clash.connections(timeout=4).get('connections', [])
+    connections = clash.connections(timeout=4, expected_status=200).get('connections', [])
     byport = {}
     for x in connections:
         m = x.get('metadata', {})

@@ -50,7 +50,7 @@ def snapshot(include_nodes=True):
     data={'mode':c.get('mode'), 'tun':c.get('tun',{}).get('enable',False),'exit':p.get('GLOBAL',{}).get('now','未知'),'entry':p.get(t.ENTRY,{}).get('now','未知'),'dialer':p.get(t.EXIT,{}).get('dialer-proxy'),'nodes':list(owners),'live':live,'expected_ip':runtime.expected_ip()}
     if include_nodes:
         try:data['node_rows']=node_rows(p, owners)
-        except Exception as e:data['node_rows_error']=str(e)
+        except Exception as e:data['node_rows_error']=runtime.safe_error(e)
     return data
 
 def latency():
@@ -71,7 +71,7 @@ def latency():
                 d=clash.entry_delay(name, provider)
                 if not isinstance(d,(int,float)) or d<=0:raise RuntimeError('未返回有效延迟')
                 row.update(delay=d,status='实测可达')
-            except Exception as e:row.update(delay=None,status='未响应',error=str(e))
+            except Exception as e:row.update(delay=None,status='未响应',error=runtime.safe_error(e))
             return name,row
         progress=t.BASE/'latency-progress.json'
         def publish():
@@ -131,7 +131,7 @@ def change(target,previous,guard=None):
         raise RuntimeError('切换后的节点归属待核对，请刷新 Clash 状态')
     warning=''
     try:clash.persist_selection(target, backup_dir=t.BASE / 'backups')
-    except Exception as e:warning='实时切换成功，但保存选择失败：'+str(e)
+    except Exception as e:warning='实时切换成功，但保存选择失败：'+runtime.safe_error(e)
     return {'message':warning or '已切换中转入口，美国静态出口保持不变。建议运行网络检查。','state':after}
 
 
@@ -165,7 +165,7 @@ def startup(metric, *flags):
             if result['initialized'] and '--refresh' in flags:
                 result['message'] = '已刷新 Clash 状态。'
         except RuntimeError as error:
-            result.update(startup_checked=False, message=str(error))
+            result.update(startup_checked=False, message=runtime.safe_error(error))
     result['state'] = snapshot()
     return result
 
@@ -244,8 +244,8 @@ if __name__ == '__main__':
     try:
         main()
     except SettingsError as error:
-        print(json.dumps({'ok': False, 'error': str(error), 'field': error.field}, ensure_ascii=False))
+        print(json.dumps({'ok': False, 'error': runtime.safe_error(error), 'field': error.field}, ensure_ascii=False))
         sys.exit(1)
     except Exception as error:
-        print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
+        print(json.dumps({'ok': False, 'error': runtime.safe_error(error)}, ensure_ascii=False))
         sys.exit(1)

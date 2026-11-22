@@ -24,8 +24,9 @@ class ClashAdapterTests(unittest.TestCase):
 
         self.assertFalse(hasattr(clash, 'api'))
         self.assertEqual(transport.call_args_list[:4], [
-            call('GET', '/configs', timeout=4), call('GET', '/proxies', timeout=4),
-            call('GET', '/providers/proxies'), call('GET', '/connections', timeout=4),
+            call('GET', '/configs', timeout=4, expected_status=200),
+            call('GET', '/proxies', timeout=4, expected_status=200),
+            call('GET', '/providers/proxies'), call('GET', '/connections', timeout=4, expected_status=None),
         ])
         for request, expected in zip(transport.call_args_list[4:6], [
             '/providers/proxies/my%2Fprovider/a%2Fb%3Fc/healthcheck', '/proxies/a%2Fb%3Fc/delay',
@@ -53,6 +54,17 @@ class ClashAdapterTests(unittest.TestCase):
 
             receive.side_effect = TimeoutError('token: fixture-only')
             self.assertEqual(network_check.safe(network_check.local_state), {'error': 'Clash 控制接口超时'})
+
+    def test_diagnostics_report_empty_no_content_status(self):
+        connection = http.client.HTTPConnection
+        with (patch.object(connection, 'request'),
+              patch.object(connection, 'getresponse') as receive,
+              patch.object(network_check, 'run', side_effect=['123 claude', ''])):
+            receive.return_value.status = 204
+            receive.return_value.read.return_value = b''
+            for diagnostic in (network_check.local_state, network_check.claude_connections):
+                with self.subTest(diagnostic=diagnostic.__name__):
+                    self.assertEqual(network_check.safe(diagnostic), {'error': 'Clash API 返回 204'})
 
     def test_reload_validates_the_exact_payload_before_guard_and_write(self):
         payload = b'proxies: []'

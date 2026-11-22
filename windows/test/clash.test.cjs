@@ -92,64 +92,47 @@ test('a connected controller failure hides transport details and leaves the relo
   {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
 });
 
-test('manual switch persists both verified selectors and preserves unrelated profile data', async t => {
- let entry = 'old', verified = false;
- const {b, root} = await fixture(t, {
-  transport: (_endpoint, method, route, body) => {
-   assert.equal(route, '/proxies/' + encodeURIComponent(ENTRY));
-   assert.equal(method, 'PUT');
-   entry = body.name;
-  },
- });
- const other = {uid: 'other', selected: [{name: ENTRY, now: 'unrelated'}]};
- const initial = {current: 'active', items: [{uid: 'active', selected: [{name: 'other group', now: 'keep'}]}, other]};
+test('verified manual switch leaves a newly active Verge profile alone', async t => {
+ let entry = 'old';
+ const {b, root} = await fixture(t, {transport: (_endpoint, _method, _route, body) => { entry = body.name; }});
  const file = path.join(root, 'profiles.yaml');
- const original = YAML.stringify(initial);
+ const original = YAML.stringify({current: 'a', items: [{uid: 'a'}, {uid: 'b'}]});
+ const changed = original.replace('current: a', 'current: b');
  await fs.writeFile(file, original);
  b.state = async () => {
-  assert.equal(await fs.readFile(file, 'utf8'), original);
-  return {mode: 'global', entry, exit: EXIT, dialer: ENTRY, live: ['old', 'new'], switchable: ['old','new'],
-   entryOwners: {old: 'owner', new: entry === 'old' || verified ? 'owner' : 'external'}};
+  if (entry === 'new') await fs.writeFile(file, changed);
+  return {mode: 'global', entry, exit: EXIT, dialer: ENTRY, switchable: ['old', 'new'],
+   entryOwners: {old: 'a', new: 'a'}};
  };
- await assert.rejects(b.switchNode('new', 'old'), /待核对/);
- assert.equal(await fs.readFile(file, 'utf8'), original);
- await assert.rejects(fs.stat(path.join(b.dataDir, 'backups')), {code: 'ENOENT'});
-
- entry = 'old';
- verified = true;
- const after = await b.switchNode('new', 'old');
- assert.equal(after.entry, 'new');
- assert.equal(after.switchWarning, undefined);
- initial.items[0].selected.push({name: ENTRY, now: 'new'}, {name: 'GLOBAL', now: EXIT});
- assert.deepEqual(YAML.parse(await fs.readFile(file, 'utf8')), initial);
- const backups = await fs.readdir(path.join(b.dataDir, 'backups'));
- assert.equal(backups.length, 1);
- assert.equal(await fs.readFile(path.join(b.dataDir, 'backups', backups[0]), 'utf8'), original);
+ assert.equal((await b.switchNode('new', 'old')).entry, 'new');
+ assert.equal(await fs.readFile(file, 'utf8'), changed);
 });
 
-test('selector persistence refuses concurrent changes and malformed YAML', async t => {
- const {b, adapter, root} = await fixture(t);
+test('verified manual switch cannot overwrite a late Verge edit', async t => {
+ let entry = 'old';
+ const {b, root} = await fixture(t, {transport: (_endpoint, _method, _route, body) => { entry = body.name; }});
  const file = path.join(root, 'profiles.yaml');
- const original = YAML.stringify({current: 'active', items: [{uid: 'active'}]});
- const backup = path.join(b.dataDir, 'backups');
+ const original = YAML.stringify({current: 'a', items: [{uid: 'a'}]});
+ const changed = original + '# Verge edit\n';
  await fs.writeFile(file, original);
- const write = fs.writeFile;
- const concurrent = original + '# edited by Verge\n';
- const stub = t.mock.method(fs, 'writeFile', async (dest, ...args) => {
-  await write(dest, ...args);
-  if (dest.startsWith(file + '.linkbox-')) await write(file, concurrent);
+ b.state = async () => {
+  return {mode: 'global', entry, exit: EXIT, dialer: ENTRY, switchable: ['old', 'new'],
+   entryOwners: {old: 'a', new: 'a'}};
+ };
+ let vergeContents = original;
+ const rename = fs.rename;
+ t.mock.method(fs, 'rename', async (source, destination) => {
+  if (destination === file) {
+   vergeContents = changed;
+   await fs.writeFile(file, vergeContents);
+  }
+  await rename(source, destination);
  });
- await assert.rejects(adapter.persistSelection('new', backup), /同时更新/);
- assert.equal(await fs.readFile(file, 'utf8'), concurrent);
- assert.ok((await fs.readdir(root)).every(name => !name.includes('.linkbox-')));
- stub.mock.restore();
-
- await fs.writeFile(file, 'current: [password: fixture-only');
- await assert.rejects(adapter.persistSelection('new', backup), {message: '无法读取 Clash Verge 订阅选择，未修改'});
- assert.equal(await fs.readFile(file, 'utf8'), 'current: [password: fixture-only');
+ assert.equal((await b.switchNode('new', 'old')).entry, 'new');
+ assert.equal(await fs.readFile(file, 'utf8'), vergeContents);
 });
 
-test('reads and reload use the same controller deadline after validation', async t => {
+test('diagnostic reads use four seconds and reload gives the controller thirty seconds', async t => {
  const deadlines = [];
  const {adapter} = await fixture(t, {validate: () => {}});
  const schedule = setTimeout;
@@ -167,8 +150,33 @@ test('reads and reload use the same controller deadline after validation', async
   };
   return req;
  });
- await assert.rejects(adapter.connections(), {message: 'Clash 控制接口超时'});
+ await assert.rejects(adapter.connections(4000), {message: 'Clash 控制接口超时'});
  await assert.rejects(adapter.reload('proxies: []', () => {}, () => assert.fail('rollback')),
   {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
- assert.deepEqual(deadlines, [6000, 6000]);
+ assert.deepEqual(deadlines, [4000, 30000]);
+});
+
+test('a rejection after seven seconds still rolls back a Windows reload', async t => {
+ const {root, adapter} = await fixture(t, {validate: () => {}});
+ const file = path.join(root, 'clash-verge.yaml');
+ const original = await fs.readFile(file, 'utf8'), payload = 'proxies: [{name: new}]';
+ let deadline;
+ t.mock.method(globalThis, 'setTimeout', (abandon, ms) => {
+  deadline = {abandon, ms};
+ });
+ t.mock.method(http, 'request', (_options, respond) => {
+  const req = new EventEmitter();
+  req.write = () => {};
+  req.destroy = error => req.emit('error', error);
+  req.end = () => queueMicrotask(() => {
+   req.emit('socket', {connecting: false});
+   if (deadline.ms < 7000) deadline.abandon();
+   else respond(Object.assign(new EventEmitter(), {statusCode: 400, resume() {}}));
+   req.emit('close');
+  });
+  return req;
+ });
+ const reload = adapter.reload(payload, () => fs.writeFile(file, payload), () => fs.writeFile(file, original));
+ await assert.rejects(reload, /400.*文件已回退/);
+ assert.equal(await fs.readFile(file, 'utf8'), original);
 });

@@ -4,10 +4,11 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 from subprocess import run as run_process
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from unittest.mock import patch
 from urllib.parse import quote
 
@@ -132,6 +133,45 @@ class SubscriptionFixture:
 
 
 class UpdateTests(SubscriptionFixture, unittest.TestCase):
+    def gui_error(self, *args, body=None):
+        output = io.StringIO()
+        with (patch('sys.argv', ['gui_backend.py', *args]),
+              patch('sys.stdin', io.StringIO(json.dumps(body))),
+              redirect_stdout(output), self.assertRaises(SystemExit) as exited):
+            runpy.run_path(gui.__file__, run_name='__main__')
+        self.assertEqual(exited.exception.code, 1)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result['ok'])
+        return result['error']
+
+    def test_catalog_error_redacts_malformed_subscription_url(self):
+        index = yaml.safe_load(self.index.read_bytes())
+        index['items'][0]['url'] = 'https://fixture-user:fixture-pass@example.invalid／bad/path?key=fixture-query'
+        self.index.write_bytes(update.dump(index))
+        error = self.gui_error('subscription-catalog')
+        for value in ('fixture-user', 'fixture-pass', 'fixture-query'):
+            self.assertFalse(value in error, 'Catalog error disclosed a URL credential')
+        self.assertEqual(error, '订阅地址包含无效字符')
+
+    def test_gui_error_redacts_subscription_userinfo_and_query(self):
+        address = 'HTTPS://fixture-user:fixture pass@example.invalid/path?key=fixture-query'
+        with patch.object(t, 'relay_state', side_effect=RuntimeError(f'打不开 "{address}"')):
+            error = self.gui_error('subscription-catalog')
+        self.assertTrue(error == '打不开 [网络地址]', 'Catalog error disclosed URL details')
+
+    def test_save_error_omits_malformed_retained_provider_cache_source(self):
+        self.apply({'a': ['current'], 'b': ['other']})
+        (self.root / 'profiles/b.yaml').write_text('proxies: [')
+        (self.root / 'providers/linkbox/b.yaml').write_text('proxies: [{password: fixture-cache}')
+        catalog = picker.catalog()
+        self.assertTrue(catalog['sources'][1]['warning'])
+        error = self.gui_error('save-node-selection', 'chain', body={
+            'fingerprint': catalog['fingerprint'], 'current': catalog['current'],
+            'selected': {'a': ['fast'], 'b': []},
+        })
+        self.assertFalse('fixture-cache' in error, 'Save error disclosed a YAML source line')
+        self.assertEqual(error, '无法解析 YAML 配置')
+
     def test_switch_unmanaged_entry_with_implicit_members(self):
         for flag in ('include-all-providers', 'include-all-proxies', 'include-all'):
             with self.subTest(flag=flag):
@@ -837,6 +877,19 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
                 self.real_api('PUT', '/configs?force=false')
             self.assertTrue(rejected.exception.rejected)
             response.return_value.read.assert_not_called()
+
+    def test_redirected_reload_reports_status_and_keeps_new_files(self):
+        original = self.config.read_bytes()
+        def redirect_reload(method, route, body=None, **_):
+            if route == '/configs?force=false':
+                raise clash.ClashHTTPError(302)
+            return self.controller(method, route, body)
+
+        self.api.side_effect = redirect_reload
+        with self.assertRaisesRegex(RuntimeError, '302.*Clash 未确认'):
+            self.apply({'a': ['fast'], 'b': []})
+        self.assertNotEqual(self.config.read_bytes(), original)
+        self.assertEqual(json.loads(self.policy.read_text())['selected_nodes'], {'a': ['fast']})
 
     def test_lost_reload_response_keeps_new_files_with_unchanged_group(self):
         self.apply({'a': ['current', 'fast'], 'b': []})

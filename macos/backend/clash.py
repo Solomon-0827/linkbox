@@ -39,7 +39,7 @@ def _request_not_sent(error):
         errno.ECONNREFUSED, errno.ENOENT, errno.ENETUNREACH, errno.EHOSTUNREACH)
 
 
-def _request(method, path, payload=None, *, timeout=6):
+def _request(method, path, payload=None, *, timeout=6, expected_status=None):
     class Connection(http.client.HTTPConnection):
         def connect(self):
             try:
@@ -54,7 +54,7 @@ def _request(method, path, payload=None, *, timeout=6):
         conn.request(method, path, json.dumps(payload, ensure_ascii=False).encode() if payload is not None else None,
                      {'Content-Type': 'application/json'})
         response = conn.getresponse()
-        if response.status >= 300:
+        if not 200 <= response.status < 300 or expected_status not in (None, response.status):
             raise ClashHTTPError(response.status)
         body = response.read()
         return json.loads(body) if body else None
@@ -68,9 +68,9 @@ def _request(method, path, payload=None, *, timeout=6):
         conn.close()
 
 
-def state(*, timeout=6):
-    config = _request('GET', '/configs', timeout=timeout)
-    proxies = _request('GET', '/proxies', timeout=timeout)['proxies']
+def state(*, timeout=6, expected_status=None):
+    config = _request('GET', '/configs', timeout=timeout, expected_status=expected_status)
+    proxies = _request('GET', '/proxies', timeout=timeout, expected_status=expected_status)['proxies']
     return config, proxies
 
 
@@ -78,8 +78,8 @@ def providers():
     return _request('GET', '/providers/proxies')
 
 
-def connections(*, timeout=6):
-    return _request('GET', '/connections', timeout=timeout)
+def connections(*, timeout=6, expected_status=None):
+    return _request('GET', '/connections', timeout=timeout, expected_status=expected_status)
 
 
 def entry_delay(name, provider):
@@ -113,7 +113,8 @@ def reload(payload, prepare, rollback):
             rollback()
             message = _RELOAD_NOT_SENT if unsent else str(error)
             raise RuntimeError(message + '，文件已回退；请刷新状态后重试') from None
-        raise RuntimeError(_RELOAD_UNCERTAIN) from None
+        message = f'{error}。{_RELOAD_UNCERTAIN}' if isinstance(error, ClashHTTPError) else _RELOAD_UNCERTAIN
+        raise RuntimeError(message) from None
 
 
 def config_file():

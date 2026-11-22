@@ -1,5 +1,5 @@
 const test=require('node:test'),assert=require('node:assert/strict'),os=require('node:os'),path=require('node:path'),fs=require('node:fs/promises');
-const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED}=require('../backend.cjs');
+const {Backend,isolatedConfig,ipv6Assessment,assessClaude,EXPECTED,safeError}=require('../backend.cjs');
 const {Clash, ENTRY, EXIT}=require('../clash.cjs');
 const ipComparison=require('../../fixtures/ip-comparison.json');
 function fakeBackend(folder, Constructor=Backend) {
@@ -9,6 +9,13 @@ function fakeBackend(folder, Constructor=Backend) {
  });
  return b;
 }
+test('UI error formatting hides quoted URL credentials and YAML source lines', () => {
+ const address = 'HTTPS://fixture-user:fixture pass@example.invalid/path?key=fixture-query';
+ assert.equal(safeError(Error(`打不开 "${address}"`)), '打不开 [网络地址]');
+ assert.throws(() => require('yaml').parse('proxies: [{password: fixture-cache}'), error =>
+  safeError(error) === '无法解析 YAML 配置');
+});
+
 test('Claude proxy exit checks compare parsed addresses',()=>{
  const rows=[{LocalPort:5000,LocalAddress:'127.0.0.1'}];
  const connections=[{metadata:{sourcePort:'5000',sourceIP:'127.0.0.1',host:'api.anthropic.com'},chains:['美国静态家宽']}];
@@ -138,7 +145,6 @@ test('switch validates stale state before writes and writes only entrance',async
   switchable:['a','b'],entryOwners:{a:'a',b:'a'}};
  const wrote=[];
  b.state=async()=>state;
- b.clash.persistSelection=async()=>{};
  b.controller=async(method,route,body)=>{wrote.push([method,route,body]);state.entry=body.name;};
  await assert.rejects(b.switchNode('b','stale'));
  assert.deepEqual(wrote,[]);
@@ -218,7 +224,8 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
  const b=await fakeBackend(folder).init(),names=['current','entrance','chain','failed'];let entry='current',active=0,peak=0,writes=[];
  const profiles=path.join(folder,'profiles.yaml');
  await fs.writeFile(path.join(folder,'clash-verge.yaml'),'proxies: []');
- await fs.writeFile(profiles,'current: active\nitems: [{uid: active}]');
+ const originalProfiles='current: active\nitems: [{uid: active}]';
+ await fs.writeFile(profiles,originalProfiles);
  b.settings.configDir=folder;
  await b.clash.config();
  b.state=async()=>({mode:'global',tun:true,entry,exit:'美国静态家宽',dialer:'中转入口',nodes:names.map(name=>({name,providerId:'a'})),live:names,switchable:names,entryOwners:Object.fromEntries(names.map(name=>[name,'a']))});
@@ -233,8 +240,8 @@ test('dynamic benchmark limits concurrency and only an opted-in scheduled run ch
  const run=await b.benchmark('chain',()=>true);assert.equal(run.switchedTo,'entrance');assert.deepEqual(writes,[['PUT','/proxies/'+encodeURIComponent('中转入口'),'entrance']]);
  await b.saveSettings({metric:'chain'});const next=await b.benchmark('chain',()=>true);assert.equal(next.switchedTo,'chain');
  entry='current';const scheduled=b.benchmark('chain',()=>true);await b.saveSettings({autoRelay:false});
- assert.deepEqual(require('yaml').parse(await fs.readFile(profiles,'utf8')).items[0].selected,
-  [{name:ENTRY,now:'chain'},{name:'GLOBAL',now:EXIT}]);
+ await assert.rejects(fs.access(path.join(folder,'backups')), {code:'ENOENT'});
+ assert.equal(await fs.readFile(profiles,'utf8'),originalProfiles);
  assert.equal((await scheduled).switchedTo,undefined);assert.equal(writes.length,2);
  await b.saveSettings({autoRelay:true});const testNode=b.testNode;b.testNode=async(...args)=>{b.cancel();return testNode(...args)};
  assert.equal((await b.benchmark('chain',()=>true)).switchedTo,undefined);assert.equal(writes.length,2);

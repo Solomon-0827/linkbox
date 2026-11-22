@@ -11,6 +11,11 @@ import chain_test as c
 import gui_backend as g
 
 class ParallelTests(unittest.TestCase):
+    def setUp(self):
+        base = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(g.t, 'BASE', base))
+        self.enterContext(patch.object(g.runtime, 'BASE', base))
+
     def exercise(self, mode, concurrency=5):
         names=[str(i) for i in range(8)]
         state={'mode':'global','exit':c.t.EXIT,'dialer':c.t.ENTRY}

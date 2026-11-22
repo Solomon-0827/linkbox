@@ -7,7 +7,7 @@ const subscriptions=require('./subscriptions.cjs');
 const DEMO=process.argv.includes('--demo');let win,tray,backend,quitting=false,readyToQuit=false,timer,coffeeWindow,coffeePending,uiActive=false;
 async function auto(){
  if(DEMO||quitting||backend.settings.hourly===false||backend.busy||uiActive)return;
- try{const result=await backend.benchmark('chain',()=>!quitting&&!uiActive);win?.webContents.send('automatic',{ok:true,switchedTo:result.switchedTo,switchWarning:result.switchWarning});}
+ try{const result=await backend.benchmark('chain',()=>!quitting&&!uiActive);win?.webContents.send('automatic',{ok:true,switchedTo:result.switchedTo});}
  catch(e){win?.webContents.send('automatic',{error:safeError(e)});}
 }
 function scheduleAuto(){clearInterval(timer);if(!DEMO&&backend.settings.hourly!==false)timer=setInterval(auto,benchmarkSettings(backend.settings).interval*60000);}

@@ -38,7 +38,7 @@ function request(endpoint, method, route, body, timeout = 6000) {
   let req;
   try {
    req = http.request({...options, method, path: route, headers}, response => {
-    if (response.statusCode >= 300) {
+    if (response.statusCode < 200 || response.statusCode >= 300) {
      response.on('error', () => {});
      response.resume();
      reject(new ClashHTTPError(response.statusCode));
@@ -106,29 +106,18 @@ async function restoreFiles(written, originals) {
  }
 }
 
-function updateSelector(index, name, includeExit = false) {
+function updateSelector(index, name) {
  const profile = index.current && index.items?.find(item => item.uid === index.current);
- if (!profile) {
-  if (includeExit) throw Error('找不到当前订阅，未修改持久化设置');
-  return false;
- }
+ if (!profile) return false;
  const choices = profile.selected ??= [];
  if (!Array.isArray(choices) || choices.some(choice => !choice || typeof choice !== 'object' || Array.isArray(choice))) {
   throw Error('无法读取 Clash Verge 订阅选择，未修改');
  }
- let changed = false;
- const targets = includeExit ? [[ENTRY, name], ['GLOBAL', EXIT]] : [[ENTRY, name]];
- for (const [group, target] of targets) {
-  const choice = choices.find(item => item.name === group);
-  if (!choice) {
-   choices.push({name: group, now: target});
-   changed = true;
-  } else if (choice.now !== target) {
-   choice.now = target;
-   changed = true;
-  }
- }
- return changed;
+ const choice = choices.find(item => item.name === ENTRY);
+ if (!choice) choices.push({name: ENTRY, now: name});
+ else if (choice.now !== name) choice.now = name;
+ else return false;
+ return true;
 }
 
 class Clash {
@@ -175,7 +164,7 @@ class Clash {
   // Recheck the snapshots and install the files only after validation succeeds.
   await prepare();
   try {
-   await this.#call('PUT', '/configs?force=false', {payload});
+   await this.#call('PUT', '/configs?force=false', {payload}, 30000);
   } catch (error) {
    const unsent = requestNotSent(error);
    if (unsent || (error instanceof ClashHTTPError && error.rejected)) {
@@ -183,7 +172,8 @@ class Clash {
     const message = unsent ? RELOAD_NOT_SENT : error.message;
     throw Error(message + '，文件已回退；请刷新状态后重试');
    }
-   throw Error(RELOAD_UNCERTAIN);
+   const message = error instanceof ClashHTTPError ? error.message + '。' + RELOAD_UNCERTAIN : RELOAD_UNCERTAIN;
+   throw Error(message);
   }
  }
 
@@ -199,30 +189,16 @@ class Clash {
  managedCacheFile(owner) { return path.join(this.root, 'providers', 'linkbox', owner + '.yaml'); }
  providerFile(filename) { return path.resolve(this.root, filename); }
 
- async persistSelection(name, backupDir) {
+ async persistSelection(name) {
   const file = this.profilesFile();
   const original = await readFile(file);
-  let output;
-  try {
-   const document = YAML.parseDocument(original?.toString() || '', {prettyErrors: false, intAsBigInt: true});
-   if (document.errors.length || document.warnings.length) throw TypeError();
-   const index = document.toJS();
-   if (!index || typeof index !== 'object' || Array.isArray(index)) throw TypeError();
-   const changed = updateSelector(index, name, !!backupDir);
-   if (!changed && !backupDir) return;
-   output = YAML.stringify(index);
-  } catch (error) {
-   if (error instanceof YAML.YAMLError || error instanceof TypeError) {
-    throw Error('无法读取 Clash Verge 订阅选择，未修改');
-   }
-   throw error;
+  const index = parseYAML(original?.toString() || '');
+  if (!index || typeof index !== 'object' || Array.isArray(index)) throw Error('无法读取 Clash Verge 订阅选择，未修改');
+  if (updateSelector(index, name)) {
+   await writeFile(file, YAML.stringify(index), {
+    expected: original, conflict: '配置或节点已被其他操作改变，已取消更新',
+   });
   }
-  if (backupDir) {
-   await fs.mkdir(backupDir, {recursive: true, mode: 0o700});
-   await fs.writeFile(path.join(backupDir, 'profiles-' + crypto.randomUUID() + '.yaml'), original, {mode: 0o600, flag: 'wx'});
-  }
-  await writeFile(file, output, {expected: original, conflict: backupDir ?
-   'Clash 同时更新了订阅文件，跳过持久化，避免覆盖' : '配置或节点已被其他操作改变，已取消更新'});
  }
 
  connectionPath(key) {
