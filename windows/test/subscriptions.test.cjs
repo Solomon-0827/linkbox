@@ -926,6 +926,49 @@ test('validation failure and external state change cancel before any reload', as
  assert.deepEqual(await fs.readFile(file), original);
 });
 
+test('Sync does not rediscover the controller when a settings save finishes after the final guard', async t => {
+ const {b, root, data, config, requests, refreshWith} = await fixture(t);
+ const nextRoot = path.join(root, 'other-verge');
+ await fs.mkdir(nextRoot);
+ await fs.writeFile(path.join(nextRoot, 'clash-verge.yaml'), YAML.stringify({
+  ...config, 'external-controller': 'localhost:19091',
+ }));
+ refreshWith({a: ['current', 'fast', 'new'], b: ['other']});
+ const discover = [];
+ const request = b.request;
+ b.request = async (endpoint, method, route, body) => {
+  if (route === '/version') { discover.push(endpoint); return {}; }
+  return request(endpoint, method, route, body);
+ };
+ const rename = fs.rename;
+ const entered = Promise.withResolvers();
+ const resume = Promise.withResolvers();
+ let save;
+ t.mock.method(fs, 'rename', async (from, to) => {
+  if (to === path.join(data, 'settings.json')) {
+   entered.resolve();
+   await resume.promise;
+  }
+  if (to === path.join(root, 'clash-verge.yaml')) {
+   resume.resolve();
+   await save;
+  }
+  return rename(from, to);
+ });
+ save = b.saveSettings({configDir: nextRoot});
+ await entered.promise;
+ try {
+  await assert.rejects(sub.run(b), {message: '已写入新配置，Clash 未确认，请刷新状态核对'});
+ } finally {
+  resume.resolve();
+  await save;
+ }
+ assert.equal(b.settings.configDir, nextRoot);
+ assert.deepEqual(discover, []);
+ assert.deepEqual(requests, []);
+ assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /name: new/);
+});
+
 test('successful reload reports an external change between selected entries', async t => {
  const {b, apply, state, requests, saved} = await fixture(t);
  const controller = b.request;
@@ -954,6 +997,28 @@ test('explicit reload rejection restores the files even when readback is unavail
  await assert.rejects(fs.access(path.join(root,'profiles/Script.js')));
  await assert.rejects(fs.access(policy));
  assert.equal(b.busy, false);
+});
+
+test('unsent reload rolls back Sync and reports no request', async t => {
+ const {b, root, data, requests, refreshWith} = await fixture(t);
+ const before = await fixtureFiles(data);
+ refreshWith({a: ['current', 'fast', 'new'], b: ['other']});
+ const controller = b.request;
+ for (const code of ['ENETUNREACH', 'ECONNREFUSED', 'ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH']) {
+  b.request = async (...args) => {
+   if (args[2] === '/configs?force=false') {
+    assert.match(await fs.readFile(path.join(root, 'profiles/a.yaml'), 'utf8'), /name: new/);
+    throw Object.assign(Error('connection failed'), {code});
+   }
+   return controller(...args);
+  };
+  await assert.rejects(b.updateSubscriptions(),
+   {message: '无法连接 Clash 控制接口，未发送重载请求，文件已回退；请刷新状态后重试'}, code);
+  const files = Object.entries(await fixtureFiles(data))
+   .filter(([file]) => !file.startsWith(path.join(data, 'backups') + path.sep));
+  assert.deepEqual(Object.fromEntries(files), before, code);
+  assert.deepEqual(requests, []);
+ }
 });
 
 test('remove applies the same selection and refuses the current, stale or unknown entries', async t => {
@@ -992,6 +1057,23 @@ test('deleted subscriptions disappear from picker and a rotation retains the sta
  assert.deepEqual((await sub.catalog(b)).sources.map(s=>s.name), ['B']);
  assert.equal(sub.sourceKey('https://a.invalid/client/'+'a'.repeat(24)),
   sub.sourceKey('https://b.invalid/client/'+'a'.repeat(24)));
+});
+
+test('discovery validates duplicate sources before skipping their profile path joins', async t => {
+ const {b, root, items, write} = await fixture(t);
+ const duplicate = {...items[0], uid: 'duplicate', file: 'duplicate.yaml'};
+ await write('profiles.yaml', {items: [items[0], duplicate]});
+ const joins = [];
+ const join = path.join;
+ t.mock.method(path, 'join', (...parts) => {
+  if (parts[0] === root && parts[1] === 'profiles') joins.push(parts[2]);
+  return join(...parts);
+ });
+ assert.deepEqual((await sub.catalog(b)).sources.map(s => s.name), ['A']);
+ assert.deepEqual(joins, ['a.yaml']);
+
+ await write('profiles.yaml', {items: [items[0], {...duplicate, file: '../outside.yaml'}]});
+ await assert.rejects(b.updateSubscriptions(), {message: 'Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点'});
 });
 
 test('redirected reload reports HTTP status and keeps the new files', async t => {

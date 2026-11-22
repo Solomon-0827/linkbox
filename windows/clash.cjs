@@ -72,12 +72,11 @@ async function readFile(file) {
  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
-async function writeFile(file, data, {expected, conflict} = {}) {
+async function writeFile(file, data) {
  await fs.mkdir(path.dirname(file), {recursive: true});
  const temp = file + '.linkbox-' + crypto.randomUUID();
  try {
   await fs.writeFile(temp, data, {mode: 0o600, flag: 'wx'});
-  if (conflict && !equal(expected, await readFile(file))) throw Error(conflict);
   await fs.rename(temp, file);
  } finally {
   await fs.rm(temp, {force: true});
@@ -133,6 +132,7 @@ class Clash {
  async switchEntry(name) { await this.#call('PUT', ENTRY_ROUTE, {name}); }
 
  async reload(root, payload, prepare, rollback, validationRoot = () => root) {
+  const endpoint = this.#endpoint;
   const temp = await fs.mkdtemp(path.join(root, 'linkbox-validate-'));
   try {
    const file = path.join(temp, 'config.yaml');
@@ -149,10 +149,13 @@ class Clash {
 
   // Recheck the snapshots and install the files only after validation succeeds.
   await prepare();
+  // A settings save can invalidate the controller while the files are being installed.
+  if (!endpoint || this.#endpoint !== endpoint) throw Error(RELOAD_UNCERTAIN);
   try {
-   await this.#call('PUT', '/configs?force=false', {payload}, 30000);
+   await this.#transport(endpoint, 'PUT', '/configs?force=false', {payload}, 30000);
   } catch (error) {
-   const unsent = error instanceof ClashRequestNotSent;
+   const unsent = error instanceof ClashRequestNotSent ||
+    ['ECONNREFUSED', 'ENOENT', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH'].includes(error?.code);
    if (unsent || (error instanceof ClashHTTPError && error.rejected)) {
     await rollback();
     const message = unsent ? RELOAD_NOT_SENT : error.message;
@@ -165,13 +168,11 @@ class Clash {
 
  profilesFile(root) { return path.join(root, 'profiles.yaml'); }
  scriptFile(root) { return this.profileFile(root, 'Script.js'); }
- profileFile(root, filename) {
-  if (typeof filename !== 'string' || !filename || filename === '.' || filename === '..' ||
-      path.basename(filename) !== filename || filename.includes('/') || filename.includes('\\')) {
-   throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
-  }
-  return path.join(root, 'profiles', filename);
+ validProfileFilename(filename) {
+  return typeof filename === 'string' && filename !== '' && filename !== '.' && filename !== '..' &&
+   path.basename(filename) === filename && !filename.includes('/') && !filename.includes('\\');
  }
+ profileFile(root, filename) { return path.join(root, 'profiles', filename); }
  managedCacheFile(root, owner) { return path.join(root, 'providers', 'linkbox', owner + '.yaml'); }
  providerFile(root, filename) { return path.resolve(root, filename); }
 
@@ -179,9 +180,8 @@ class Clash {
   const original = await readFile(file);
   const index = YAML.parse(original.toString());
   if (updateSelector(index, name)) {
-   await writeFile(file, YAML.stringify(index), {
-    expected: original, conflict: '配置或节点已被其他操作改变，已取消更新',
-   });
+   if (!equal(original, await readFile(file))) throw Error('配置或节点已被其他操作改变，已取消更新');
+   await writeFile(file, YAML.stringify(index));
   }
  }
 

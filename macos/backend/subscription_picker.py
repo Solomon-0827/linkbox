@@ -56,14 +56,13 @@ def discover(for_update=False):
                 raise RuntimeError('Clash Verge 订阅需要 HTTPS 地址及本地文件，未更新节点')
             continue
         filename = item['file']
-        try:
-            profile = clash.profile_file(root, filename)
-        except ValueError as error:
+        if not clash.valid_profile_filename(filename):
             if for_update:
-                raise RuntimeError(str(error)) from None
+                raise RuntimeError('Clash Verge 订阅路径无效，未删除节点')
             continue
         old = by_url.get(source_key(item['url']), {})
         identifier = old.get('name') or 'verge_' + hashlib.sha256(str(item.get('uid', filename)).encode()).hexdigest()[:12]
+        profile = clash.profile_file(root, filename)
         source = {'name': identifier, 'display_name': item.get('name') or identifier,
                   'url': item['url'], 'profile_file': filename}
         key = source_key(item['url'])

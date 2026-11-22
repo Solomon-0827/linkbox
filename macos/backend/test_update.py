@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 from subprocess import run as run_process
 import tempfile
 import unittest
@@ -637,6 +638,29 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
         self.assertEqual(self.requests, [ENTRY_ROUTE])
         self.assertFalse(self.index.exists())
 
+    def test_verified_switch_reports_staging_failure_when_verge_directory_moves(self):
+        state = {**self.active, 'live': ['current', 'fast']}
+        original = self.index.read_bytes()
+        moved = self.base / 'moved-verge'
+        mkdir = Path.mkdir
+
+        def move_verge_after_backup_directory(path, *args, **kwargs):
+            mkdir(path, *args, **kwargs)
+            if path == self.base / 'backups':
+                self.root.rename(moved)
+
+        with (patch.object(gui, 'snapshot', side_effect=lambda: {**state, 'entry': self.active['entry']}),
+              patch.object(Path, 'mkdir', move_verge_after_backup_directory)):
+            result = gui.change('fast', 'current')
+
+        self.assertEqual(result['state']['entry'], 'fast')
+        self.assertEqual(self.requests, [ENTRY_ROUTE])
+        self.assertFalse(self.root.exists())
+        self.assertRegex(result['message'], r"^实时切换成功，但保存选择失败：\[Errno 2\] No such file or directory: '"
+                         + re.escape(str(self.root / '.toolbox-')) + r"[^']+'$")
+        self.assertEqual((moved / self.index.name).read_bytes(), original)
+        self.assertEqual([p.read_bytes() for p in (self.base / 'backups').iterdir()], [original])
+
     def test_manual_and_auto_switch_ignore_duplicate_loaded_by_other_group(self):
         self.policy.write_text(json.dumps({'selected_nodes': {'a': ['current', 'same']}}))
         config = yaml.safe_load(self.config.read_bytes())
@@ -847,6 +871,25 @@ class UpdateTests(SubscriptionFixture, unittest.TestCase):
             self.apply({'a': ['fast'], 'b': []})
         self.assertEqual(self.requests, ['/configs?force=false'])
         self.assertEqual({k: v for k, v in self.files().items() if not k.startswith('backups/')}, before)
+
+    def test_unsent_reload_rolls_back_sync_and_reports_no_request(self):
+        before = self.files()
+        self.downloaded = {'a': ['current', 'fast', 'new'], 'b': ['other']}
+        for error in (OSError(errno.ENETUNREACH, 'unreachable'), ConnectionRefusedError(errno.ECONNREFUSED, 'refused'),
+                      FileNotFoundError(errno.ENOENT, 'missing socket'), OSError(errno.EHOSTUNREACH, 'unreachable'),
+                      socket.gaierror(socket.EAI_AGAIN, 'lookup failed')):
+            with self.subTest(error=error):
+                def reject_reload(method, route, body=None, **_):
+                    if route == '/configs?force=false':
+                        self.assertIn('name: new', (self.root / 'profiles/a.yaml').read_text())
+                        raise error
+                    return self.controller(method, route, body)
+
+                self.api.side_effect = reject_reload
+                with self.assertRaisesRegex(RuntimeError, '^无法连接 Clash 控制接口，未发送重载请求，文件已回退；请刷新状态后重试$'):
+                    picker.synchronize()
+                self.assertEqual({k: v for k, v in self.files().items() if not k.startswith('backups/')}, before)
+                self.assertEqual(self.requests, [])
 
     def test_transport_rejects_an_http_error_without_reading_the_body(self):
         with (patch('clash.http.client.HTTPConnection.request'),

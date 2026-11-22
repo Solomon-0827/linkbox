@@ -107,6 +107,23 @@ test('verified manual switch leaves a newly active Verge profile alone', async t
  assert.equal(await fs.readFile(file, 'utf8'), changed);
 });
 
+test('post-reload persistence compares profiles before staging the replacement', async t => {
+ const {adapter, root} = await fixture(t);
+ const file = path.join(root, 'profiles.yaml');
+ const original = {current: 'a', items: [{uid: 'a'}]};
+ const write = fs.writeFile;
+ await write(file, YAML.stringify(original));
+ t.mock.method(fs, 'writeFile', async (target, ...args) => {
+  if (target.startsWith(file + '.linkbox-')) await write(file, YAML.stringify({...original, current: 'b'}));
+  return write(target, ...args);
+ });
+
+ await adapter.persistSelection(file, 'fast');
+ assert.deepEqual(YAML.parse(await fs.readFile(file, 'utf8')), {
+  current: 'a', items: [{uid: 'a', selected: [{name: ENTRY, now: 'fast'}]}],
+ });
+});
+
 test('verified manual switch cannot overwrite a late Verge edit', async t => {
  let entry = 'old';
  const {b, root} = await fixture(t, {transport: (_endpoint, _method, _route, body) => { entry = body.name; }});

@@ -112,6 +112,23 @@ class ClashAdapterTests(unittest.TestCase):
                 transport.assert_not_called()
                 self.assertEqual(list(root.iterdir()), [])
 
+    def test_post_reload_persistence_compares_profiles_before_staging(self):
+        original = b'current: active\nitems: [{uid: active}]\n'
+        with tempfile.TemporaryDirectory() as directory:
+            profiles = Path(directory) / 'profiles.yaml'
+            profiles.write_bytes(original)
+            mkstemp = tempfile.mkstemp
+
+            def edit_while_staging(*args, **kwargs):
+                profiles.write_bytes(original.replace(b'current: active', b'current: other'))
+                return mkstemp(*args, **kwargs)
+
+            with patch.object(clash.tempfile, 'mkstemp', side_effect=edit_while_staging):
+                clash.persist_selection(profiles, 'new')
+
+            self.assertIn(b'current: active\n', profiles.read_bytes())
+            self.assertIn(b'now: new\n', profiles.read_bytes())
+
     def test_persistence_does_not_replace_a_concurrent_edit(self):
         original = b'current: active\nitems: [{uid: active}]\n'
         concurrent = original + b'# edited by Verge\n'

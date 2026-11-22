@@ -42,14 +42,8 @@ async function discover(b, forUpdate = false) {
  for (const item of profiles.items) {
   if (item.type !== 'remote') continue;
   const {url, file} = item;
-  let profile;
-  try {
-   if (typeof url !== 'string' || !url.startsWith('https://')) {
-    throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
-   }
-   profile = b.clash.profileFile(b.root, file);
-  } catch (error) {
-   if (forUpdate) throw error;
+  if (typeof url !== 'string' || !url.startsWith('https://') || !b.clash.validProfileFilename(file)) {
+   if (forUpdate) throw Error('Clash Verge 订阅需要 HTTPS 地址及有效本地文件，未更新节点');
    continue;
   }
   const key = sourceKey(url);
@@ -58,7 +52,7 @@ async function discover(b, forUpdate = false) {
   const name = saved.get(key)?.name || 'verge_' + hash(item.uid || file).slice(0, 12);
   const source = {name, display_name: item.name || name, url, profile_file: file};
   let raw;
-  try { raw = await readFile(profile); }
+  try { raw = await readFile(b.clash.profileFile(b.root, file)); }
   catch (error) { if (!error.code) throw error; raw = null; }
   sources.push({source, raw});
  }

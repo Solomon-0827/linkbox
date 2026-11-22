@@ -1,5 +1,6 @@
 """LinkBox's operations on the local Clash controller and Verge files."""
 import datetime
+import errno
 import http.client
 import json
 import os
@@ -101,7 +102,8 @@ def reload(root, payload, prepare, rollback):
     try:
         _request('PUT', '/configs?force=false', {'payload': payload.decode()})
     except Exception as error:
-        unsent = isinstance(error, ClashRequestNotSent)
+        unsent = isinstance(error, (ClashRequestNotSent, socket.gaierror)) or getattr(error, 'errno', None) in (
+            errno.ECONNREFUSED, errno.ENOENT, errno.ENETUNREACH, errno.EHOSTUNREACH)
         if unsent or (isinstance(error, ClashHTTPError) and error.rejected):
             rollback()
             message = _RELOAD_NOT_SENT if unsent else str(error)
@@ -122,9 +124,12 @@ def script_file(root):
     return profile_file(root, 'Script.js')
 
 
+def valid_profile_filename(filename):
+    return (isinstance(filename, str) and bool(filename) and Path(filename).name == filename
+            and filename not in {'.', '..'} and '\\' not in filename)
+
+
 def profile_file(root, filename):
-    if not isinstance(filename, str) or not filename or Path(filename).name != filename or filename in {'.', '..'} or '\\' in filename:
-        raise ValueError('Clash Verge 订阅路径无效，未删除节点')
     return root / 'profiles' / filename
 
 
@@ -147,16 +152,15 @@ def read_yaml(path, *, text=True):
     return yaml.safe_load(path.read_text() if text else path.read_bytes())
 
 
-def write_file(path, data, *, expected=None, conflict=None, require_existing=False, prefix='.linkbox-'):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_file(path, data, *, expected=None, conflict=None, prefix='.linkbox-'):
+    if conflict is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=prefix, dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as output:
             output.write(data)
-        if conflict is not None:
-            current = path.read_bytes() if require_existing else read_file(path)
-            if current != expected:
-                raise RuntimeError(conflict)
+        if conflict is not None and path.read_bytes() != expected:
+            raise RuntimeError(conflict)
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
@@ -194,15 +198,17 @@ def update_selector(index, name, *, include_exit=False):
 def persist_selection(path, name, *, backup_dir=None):
     original = path.read_bytes()
     index = yaml.safe_load(original)
-    if not update_selector(index, name, include_exit=backup_dir is not None) and backup_dir is None:
+    changed = update_selector(index, name, include_exit=backup_dir is not None)
+    if backup_dir is None:
+        if changed:
+            if read_file(path) != original:
+                raise RuntimeError('配置或节点已被其他操作改变，已取消更新')
+            write_file(path, yaml.safe_dump(index, allow_unicode=True, sort_keys=False).encode())
         return
     output = yaml.safe_dump(index, allow_unicode=True, sort_keys=False).encode()
-    if backup_dir is not None:
-        backup_dir.mkdir(exist_ok=True, mode=0o700)
-        backup = backup_dir / ('profiles-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.yaml')
-        with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as file:
-            file.write(original)
-    write_file(path, output, expected=original, require_existing=backup_dir is not None,
-               prefix='.toolbox-' if backup_dir is not None else '.linkbox-',
-               conflict='Clash 同时更新了订阅文件，跳过持久化，避免覆盖' if backup_dir is not None
-               else '配置或节点已被其他操作改变，已取消更新')
+    backup_dir.mkdir(exist_ok=True, mode=0o700)
+    backup = backup_dir / ('profiles-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.yaml')
+    with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as file:
+        file.write(original)
+    write_file(path, output, expected=original, prefix='.toolbox-',
+               conflict='Clash 同时更新了订阅文件，跳过持久化，避免覆盖')
